@@ -265,6 +265,19 @@ fn extract_credentials(headers: &HeaderMap) -> Credentials {
     creds
 }
 
+/// Authenticate an HTTP request. Returns identity on success, or a 401 response.
+async fn authenticate_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthIdentity, (StatusCode, Json<Value>)> {
+    let creds = extract_credentials(headers);
+    state.auth_provider.authenticate(&creds).await.map_err(|e| {
+        let err =
+            JsonRpcResponse::error(Value::Null, -32000, &format!("authentication failed: {e}"));
+        (StatusCode::UNAUTHORIZED, Json(json!(err)))
+    })
+}
+
 /// Validate that a bind address is safe.
 /// Non-loopback addresses require --insecure flag.
 fn validate_bind_addr(addr: &str, insecure: bool) -> Result<std::net::SocketAddr> {
@@ -377,14 +390,9 @@ async fn mcp_handler(
     }
 
     // Authenticate
-    let creds = extract_credentials(&headers);
-    let identity = match state.auth_provider.authenticate(&creds).await {
+    let identity = match authenticate_request(&state, &headers).await {
         Ok(id) => id,
-        Err(e) => {
-            let err =
-                JsonRpcResponse::error(Value::Null, -32000, &format!("authentication failed: {e}"));
-            return (StatusCode::UNAUTHORIZED, Json(json!(err)));
-        }
+        Err(resp) => return resp,
     };
 
     // Parse JSON-RPC request
@@ -408,10 +416,13 @@ async fn mcp_handler(
 // GET /mcp/sse — SSE endpoint for streaming
 // Implements the MCP SSE transport: client connects via SSE, sends requests via POST to /mcp,
 // and receives responses as SSE events.
-async fn mcp_sse_handler(
-    State(state): State<AppState>,
-) -> Sse<ReceiverStream<Result<Event, std::convert::Infallible>>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
+async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    // Authenticate
+    if let Err(resp) = authenticate_request(&state, &headers).await {
+        return resp.into_response();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
     // Send the endpoint event so clients know where to POST
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -456,7 +467,7 @@ async fn mcp_sse_handler(
         }
     });
 
-    Sse::new(ReceiverStream::new(rx))
+    Sse::new(ReceiverStream::new(rx)).into_response()
 }
 
 // --- Public entry point ---
