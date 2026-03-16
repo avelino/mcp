@@ -6,6 +6,7 @@ mod output;
 mod protocol;
 mod registry;
 mod serve;
+mod server_auth;
 mod spinner;
 mod transport;
 
@@ -34,9 +35,11 @@ fn print_usage() {
     eprintln!("  mcp add --url <url> <name>          Add HTTP server manually");
     eprintln!("  mcp remove <name>                   Remove server from config");
     eprintln!("  mcp serve                           Start proxy server (stdio)");
+    eprintln!("  mcp serve --http [addr]             Start proxy server over HTTP");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  --json                              Force JSON output");
+    eprintln!("  --insecure                          Allow HTTP on non-loopback interfaces");
     eprintln!();
     eprintln!("Output defaults to human-readable tables when run interactively.");
     eprintln!("Piped output defaults to JSON for scripting.");
@@ -83,7 +86,20 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         "serve" => {
-            return serve::run(cfg).await;
+            let rest = &args[1..];
+            let insecure = rest.iter().any(|a| a == "--insecure");
+            let http_addr = if let Some(pos) = rest.iter().position(|a| a == "--http") {
+                // Next arg is the bind address, or default to 127.0.0.1:8080
+                let addr = rest
+                    .get(pos + 1)
+                    .filter(|a| !a.starts_with("--"))
+                    .map(|a| a.as_str())
+                    .unwrap_or("127.0.0.1:8080");
+                Some(addr.to_string())
+            } else {
+                None
+            };
+            return serve::run(cfg, http_addr.as_deref(), insecure).await;
         }
         "add" => {
             return handle_add(&args[1..]).await;

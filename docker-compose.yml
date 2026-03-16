@@ -1,0 +1,29 @@
+# MCP Proxy Server — Docker Compose example
+#
+# Usage:
+#   cp servers.example.json servers.json   # edit with your backends and tokens
+#   docker compose up --build
+#
+# Test:
+#   curl http://localhost:8080/health
+#   curl http://localhost:8080/mcp \
+#     -H "Authorization: Bearer change-me-alice" \
+#     -H "Content-Type: application/json" \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+services:
+  mcp-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./servers.json:/root/.config/mcp/servers.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mcp", "serve", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
