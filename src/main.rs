@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod client;
 mod config;
@@ -13,6 +14,7 @@ mod transport;
 use anyhow::{bail, Result};
 use output::OutputFormat;
 use std::io::{IsTerminal, Read};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -36,6 +38,13 @@ fn print_usage() {
     eprintln!("  mcp remove <name>                   Remove server from config");
     eprintln!("  mcp serve                           Start proxy server (stdio)");
     eprintln!("  mcp serve --http [addr]             Start proxy server over HTTP");
+    eprintln!("  mcp logs                            Show recent audit log entries");
+    eprintln!("  mcp logs --limit N                  Show last N entries (default: 50)");
+    eprintln!("  mcp logs --server <name>            Filter by backend server");
+    eprintln!("  mcp logs --tool <prefix>            Filter by tool name prefix");
+    eprintln!("  mcp logs --errors                   Show only failures");
+    eprintln!("  mcp logs --since <duration>         Filter by time (5m, 1h, 24h, 7d)");
+    eprintln!("  mcp logs -f                         Follow mode (streams new entries live)");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  --json                              Force JSON output");
@@ -67,8 +76,26 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Audit logger shared across all commands
+    let audit =
+        Arc::new(audit::AuditLogger::open(&cfg.audit).unwrap_or(audit::AuditLogger::Disabled));
+
     if args[0] == "--list" {
-        return output::print_servers(&cfg.servers, fmt);
+        let start = std::time::Instant::now();
+        let result = output::print_servers(&cfg.servers, fmt);
+        audit.log(audit::AuditEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: "cli".to_string(),
+            method: "servers/list".to_string(),
+            tool_name: None,
+            server_name: None,
+            identity: "local".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: result.is_ok(),
+            error_message: result.as_ref().err().map(|e| format!("{e:#}")),
+            arguments: None,
+        });
+        return result;
     }
 
     let first = &args[0];
@@ -79,17 +106,36 @@ async fn run() -> Result<()> {
                 bail!("usage: mcp search <query>");
             }
             let query = args[1..].join(" ");
+            let start = std::time::Instant::now();
             let sp = spinner::Spinner::start("searching registry...");
-            let results = registry::search_servers(&query).await?;
+            let result = registry::search_servers(&query).await;
             sp.stop();
-            output::print_search_results(&results, fmt)?;
+
+            let (success, error_message) = match &result {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(format!("{e:#}"))),
+            };
+
+            audit.log(audit::AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                source: "cli".to_string(),
+                method: "registry/search".to_string(),
+                tool_name: None,
+                server_name: None,
+                identity: "local".to_string(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                success,
+                error_message,
+                arguments: Some(serde_json::json!({"query": query})),
+            });
+
+            output::print_search_results(&result?, fmt)?;
             return Ok(());
         }
         "serve" => {
             let rest = &args[1..];
             let insecure = rest.iter().any(|a| a == "--insecure");
             let http_addr = if let Some(pos) = rest.iter().position(|a| a == "--http") {
-                // Next arg is the bind address, or default to 127.0.0.1:8080
                 let addr = rest
                     .get(pos + 1)
                     .filter(|a| !a.starts_with("--"))
@@ -102,25 +148,91 @@ async fn run() -> Result<()> {
             return serve::run(cfg, http_addr.as_deref(), insecure).await;
         }
         "add" => {
-            return handle_add(&args[1..]).await;
+            return handle_add(&args[1..], &audit).await;
         }
         "remove" => {
             if args.len() < 2 {
                 bail!("usage: mcp remove <name>");
             }
-            manager::remove_server(&args[1])?;
-            return Ok(());
+            let start = std::time::Instant::now();
+            let result = manager::remove_server(&args[1]);
+
+            audit.log(audit::AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                source: "cli".to_string(),
+                method: "config/remove".to_string(),
+                tool_name: None,
+                server_name: Some(args[1].clone()),
+                identity: "local".to_string(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                success: result.is_ok(),
+                error_message: result.as_ref().err().map(|e| format!("{e:#}")),
+                arguments: None,
+            });
+
+            return result;
+        }
+        "logs" => {
+            return handle_logs_command(&args[1..], &cfg, fmt).await;
         }
         _ => {}
     }
 
-    handle_server_command(&args, &cfg, fmt).await
+    handle_server_command(&args, &cfg, fmt, &audit).await
+}
+
+async fn handle_logs_command(
+    args: &[String],
+    cfg: &config::Config,
+    fmt: OutputFormat,
+) -> Result<()> {
+    let filter = audit::parse_filter_args(args)?;
+
+    if filter.follow {
+        return handle_logs_follow(cfg, fmt, &filter).await;
+    }
+
+    let audit_logger = audit::AuditLogger::open(&cfg.audit)?;
+    let entries = audit_logger.query_filtered(&filter)?;
+
+    if entries.is_empty() {
+        eprintln!("No audit log entries found.");
+        return Ok(());
+    }
+
+    output::print_audit_logs(&entries, fmt)
+}
+
+async fn handle_logs_follow(
+    cfg: &config::Config,
+    fmt: OutputFormat,
+    filter: &audit::AuditFilter,
+) -> Result<()> {
+    let audit_logger = audit::AuditLogger::open(&cfg.audit)?;
+    let mut last_key = String::new();
+
+    eprintln!("[logs] following audit log (ctrl+c to stop)...");
+
+    loop {
+        let entries = audit_logger.query_recent(100)?;
+        for entry in &entries {
+            let key = format!("{}:{}", entry.timestamp, entry.identity);
+            if key > last_key {
+                if filter.matches(entry) {
+                    output::print_audit_log_entry(entry, fmt)?;
+                }
+                last_key = key;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 async fn handle_server_command(
     args: &[String],
     cfg: &config::Config,
     fmt: OutputFormat,
+    audit: &Arc<audit::AuditLogger>,
 ) -> Result<()> {
     let server_name = &args[0];
     let server_config = cfg
@@ -133,19 +245,67 @@ async fn handle_server_command(
     sp.stop();
 
     if args.len() == 1 || (args.len() >= 2 && args[1] == "--list") {
+        let start = std::time::Instant::now();
         let sp = spinner::Spinner::start("listing tools...");
-        let tools = client.list_tools().await?;
+        let result = client.list_tools().await;
         sp.stop();
-        output::print_tools(&tools, fmt)?;
+
+        let (tools, success, error_message) = match &result {
+            Ok(tools) => (Some(tools.clone()), true, None),
+            Err(e) => (None, false, Some(format!("{e:#}"))),
+        };
+
+        audit.log(audit::AuditEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: "cli".to_string(),
+            method: "tools/list".to_string(),
+            tool_name: None,
+            server_name: Some(server_name.clone()),
+            identity: "local".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            success,
+            error_message,
+            arguments: None,
+        });
+
+        if let Some(tools) = tools {
+            output::print_tools(&tools, fmt)?;
+        } else {
+            result?;
+        }
         client.shutdown().await?;
         return Ok(());
     }
 
     if args.len() >= 2 && args[1] == "--info" {
+        let start = std::time::Instant::now();
         let sp = spinner::Spinner::start("listing tools...");
-        let tools = client.list_tools().await?;
+        let result = client.list_tools().await;
         sp.stop();
-        output::print_tools_info(&tools, fmt)?;
+
+        let (tools, success, error_message) = match &result {
+            Ok(tools) => (Some(tools.clone()), true, None),
+            Err(e) => (None, false, Some(format!("{e:#}"))),
+        };
+
+        audit.log(audit::AuditEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: "cli".to_string(),
+            method: "tools/info".to_string(),
+            tool_name: None,
+            server_name: Some(server_name.clone()),
+            identity: "local".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            success,
+            error_message,
+            arguments: None,
+        });
+
+        if let Some(tools) = tools {
+            output::print_tools_info(&tools, fmt)?;
+        } else {
+            result?;
+        }
         client.shutdown().await?;
         return Ok(());
     }
@@ -157,19 +317,59 @@ async fn handle_server_command(
         read_stdin_or_empty()?
     };
 
+    let start = std::time::Instant::now();
     let sp = spinner::Spinner::start(&format!("calling {tool_name}..."));
-    let result = client.call_tool(tool_name, json_args).await?;
+    let result = client.call_tool(tool_name, json_args.clone()).await;
     sp.stop();
-    output::print_tool_result(&result, fmt)?;
+
+    let (call_result, success, error_message) = match &result {
+        Ok(r) => {
+            let is_err = r.is_error.unwrap_or(false);
+            let err_msg = if is_err {
+                r.content.first().and_then(|c| c.text.clone())
+            } else {
+                None
+            };
+            (Some(r.clone()), !is_err, err_msg)
+        }
+        Err(e) => (None, false, Some(format!("{e:#}"))),
+    };
+
+    let log_arguments = if cfg.audit.log_arguments {
+        Some(json_args)
+    } else {
+        None
+    };
+
+    audit.log(audit::AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        source: "cli".to_string(),
+        method: "tools/call".to_string(),
+        tool_name: Some(tool_name.clone()),
+        server_name: Some(server_name.clone()),
+        identity: "local".to_string(),
+        duration_ms: start.elapsed().as_millis() as u64,
+        success,
+        error_message,
+        arguments: log_arguments,
+    });
+
+    if let Some(r) = call_result {
+        output::print_tool_result(&r, fmt)?;
+    } else {
+        result?;
+    }
     client.shutdown().await?;
 
     Ok(())
 }
 
-async fn handle_add(args: &[String]) -> Result<()> {
+async fn handle_add(args: &[String], audit: &Arc<audit::AuditLogger>) -> Result<()> {
     if args.is_empty() {
         bail!("usage: mcp add <name> or mcp add --url <url> <name>");
     }
+
+    let start = std::time::Instant::now();
 
     if args[0] == "--url" {
         if args.len() < 3 {
@@ -177,14 +377,41 @@ async fn handle_add(args: &[String]) -> Result<()> {
         }
         let url = &args[1];
         let name = &args[2];
-        manager::add_http(name, url)?;
-        return Ok(());
+        let result = manager::add_http(name, url);
+
+        audit.log(audit::AuditEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: "cli".to_string(),
+            method: "config/add".to_string(),
+            tool_name: None,
+            server_name: Some(name.to_string()),
+            identity: "local".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: result.is_ok(),
+            error_message: result.as_ref().err().map(|e| format!("{e:#}")),
+            arguments: Some(serde_json::json!({"url": url})),
+        });
+
+        return result;
     }
 
     let name = &args[0];
-    manager::add_from_registry(name).await?;
+    let result = manager::add_from_registry(name).await;
 
-    Ok(())
+    audit.log(audit::AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        source: "cli".to_string(),
+        method: "config/add".to_string(),
+        tool_name: None,
+        server_name: Some(name.to_string()),
+        identity: "local".to_string(),
+        duration_ms: start.elapsed().as_millis() as u64,
+        success: result.is_ok(),
+        error_message: result.as_ref().err().map(|e| format!("{e:#}")),
+        arguments: Some(serde_json::json!({"from": "registry"})),
+    });
+
+    result
 }
 
 fn read_stdin_or_empty() -> Result<serde_json::Value> {
