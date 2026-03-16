@@ -209,19 +209,35 @@ async fn handle_logs_follow(
     filter: &audit::AuditFilter,
 ) -> Result<()> {
     let audit_logger = audit::AuditLogger::open(&cfg.audit)?;
-    let mut last_key = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     eprintln!("[logs] following audit log (ctrl+c to stop)...");
+
+    // Seed with current entries so we only show new ones
+    let existing = audit_logger.query_recent(100)?;
+    for entry in &existing {
+        seen.insert(format!(
+            "{}:{}:{}",
+            entry.timestamp, entry.method, entry.identity
+        ));
+    }
 
     loop {
         let entries = audit_logger.query_recent(100)?;
         for entry in &entries {
-            let key = format!("{}:{}", entry.timestamp, entry.identity);
-            if key > last_key {
-                if filter.matches(entry) {
-                    output::print_audit_log_entry(entry, fmt)?;
-                }
-                last_key = key;
+            let key = format!("{}:{}:{}", entry.timestamp, entry.method, entry.identity);
+            if seen.insert(key) && filter.matches(entry) {
+                output::print_audit_log_entry(entry, fmt)?;
+            }
+        }
+        // Cap memory: keep only recent keys since query_recent returns at most 100
+        if seen.len() > 500 {
+            seen.clear();
+            for entry in &entries {
+                seen.insert(format!(
+                    "{}:{}:{}",
+                    entry.timestamp, entry.method, entry.identity
+                ));
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
