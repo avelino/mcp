@@ -82,11 +82,7 @@ async fn run() -> Result<()> {
             let sp = spinner::Spinner::start("searching registry...");
             let results = registry::search_servers(&query).await?;
             sp.stop();
-            if results.is_empty() {
-                eprintln!("no servers found for \"{query}\"");
-            } else {
-                output::print_search_results(&results, fmt)?;
-            }
+            output::print_search_results(&results, fmt)?;
             return Ok(());
         }
         "add" => {

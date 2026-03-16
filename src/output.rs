@@ -335,34 +335,45 @@ fn print_tool_result_text(result: &ToolCallResult) -> Result<()> {
         eprint!("{} ", style("error:").red().bold());
     }
 
+    macro_rules! out {
+        ($is_error:expr, $($arg:tt)*) => {
+            if $is_error {
+                eprintln!($($arg)*);
+            } else {
+                println!($($arg)*);
+            }
+        };
+    }
+
+    if is_error && result.content.is_empty() {
+        eprintln!("(no details)");
+        return Ok(());
+    }
+
     for content in &result.content {
         match content.content_type.as_str() {
             "text" => {
                 if let Some(ref text) = content.text {
-                    if is_error {
-                        eprintln!("{}", text);
-                    } else {
-                        println!("{}", text);
-                    }
+                    out!(is_error, "{}", text);
                 }
             }
             "image" => {
                 let mime = content.mime_type.as_deref().unwrap_or("image/*");
-                println!("{}", style(format!("[image: {mime}]")).dim());
+                out!(is_error, "{}", style(format!("[image: {mime}]")).dim());
             }
             "resource" => {
                 if let Some(ref text) = content.text {
-                    println!("{}", text);
+                    out!(is_error, "{}", text);
                 } else {
                     let mime = content.mime_type.as_deref().unwrap_or("unknown");
-                    println!("{}", style(format!("[resource: {mime}]")).dim());
+                    out!(is_error, "{}", style(format!("[resource: {mime}]")).dim());
                 }
             }
             other => {
                 if let Some(ref text) = content.text {
-                    println!("{}", text);
+                    out!(is_error, "{}", text);
                 } else {
-                    println!("{}", style(format!("[{other}: unsupported content type]")).dim());
+                    out!(is_error, "{}", style(format!("[{other}: unsupported content type]")).dim());
                 }
             }
         }
@@ -476,7 +487,7 @@ mod tests {
         servers.insert(
             "sentry".to_string(),
             ServerConfig::Http {
-                url: "https://mcp.sentry.dev/mcp".to_string(),
+                url: "https://mcp.sentry.dev/sse".to_string(),
                 headers: HashMap::new(),
             },
         );
