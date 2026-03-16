@@ -125,6 +125,7 @@ Tokens are saved in `~/.config/mcp/auth.json` and refreshed automatically.
 | `mcp add <name>` | Add a server from registry |
 | `mcp add --url <url> <name>` | Add an HTTP server |
 | `mcp remove <name>` | Remove a server |
+| `mcp serve` | Start proxy — all servers as one MCP endpoint |
 
 ## Piping JSON from stdin
 
@@ -163,6 +164,23 @@ Available tags:
 | `latest` | Latest stable release |
 | `x.y.z` | Pinned version |
 | `beta` | Latest build from main branch |
+
+## Proxy mode
+
+Use `mcp serve` to expose all your configured servers as a single MCP endpoint. Configure it once, use it from any LLM tool:
+
+```json
+{
+  "mcpServers": {
+    "all": {
+      "command": "mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+This works with Claude Code, Cursor, Windsurf, or any MCP-compatible client. Tools are namespaced as `server__tool` (e.g. `sentry__search_issues`). See the [proxy mode guide](docs/guides/proxy-mode.md) for details.
 
 ## Environment variables
 

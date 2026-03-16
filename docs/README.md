@@ -21,6 +21,7 @@ Focused explanations for specific topics:
 * **[Authentication](guides/authentication.md)** — OAuth, API tokens, service-specific setup.
 * **[Registry](guides/registry.md)** — Finding and adding servers from the MCP registry.
 * **[Scripting](guides/scripting.md)** — Using `mcp` in shell scripts, piping, CI/CD.
+* **[Proxy mode](guides/proxy-mode.md)** — Expose all servers as a single MCP endpoint for LLM tools.
 
 ## Reference
 

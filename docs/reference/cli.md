@@ -153,6 +153,35 @@ Content items have a `type` field:
 - `"image"` — Base64-encoded image in `data` field, with `mimeType`
 - `"resource"` — Embedded resource content
 
+## Proxy commands
+
+### `mcp serve`
+
+Start a proxy server that aggregates all configured backends into a single MCP endpoint over stdio.
+
+```bash
+mcp serve
+```
+
+The proxy connects to every server in `servers.json`, merges their tool lists with namespaced names (`server__tool`), and routes `tools/call` requests to the correct backend.
+
+Designed to be used as a stdio transport in any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "all": {
+      "command": "mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Diagnostics are logged to stderr. Protocol messages use stdin/stdout.
+
+See **[Proxy mode guide](../guides/proxy-mode.md)** for full details and client configuration examples.
+
 ## Registry commands
 
 ### `mcp search <query>`

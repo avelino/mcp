@@ -106,6 +106,22 @@ All output functions return `Result` and write to stdout. Errors and status mess
 
 The output module doesn't do any filtering or transformation. It formats the raw protocol data as pretty-printed JSON. Users can pipe to `jq` for whatever processing they need.
 
+## Proxy mode: `mcp serve`
+
+The proxy inverts the CLI's role — instead of being a **client** that talks to one server, it becomes a **server** that talks to many.
+
+```
+MCP Client  ←stdin/stdout→  mcp serve  ←→  backend 1 (stdio)
+                                        ←→  backend 2 (http)
+                                        ←→  backend N
+```
+
+On `initialize`, the proxy connects to all configured backends in parallel (reusing `McpClient`). It merges their tool lists with namespaced names (`server__tool`) and builds a routing table. On `tools/call`, it splits the namespaced name, looks up the backend, and forwards the request.
+
+The proxy reuses the same `McpClient` and `Transport` abstractions — no new protocol code was needed. It just listens on stdin instead of connecting to a server's stdin.
+
+Error handling is partial-availability: if one backend fails to connect, the others still work. If a backend dies mid-session, the proxy returns an MCP-level error for that tool call without crashing.
+
 ## Design principles
 
 - **No daemon** — Each invocation is independent. Start, connect, do the thing, exit. Tokens are persisted to disk, everything else is ephemeral.

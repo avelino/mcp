@@ -14,6 +14,7 @@
 * [Authentication](guides/authentication.md)
 * [Registry](guides/registry.md)
 * [Scripting](guides/scripting.md)
+* [Proxy mode](guides/proxy-mode.md)
 
 ## How-to
 

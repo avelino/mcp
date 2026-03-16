@@ -5,7 +5,7 @@ pub const PROTOCOL_VERSION: &str = "2025-03-26";
 
 // --- JSON-RPC 2.0 ---
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     pub id: u64,
@@ -25,21 +25,50 @@ impl JsonRpcRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct JsonRpcResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jsonrpc: Option<String>,
     pub id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+}
+
+impl JsonRpcResponse {
+    pub fn success(id: u64, result: Value) -> Self {
+        Self {
+            jsonrpc: Some("2.0".to_string()),
+            id: Some(id),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn error(id: u64, code: i64, message: &str) -> Self {
+        Self {
+            jsonrpc: Some("2.0".to_string()),
+            id: Some(id),
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.to_string(),
+                data: None,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
     pub jsonrpc: String,
     pub method: String,
@@ -82,9 +111,9 @@ pub struct ClientInfo {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Tool {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, rename = "inputSchema")]
+    #[serde(default, rename = "inputSchema", skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
 }
 
@@ -105,7 +134,7 @@ pub struct ToolCallParams {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ToolCallResult {
     pub content: Vec<Content>,
-    #[serde(default, rename = "isError")]
+    #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
 
@@ -113,11 +142,11 @@ pub struct ToolCallResult {
 pub struct Content {
     #[serde(rename = "type")]
     pub content_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
-    #[serde(default, rename = "mimeType")]
+    #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
 

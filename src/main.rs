@@ -5,6 +5,7 @@ mod manager;
 mod output;
 mod protocol;
 mod registry;
+mod serve;
 mod spinner;
 mod transport;
 
@@ -32,6 +33,7 @@ fn print_usage() {
     eprintln!("  mcp add <name>                      Add server from registry");
     eprintln!("  mcp add --url <url> <name>          Add HTTP server manually");
     eprintln!("  mcp remove <name>                   Remove server from config");
+    eprintln!("  mcp serve                           Start proxy server (stdio)");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  --json                              Force JSON output");
@@ -79,6 +81,9 @@ async fn run() -> Result<()> {
             sp.stop();
             output::print_search_results(&results, fmt)?;
             return Ok(());
+        }
+        "serve" => {
+            return serve::run(cfg).await;
         }
         "add" => {
             return handle_add(&args[1..]).await;
