@@ -129,12 +129,16 @@ jobs:
             "${FILES[@]}"
 
   docker:
-    if: github.event.workflow_run.conclusion == 'success'
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
 
       - uses: docker/setup-qemu-action@v3
 
@@ -154,14 +158,38 @@ jobs:
           SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
           echo "tag=${VERSION}-beta.${SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Prepare Docker contexts
+        run: |
+          mkdir -p docker-amd64 docker-arm64
+          cp artifacts/mcp-x86_64-unknown-linux-gnu/mcp-x86_64-unknown-linux-gnu docker-amd64/mcp
+          cp artifacts/mcp-aarch64-unknown-linux-gnu/mcp-aarch64-unknown-linux-gnu docker-arm64/mcp
+          chmod +x docker-amd64/mcp docker-arm64/mcp
+          cp Dockerfile docker-amd64/
+          cp Dockerfile docker-arm64/
+
+      - name: Build and push (amd64)
         uses: docker/build-push-action@v6
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
+          context: docker-amd64
+          platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/avelino/mcp:beta
-            ghcr.io/avelino/mcp:${{ steps.prep.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/avelino/mcp:${{ steps.prep.outputs.tag }}-amd64
+          provenance: false
+
+      - name: Build and push (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-arm64
+          platforms: linux/arm64
+          push: true
+          tags: ghcr.io/avelino/mcp:${{ steps.prep.outputs.tag }}-arm64
+          provenance: false
+
+      - name: Create multi-arch manifest
+        run: |
+          TAG="${{ steps.prep.outputs.tag }}"
+          docker buildx imagetools create \
+            -t ghcr.io/avelino/mcp:beta \
+            -t ghcr.io/avelino/mcp:${TAG} \
+            ghcr.io/avelino/mcp:${TAG}-amd64 \
+            ghcr.io/avelino/mcp:${TAG}-arm64
