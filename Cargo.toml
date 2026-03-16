@@ -18,6 +18,9 @@ base64 = "0.22"
 rand = "0.9"
 open = "5"
 url = "2"
+indicatif = "0.17"
+comfy-table = "7"
+console = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
