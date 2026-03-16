@@ -25,6 +25,13 @@ Output is always JSON. Pipe it, `jq` it, script it.
 **Install:**
 
 ```bash
+# Homebrew (macOS and Linux)
+brew install avelino/mcp/mcp
+
+# Pre-built binary from GitHub Releases
+# Download the latest from https://github.com/avelino/mcp/releases
+
+# From source (requires Rust)
 cargo install --path .
 ```
 

@@ -1,0 +1,97 @@
+name: Publish Homebrew
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  homebrew:
+    if: "!github.event.release.prerelease"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set version
+        id: version
+        run: echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download binaries and compute checksums
+        id: checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          BASE="https://github.com/avelino/mcp/releases/download/${TAG}"
+
+          # Download macOS and Linux binaries
+          curl -sL "${BASE}/mcp-x86_64-apple-darwin" -o mcp-x86_64-apple-darwin
+          curl -sL "${BASE}/mcp-aarch64-apple-darwin" -o mcp-aarch64-apple-darwin
+          curl -sL "${BASE}/mcp-x86_64-unknown-linux-gnu" -o mcp-x86_64-unknown-linux-gnu
+          curl -sL "${BASE}/mcp-aarch64-unknown-linux-gnu" -o mcp-aarch64-unknown-linux-gnu
+
+          # Compute SHA256
+          echo "sha_darwin_x86=$(sha256sum mcp-x86_64-apple-darwin | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "sha_darwin_arm=$(sha256sum mcp-aarch64-apple-darwin | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "sha_linux_x86=$(sha256sum mcp-x86_64-unknown-linux-gnu | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "sha_linux_arm=$(sha256sum mcp-aarch64-unknown-linux-gnu | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: avelino/homebrew-mcp
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update formula
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA_DARWIN_X86: ${{ steps.checksums.outputs.sha_darwin_x86 }}
+          SHA_DARWIN_ARM: ${{ steps.checksums.outputs.sha_darwin_arm }}
+          SHA_LINUX_X86: ${{ steps.checksums.outputs.sha_linux_x86 }}
+          SHA_LINUX_ARM: ${{ steps.checksums.outputs.sha_linux_arm }}
+        run: |
+          VERSION="${TAG#v}"
+          cat > Formula/mcp.rb << FORMULA
+          class Mcp < Formula
+            desc "CLI that turns MCP servers into terminal commands"
+            homepage "https://github.com/avelino/mcp"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/avelino/mcp/releases/download/${TAG}/mcp-aarch64-apple-darwin"
+                sha256 "${SHA_DARWIN_ARM}"
+              else
+                url "https://github.com/avelino/mcp/releases/download/${TAG}/mcp-x86_64-apple-darwin"
+                sha256 "${SHA_DARWIN_X86}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/avelino/mcp/releases/download/${TAG}/mcp-aarch64-unknown-linux-gnu"
+                sha256 "${SHA_LINUX_ARM}"
+              else
+                url "https://github.com/avelino/mcp/releases/download/${TAG}/mcp-x86_64-unknown-linux-gnu"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install Dir.glob("mcp*").first => "mcp"
+            end
+
+            test do
+              assert_match "mcp", shell_output("#{bin}/mcp --help")
+            end
+          end
+          FORMULA
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' Formula/mcp.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/mcp.rb
+          git commit -m "mcp ${TAG}"
+          git push

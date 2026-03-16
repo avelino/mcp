@@ -2,21 +2,27 @@
 
 This guide takes you from zero to calling your first MCP tool. It should take about 5 minutes.
 
-## Prerequisites
-
-You need [Rust](https://rustup.rs/) installed. If you don't have it:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
 ## Installing mcp
 
-Clone the repository and build:
+**Homebrew (macOS and Linux):**
 
 ```bash
-git clone https://github.com/avelino/mcp.git
-cd mcp
+brew install avelino/mcp/mcp
+```
+
+**Pre-built binary:**
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/avelino/mcp/releases), make it executable, and move it to your `$PATH`:
+
+```bash
+chmod +x mcp-*
+sudo mv mcp-* /usr/local/bin/mcp
+```
+
+**From source (requires Rust):**
+
+```bash
+# Install Rust if needed: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo install --path .
 ```
 

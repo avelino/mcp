@@ -1,0 +1,42 @@
+name: Publish Crate
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish
+          save-if: false
+
+      - name: Verify build
+        run: cargo build
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Dry-run publish
+        run: cargo publish --dry-run
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish || echo "::warning::Crate version already published, skipping"
