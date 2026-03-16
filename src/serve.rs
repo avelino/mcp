@@ -28,34 +28,30 @@ impl ProxyServer {
         for (name, server_config) in &config.servers {
             eprintln!("[serve] connecting to {name}...");
             match McpClient::connect(server_config).await {
-                Ok(mut client) => {
-                    match client.list_tools().await {
-                        Ok(tools) => {
-                            eprintln!("[serve] {name}: {} tool(s)", tools.len());
-                            for tool in tools {
-                                let namespaced = format!("{name}{SEPARATOR}{}", tool.name);
-                                let description = match &tool.description {
-                                    Some(desc) => Some(format!("[{name}] {desc}")),
-                                    None => Some(format!("[{name}]")),
-                                };
-                                self.tool_map.insert(
-                                    namespaced.clone(),
-                                    (name.clone(), tool.name.clone()),
-                                );
-                                self.tools.push(Tool {
-                                    name: namespaced,
-                                    description,
-                                    input_schema: tool.input_schema,
-                                });
-                            }
-                            self.backends.insert(name.clone(), client);
+                Ok(mut client) => match client.list_tools().await {
+                    Ok(tools) => {
+                        eprintln!("[serve] {name}: {} tool(s)", tools.len());
+                        for tool in tools {
+                            let namespaced = format!("{name}{SEPARATOR}{}", tool.name);
+                            let description = match &tool.description {
+                                Some(desc) => Some(format!("[{name}] {desc}")),
+                                None => Some(format!("[{name}]")),
+                            };
+                            self.tool_map
+                                .insert(namespaced.clone(), (name.clone(), tool.name.clone()));
+                            self.tools.push(Tool {
+                                name: namespaced,
+                                description,
+                                input_schema: tool.input_schema,
+                            });
                         }
-                        Err(e) => {
-                            eprintln!("[serve] {name}: failed to list tools: {e:#}");
-                            let _ = client.shutdown().await;
-                        }
+                        self.backends.insert(name.clone(), client);
                     }
-                }
+                    Err(e) => {
+                        eprintln!("[serve] {name}: failed to list tools: {e:#}");
+                        let _ = client.shutdown().await;
+                    }
+                },
                 Err(e) => {
                     eprintln!("[serve] {name}: failed to connect: {e:#}");
                 }
@@ -108,19 +104,12 @@ impl ProxyServer {
             }
         };
 
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or(json!({}));
+        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
         let (server_name, original_name) = match self.tool_map.get(&tool_name) {
             Some(mapping) => mapping.clone(),
             None => {
-                return JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    &format!("unknown tool: {tool_name}"),
-                );
+                return JsonRpcResponse::error(id, -32602, &format!("unknown tool: {tool_name}"));
             }
         };
 
@@ -137,11 +126,7 @@ impl ProxyServer {
 
         match client.call_tool(&original_name, arguments).await {
             Ok(result) => JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap()),
-            Err(e) => JsonRpcResponse::error(
-                id,
-                -32603,
-                &format!("[{server_name}] {e:#}"),
-            ),
+            Err(e) => JsonRpcResponse::error(id, -32603, &format!("[{server_name}] {e:#}")),
         }
     }
 
@@ -227,8 +212,14 @@ mod tests {
 
     #[test]
     fn test_split_tool_name_via_separator() {
-        assert_eq!("sentry__search_issues".split_once(SEPARATOR), Some(("sentry", "search_issues")));
-        assert_eq!("slack__send_message".split_once(SEPARATOR), Some(("slack", "send_message")));
+        assert_eq!(
+            "sentry__search_issues".split_once(SEPARATOR),
+            Some(("sentry", "search_issues"))
+        );
+        assert_eq!(
+            "slack__send_message".split_once(SEPARATOR),
+            Some(("slack", "send_message"))
+        );
         assert_eq!("no_separator".split_once(SEPARATOR), None);
         assert_eq!("a__b__c".split_once(SEPARATOR), Some(("a", "b__c")));
     }
