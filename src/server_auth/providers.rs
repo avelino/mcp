@@ -34,9 +34,11 @@ impl AuthProvider for BearerTokenAuth {
             .get("authorization")
             .ok_or_else(|| anyhow::anyhow!("missing Authorization header"))?;
 
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| anyhow::anyhow!("Authorization header must use Bearer scheme"))?;
+        // RFC 7235: auth scheme is case-insensitive
+        if header.len() < 7 || !header[..7].eq_ignore_ascii_case("bearer ") {
+            bail!("Authorization header must use Bearer scheme");
+        }
+        let token = &header[7..];
 
         match self.tokens.get(token) {
             Some(subject) => Ok(AuthIdentity::new(subject.clone(), vec![])),
@@ -97,6 +99,20 @@ mod tests {
         creds.insert("authorization".to_string(), "Bearer secret-abc".to_string());
         let identity = provider.authenticate(&creds).await.unwrap();
         assert_eq!(identity.subject, "alice");
+    }
+
+    #[tokio::test]
+    async fn test_bearer_case_insensitive_scheme() {
+        let mut tokens = HashMap::new();
+        tokens.insert("secret-abc".to_string(), "alice".to_string());
+        let provider = BearerTokenAuth::new(tokens);
+
+        for scheme in &["bearer", "BEARER", "Bearer", "bEaReR"] {
+            let mut creds = Credentials::new();
+            creds.insert("authorization".to_string(), format!("{scheme} secret-abc"));
+            let identity = provider.authenticate(&creds).await.unwrap();
+            assert_eq!(identity.subject, "alice", "failed for scheme: {scheme}");
+        }
     }
 
     #[tokio::test]
