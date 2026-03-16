@@ -22,6 +22,7 @@ Focused explanations for specific topics:
 * **[Registry](guides/registry.md)** — Finding and adding servers from the MCP registry.
 * **[Scripting](guides/scripting.md)** — Using `mcp` in shell scripts, piping, CI/CD.
 * **[Proxy mode](guides/proxy-mode.md)** — Expose all servers as a single MCP endpoint for LLM tools.
+* **[Audit logging](guides/audit-logging.md)** — Track every operation with queryable logs and real-time streaming.
 
 ## Reference
 
