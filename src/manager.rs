@@ -60,6 +60,14 @@ pub fn add_http(name: &str, url: &str) -> Result<()> {
         );
     }
 
+    let parsed = url::Url::parse(url)
+        .with_context(|| format!("invalid URL: \"{url}\""))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => bail!("unsupported URL scheme \"{scheme}\": only http and https are allowed"),
+    }
+
     let path = config::config_path()?;
     let mut root = load_or_create_config(&path)?;
 
@@ -374,6 +382,35 @@ mod tests {
         let mut root = load_or_create_config(&path).unwrap();
         let result = get_servers_mut(&mut root);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_http_rejects_invalid_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+        std::env::set_var("MCP_CONFIG_PATH", path.as_os_str());
+
+        let result = add_http("test", "not-a-url");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid URL"));
+
+        std::env::remove_var("MCP_CONFIG_PATH");
+    }
+
+    #[test]
+    fn test_add_http_rejects_non_http_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+        std::env::set_var("MCP_CONFIG_PATH", path.as_os_str());
+
+        let result = add_http("test", "ftp://example.com/mcp");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported URL scheme"));
+
+        std::env::remove_var("MCP_CONFIG_PATH");
     }
 
     #[test]
