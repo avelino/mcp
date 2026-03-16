@@ -135,18 +135,17 @@ fn print_search_results_json(servers: &[RegistryServer]) -> Result<()> {
             }
 
             if !s.packages.is_empty() {
-                let install: Vec<String> = s
+                let pkgs: Vec<serde_json::Value> = s
                     .packages
                     .iter()
                     .map(|p| {
-                        if let Some(ref runtime) = p.runtime {
-                            format!("{} {}", runtime, p.name)
-                        } else {
-                            p.name.clone()
-                        }
+                        json!({
+                            "registryType": p.registry_type,
+                            "identifier": p.identifier,
+                        })
                     })
                     .collect();
-                entry["install"] = json!(install);
+                entry["packages"] = json!(pkgs);
             }
 
             entry
@@ -398,13 +397,7 @@ fn print_search_results_text(servers: &[RegistryServer]) -> Result<()> {
         let install = if !s.packages.is_empty() {
             s.packages
                 .iter()
-                .map(|p| {
-                    if let Some(ref runtime) = p.runtime {
-                        format!("{} {}", runtime, p.name)
-                    } else {
-                        p.name.clone()
-                    }
-                })
+                .map(|p| format!("{} ({})", p.identifier, p.registry_type))
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
@@ -744,13 +737,11 @@ mod tests {
                 name: "filesystem".to_string(),
                 description: Some("Access local files".to_string()),
                 repository: Some(Repository {
-                    url: "https://github.com/example/fs".to_string(),
+                    url: Some("https://github.com/example/fs".to_string()),
                 }),
                 packages: vec![Package {
-                    name: "@mcp/filesystem".to_string(),
-                    runtime: Some("npx".to_string()),
-                    runtime_args: vec![],
-                    package_args: vec![],
+                    registry_type: "npm".to_string(),
+                    identifier: "@mcp/filesystem".to_string(),
                     environment_variables: vec![],
                 }],
                 remotes: vec![],
@@ -772,13 +763,11 @@ mod tests {
             name: "test-server".to_string(),
             description: Some("A test server".to_string()),
             repository: Some(Repository {
-                url: "https://github.com/test/repo".to_string(),
+                url: Some("https://github.com/test/repo".to_string()),
             }),
             packages: vec![Package {
-                name: "test-pkg".to_string(),
-                runtime: Some("node".to_string()),
-                runtime_args: vec![],
-                package_args: vec![],
+                registry_type: "npm".to_string(),
+                identifier: "test-pkg".to_string(),
                 environment_variables: vec![],
             }],
             remotes: vec![],

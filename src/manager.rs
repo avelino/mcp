@@ -146,11 +146,23 @@ fn save_config(path: &std::path::Path, root: &Value) -> Result<()> {
 fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
     // Prefer packages (stdio) over remotes (http)
     if let Some(pkg) = server.packages.first() {
-        let command = pkg.runtime.as_deref().unwrap_or(&pkg.name);
-
-        let mut args: Vec<String> = pkg.runtime_args.clone();
-        args.push(pkg.name.clone());
-        args.extend(pkg.package_args.clone());
+        let (command, args) = match pkg.registry_type.as_str() {
+            "npm" => (
+                "npx".to_string(),
+                vec!["-y".to_string(), pkg.identifier.clone()],
+            ),
+            "pip" | "pypi" => ("uvx".to_string(), vec![pkg.identifier.clone()]),
+            "oci" | "docker" => (
+                "docker".to_string(),
+                vec![
+                    "run".to_string(),
+                    "-i".to_string(),
+                    "--rm".to_string(),
+                    pkg.identifier.clone(),
+                ],
+            ),
+            _ => (pkg.identifier.clone(), vec![]),
+        };
 
         let mut env = serde_json::Map::new();
         for ev in &pkg.environment_variables {
@@ -195,16 +207,14 @@ mod tests {
     use crate::registry::{EnvVar, Package, RegistryServer, Remote};
 
     #[test]
-    fn test_build_config_entry_from_package() {
+    fn test_build_config_entry_from_npm_package() {
         let server = RegistryServer {
             name: "github".to_string(),
             description: Some("GitHub server".to_string()),
             repository: None,
             packages: vec![Package {
-                name: "@modelcontextprotocol/server-github".to_string(),
-                runtime: Some("npx".to_string()),
-                runtime_args: vec!["-y".to_string()],
-                package_args: vec![],
+                registry_type: "npm".to_string(),
+                identifier: "@modelcontextprotocol/server-github".to_string(),
                 environment_variables: vec![EnvVar {
                     name: "GITHUB_TOKEN".to_string(),
                     description: Some("GitHub personal access token".to_string()),
@@ -257,10 +267,8 @@ mod tests {
             description: None,
             repository: None,
             packages: vec![Package {
-                name: "test-pkg".to_string(),
-                runtime: None,
-                runtime_args: vec![],
-                package_args: vec![],
+                registry_type: "npm".to_string(),
+                identifier: "test-pkg".to_string(),
                 environment_variables: vec![
                     EnvVar {
                         name: "TOKEN".to_string(),

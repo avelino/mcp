@@ -18,18 +18,15 @@ pub struct RegistryServer {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Repository {
-    pub url: String,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Package {
-    pub name: String,
-    #[serde(default)]
-    pub runtime: Option<String>,
-    #[serde(default, rename = "runtimeArgs")]
-    pub runtime_args: Vec<String>,
-    #[serde(default, rename = "packageArgs")]
-    pub package_args: Vec<String>,
+    #[serde(rename = "registryType")]
+    pub registry_type: String,
+    pub identifier: String,
     #[serde(default, rename = "environmentVariables")]
     pub environment_variables: Vec<EnvVar>,
 }
@@ -47,15 +44,20 @@ pub struct Remote {
 }
 
 #[derive(Debug, Deserialize)]
+struct SearchEntry {
+    server: RegistryServer,
+}
+
+#[derive(Debug, Deserialize)]
 struct SearchResponse {
-    servers: Vec<RegistryServer>,
+    servers: Vec<SearchEntry>,
 }
 
 pub async fn search_servers(query: &str) -> Result<Vec<RegistryServer>> {
     let client = reqwest::Client::new();
     let resp = client
         .get(REGISTRY_BASE_URL)
-        .query(&[("q", query), ("limit", "20")])
+        .query(&[("search", query), ("limit", "20")])
         .send()
         .await
         .context("failed to query MCP registry")?;
@@ -71,7 +73,39 @@ pub async fn search_servers(query: &str) -> Result<Vec<RegistryServer>> {
         .await
         .context("failed to parse registry response")?;
 
-    Ok(search_resp.servers)
+    let mut seen = std::collections::HashSet::new();
+    let mut servers: Vec<RegistryServer> = search_resp
+        .servers
+        .into_iter()
+        .map(|e| e.server)
+        .filter(|s| seen.insert(s.name.clone()))
+        .collect();
+
+    let query_lower = query.to_lowercase();
+    servers.sort_by_key(|s| relevance_score(s, &query_lower));
+    Ok(servers)
+}
+
+/// Lower score = more relevant.
+/// Prioritizes matches in the short name (after `/`) and description
+/// over matches that only hit a namespace prefix like `io.github.`.
+fn relevance_score(server: &RegistryServer, query: &str) -> u8 {
+    // Short name is the part after the last `/`
+    let short_name = server
+        .name
+        .rsplit('/')
+        .next()
+        .unwrap_or(&server.name)
+        .to_lowercase();
+    let desc = server.description.as_deref().unwrap_or("").to_lowercase();
+
+    if short_name.contains(query) {
+        return 0; // best: query in the actual server name
+    }
+    if desc.contains(query) {
+        return 1; // good: query in description
+    }
+    2 // worst: match only in namespace prefix
 }
 
 pub async fn find_server(name: &str) -> Result<Option<RegistryServer>> {
@@ -92,13 +126,15 @@ mod tests {
                 "url": "https://github.com/modelcontextprotocol/servers"
             },
             "packages": [{
-                "name": "@modelcontextprotocol/server-github",
-                "runtime": "npx",
-                "runtimeArgs": ["-y"],
-                "packageArgs": [],
+                "registryType": "npm",
+                "identifier": "@modelcontextprotocol/server-github",
+                "version": "1.0.0",
+                "transport": { "type": "stdio" },
                 "environmentVariables": [{
                     "name": "GITHUB_TOKEN",
-                    "description": "GitHub personal access token"
+                    "description": "GitHub personal access token",
+                    "isRequired": true,
+                    "isSecret": true
                 }]
             }],
             "remotes": []
@@ -109,9 +145,10 @@ mod tests {
         assert_eq!(server.description.unwrap(), "GitHub MCP server");
         assert_eq!(server.packages.len(), 1);
         assert_eq!(
-            server.packages[0].name,
+            server.packages[0].identifier,
             "@modelcontextprotocol/server-github"
         );
+        assert_eq!(server.packages[0].registry_type, "npm");
         assert_eq!(server.packages[0].environment_variables.len(), 1);
         assert_eq!(
             server.packages[0].environment_variables[0].name,
@@ -135,8 +172,8 @@ mod tests {
     fn test_search_response_deserialization() {
         let json = serde_json::json!({
             "servers": [
-                {"name": "github"},
-                {"name": "filesystem"}
+                {"server": {"name": "github"}},
+                {"server": {"name": "filesystem"}}
             ]
         });
         let resp: SearchResponse = serde_json::from_value(json).unwrap();
@@ -146,7 +183,8 @@ mod tests {
     #[test]
     fn test_remote_deserialization() {
         let json = serde_json::json!({
-            "url": "https://example.com/mcp/sse"
+            "url": "https://example.com/mcp/sse",
+            "type": "streamable-http"
         });
         let remote: Remote = serde_json::from_value(json).unwrap();
         assert_eq!(remote.url, "https://example.com/mcp/sse");
