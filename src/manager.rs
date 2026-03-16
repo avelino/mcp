@@ -18,11 +18,7 @@ pub async fn add_from_registry(name: &str) -> Result<()> {
     let path = config::config_path()?;
     let mut root = load_or_create_config(&path)?;
 
-    let servers = root
-        .as_object_mut()
-        .unwrap()
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
+    let servers = get_servers_mut(&mut root)?;
 
     if servers.get(name).is_some() {
         bail!("server \"{name}\" already exists in config");
@@ -33,7 +29,7 @@ pub async fn add_from_registry(name: &str) -> Result<()> {
 
     servers
         .as_object_mut()
-        .unwrap()
+        .context("\"mcpServers\" must be a JSON object")?
         .insert(name.to_string(), entry);
 
     save_config(&path, &root)?;
@@ -67,22 +63,21 @@ pub fn add_http(name: &str, url: &str) -> Result<()> {
     let path = config::config_path()?;
     let mut root = load_or_create_config(&path)?;
 
-    let servers = root
-        .as_object_mut()
-        .unwrap()
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
+    let servers = get_servers_mut(&mut root)?;
 
     if servers.get(name).is_some() {
         bail!("server \"{name}\" already exists in config");
     }
 
-    servers.as_object_mut().unwrap().insert(
-        name.to_string(),
-        json!({
-            "url": url
-        }),
-    );
+    servers
+        .as_object_mut()
+        .context("\"mcpServers\" must be a JSON object")?
+        .insert(
+            name.to_string(),
+            json!({
+                "url": url
+            }),
+        );
 
     save_config(&path, &root)?;
 
@@ -102,13 +97,12 @@ pub fn remove_server(name: &str) -> Result<()> {
 
     let mut root = load_or_create_config(&path)?;
 
-    let servers = root
-        .as_object_mut()
-        .unwrap()
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
+    let servers = get_servers_mut(&mut root)?;
 
-    let removed = servers.as_object_mut().unwrap().remove(name);
+    let removed = servers
+        .as_object_mut()
+        .context("\"mcpServers\" must be a JSON object")?
+        .remove(name);
 
     if removed.is_none() {
         bail!("server \"{name}\" not found in config");
@@ -119,6 +113,13 @@ pub fn remove_server(name: &str) -> Result<()> {
     eprintln!("✓ Server \"{}\" removed from {}", name, path.display());
 
     Ok(())
+}
+
+fn get_servers_mut(root: &mut Value) -> Result<&mut Value> {
+    let obj = root
+        .as_object_mut()
+        .context("config file must contain a JSON object at the top level")?;
+    Ok(obj.entry("mcpServers").or_insert_with(|| json!({})))
 }
 
 fn load_or_create_config(path: &std::path::Path) -> Result<Value> {
@@ -336,5 +337,55 @@ mod tests {
         assert!(is_reserved_name("search"));
         assert!(is_reserved_name("add"));
         assert!(!is_reserved_name("github"));
+    }
+
+    #[test]
+    fn test_get_servers_mut_valid_object() {
+        let mut root = json!({"mcpServers": {"a": {"command": "echo"}}});
+        let servers = get_servers_mut(&mut root).unwrap();
+        assert!(servers.is_object());
+    }
+
+    #[test]
+    fn test_get_servers_mut_creates_missing_key() {
+        let mut root = json!({});
+        let servers = get_servers_mut(&mut root).unwrap();
+        assert!(servers.is_object());
+        assert_eq!(servers, &json!({}));
+    }
+
+    #[test]
+    fn test_get_servers_mut_rejects_non_object_root() {
+        let mut root = json!([1, 2, 3]);
+        let result = get_servers_mut(&mut root);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("JSON object at the top level")
+        );
+    }
+
+    #[test]
+    fn test_load_malformed_json_string_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+        std::fs::write(&path, r#""just a string""#).unwrap();
+
+        let mut root = load_or_create_config(&path).unwrap();
+        let result = get_servers_mut(&mut root);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_malformed_json_array_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.json");
+        std::fs::write(&path, r#"[1, 2, 3]"#).unwrap();
+
+        let mut root = load_or_create_config(&path).unwrap();
+        let result = get_servers_mut(&mut root);
+        assert!(result.is_err());
     }
 }

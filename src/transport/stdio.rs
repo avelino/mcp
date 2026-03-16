@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{timeout, Duration};
@@ -13,6 +14,7 @@ pub struct StdioTransport {
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     timeout_secs: u64,
+    stderr_buffer: Arc<Mutex<Vec<String>>>,
 }
 
 impl StdioTransport {
@@ -26,7 +28,7 @@ impl StdioTransport {
             .envs(env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
 
         let mut child = cmd
             .spawn()
@@ -34,7 +36,31 @@ impl StdioTransport {
 
         let stdin = child.stdin.take().context("failed to open stdin")?;
         let stdout = child.stdout.take().context("failed to open stdout")?;
+        let stderr = child.stderr.take().context("failed to open stderr")?;
         let reader = BufReader::new(stdout);
+
+        let stderr_buffer = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        // Forward stderr to the user's stderr and capture for error messages
+        let buf = Arc::clone(&stderr_buffer);
+        tokio::spawn(async move {
+            let mut stderr_reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = stderr_reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end().to_string();
+                eprintln!("[server stderr] {trimmed}");
+                let mut buf = buf.lock().unwrap();
+                buf.push(trimmed);
+                // Keep only the last 50 lines to bound memory
+                if buf.len() > 50 {
+                    buf.remove(0);
+                }
+                line.clear();
+            }
+        });
 
         let timeout_secs = std::env::var("MCP_TIMEOUT")
             .ok()
@@ -46,6 +72,7 @@ impl StdioTransport {
             stdin,
             reader,
             timeout_secs,
+            stderr_buffer,
         })
     }
 
@@ -60,17 +87,25 @@ impl StdioTransport {
         Ok(())
     }
 
+    fn stderr_context(&self) -> String {
+        let buf = self.stderr_buffer.lock().unwrap();
+        if buf.is_empty() {
+            return String::new();
+        }
+        format!("\n\nserver stderr:\n{}", buf.join("\n"))
+    }
+
     async fn receive(&mut self) -> Result<JsonRpcResponse> {
         let duration = Duration::from_secs(self.timeout_secs);
         loop {
             let mut line = String::new();
-            let n = timeout(duration, self.reader.read_line(&mut line))
-                .await
-                .context("timeout waiting for server response")?
-                .context("failed to read from stdout")?;
+            let n = match timeout(duration, self.reader.read_line(&mut line)).await {
+                Err(_) => bail!("timeout waiting for server response{}", self.stderr_context()),
+                Ok(result) => result.context("failed to read from stdout")?,
+            };
 
             if n == 0 {
-                bail!("server closed stdout (EOF)");
+                bail!("server closed stdout (EOF){}", self.stderr_context());
             }
 
             let line = line.trim();
