@@ -136,7 +136,7 @@ pub struct ToolCallParams {
     pub arguments: Value,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ToolCallResult {
     pub content: Vec<Content>,
     #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]

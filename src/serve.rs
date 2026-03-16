@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+use crate::audit::{AuditEntry, AuditLogger};
 use crate::client::McpClient;
 use crate::config::Config;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, Tool, PROTOCOL_VERSION};
@@ -16,14 +17,16 @@ struct ProxyServer {
     backends: HashMap<String, McpClient>,
     tool_map: HashMap<String, (String, String)>, // namespaced -> (server, original_name)
     tools: Vec<Tool>,
+    audit: Arc<AuditLogger>,
 }
 
 impl ProxyServer {
-    fn new() -> Self {
+    fn new(audit: Arc<AuditLogger>) -> Self {
         Self {
             backends: HashMap::new(),
             tool_map: HashMap::new(),
             tools: Vec::new(),
+            audit,
         }
     }
 
@@ -156,13 +159,32 @@ impl ProxyServer {
         }
     }
 
+    fn extract_tool_info(
+        req: &JsonRpcRequest,
+        tool_map: &HashMap<String, (String, String)>,
+    ) -> Option<(String, String)> {
+        if req.method != "tools/call" {
+            return None;
+        }
+        let params = req.params.as_ref()?;
+        let tool_name = params.get("name")?.as_str()?;
+        tool_map
+            .get(tool_name)
+            .map(|(server, _original)| (tool_name.to_string(), server.clone()))
+    }
+
     async fn handle_request(
         &mut self,
         req: JsonRpcRequest,
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
+        source: &str,
     ) -> JsonRpcResponse {
-        match req.method.as_str() {
+        let start = std::time::Instant::now();
+        let method = req.method.clone();
+        let tool_info = Self::extract_tool_info(&req, &self.tool_map);
+
+        let response = match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id),
             "tools/list" => self.handle_tools_list(req.id, identity, acl),
             "tools/call" => {
@@ -172,7 +194,22 @@ impl ProxyServer {
             _ => {
                 JsonRpcResponse::error(req.id, -32601, &format!("method not found: {}", req.method))
             }
-        }
+        };
+
+        self.audit.log(AuditEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: source.to_string(),
+            method,
+            tool_name: tool_info.as_ref().map(|(t, _)| t.clone()),
+            server_name: tool_info.as_ref().map(|(_, s)| s.clone()),
+            identity: identity.subject.clone(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: response.error.is_none(),
+            error_message: response.error.as_ref().map(|e| e.message.clone()),
+            arguments: None,
+        });
+
+        response
     }
 
     async fn shutdown_all(&mut self) {
@@ -187,7 +224,8 @@ impl ProxyServer {
 // --- Stdio mode ---
 
 pub async fn run_stdio(config: Config) -> Result<()> {
-    let mut server = ProxyServer::new();
+    let audit = AuditLogger::open(&config.audit).unwrap_or(AuditLogger::Disabled);
+    let mut server = ProxyServer::new(Arc::new(audit));
     let identity = AuthIdentity::anonymous();
     let acl = config.server_auth.acl.clone();
 
@@ -217,7 +255,9 @@ pub async fn run_stdio(config: Config) -> Result<()> {
                 backends_connected = true;
             }
 
-            let response = server.handle_request(req, &identity, &acl).await;
+            let response = server
+                .handle_request(req, &identity, &acl, "serve:stdio")
+                .await;
 
             let mut data = serde_json::to_string(&response)?;
             data.push('\n');
@@ -303,7 +343,8 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let auth_provider = server_auth::build_auth_provider(&config.server_auth)?;
     let acl = config.server_auth.acl.clone();
 
-    let mut server = ProxyServer::new();
+    let audit = AuditLogger::open(&config.audit).unwrap_or(AuditLogger::Disabled);
+    let mut server = ProxyServer::new(Arc::new(audit));
     server.connect_backends(&config).await;
     let shared: SharedProxy = Arc::new(Mutex::new(server));
 
@@ -405,7 +446,9 @@ async fn mcp_handler(
     };
 
     let mut proxy = state.proxy.lock().await;
-    let response = proxy.handle_request(req, &identity, &state.acl).await;
+    let response = proxy
+        .handle_request(req, &identity, &state.acl, "serve:http")
+        .await;
 
     (
         StatusCode::OK,
@@ -516,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_proxy_server_initialize_response() {
-        let server = ProxyServer::new();
+        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let resp = server.handle_initialize(Value::from(1));
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -527,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_proxy_server_initialize_with_string_id() {
-        let server = ProxyServer::new();
+        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let resp = server.handle_initialize(Value::String("req-1".to_string()));
         assert!(resp.error.is_none());
         assert_eq!(resp.id, Some(Value::String("req-1".to_string())));
@@ -535,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_proxy_server_empty_tools_list() {
-        let server = ProxyServer::new();
+        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let identity = AuthIdentity::anonymous();
         let resp = server.handle_tools_list(Value::from(2), &identity, &None);
         assert!(resp.error.is_none());
@@ -546,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_proxy_server_tools_list_with_tools() {
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search for issues".to_string()),
@@ -568,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_unknown_tool() {
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
         let resp = server
@@ -582,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_params() {
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let identity = AuthIdentity::anonymous();
         let resp = server
             .handle_tools_call(Value::from(5), None, &identity, &None)
@@ -594,7 +637,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_name_in_params() {
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"arguments": {}}));
         let resp = server
@@ -608,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_backend_not_connected() {
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let identity = AuthIdentity::anonymous();
         server.tool_map.insert(
             "ghost__tool".to_string(),
@@ -649,10 +692,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_unknown_method() {
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "unknown/method", None);
-        let resp = server.handle_request(req, &identity, &None).await;
+        let resp = server.handle_request(req, &identity, &None, "test").await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
@@ -661,10 +704,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_initialize() {
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "initialize", None);
-        let resp = server.handle_request(req, &identity, &None).await;
+        let resp = server.handle_request(req, &identity, &None, "test").await;
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
@@ -674,7 +717,7 @@ mod tests {
     fn test_tools_list_filtered_by_acl() {
         use crate::server_auth::{AclConfig, AclPolicy, AclRule};
 
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search".to_string()),
@@ -708,7 +751,7 @@ mod tests {
     async fn test_tools_call_denied_by_acl() {
         use crate::server_auth::{AclConfig, AclPolicy, AclRule};
 
-        let mut server = ProxyServer::new();
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
         server.tool_map.insert(
             "sentry__search".to_string(),
             ("sentry".to_string(), "search".to_string()),
@@ -732,6 +775,39 @@ mod tests {
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert!(err.message.contains("access denied"));
+    }
+
+    #[test]
+    fn test_extract_tool_info() {
+        let mut tool_map = HashMap::new();
+        tool_map.insert(
+            "sentry__search_issues".to_string(),
+            ("sentry".to_string(), "search_issues".to_string()),
+        );
+
+        // tools/call with valid tool
+        let req = JsonRpcRequest::new(
+            1,
+            "tools/call",
+            Some(serde_json::json!({"name": "sentry__search_issues"})),
+        );
+        let info = ProxyServer::extract_tool_info(&req, &tool_map);
+        assert!(info.is_some());
+        let (tool, server) = info.unwrap();
+        assert_eq!(tool, "sentry__search_issues");
+        assert_eq!(server, "sentry");
+
+        // non tools/call method
+        let req2 = JsonRpcRequest::new(1, "tools/list", None);
+        assert!(ProxyServer::extract_tool_info(&req2, &tool_map).is_none());
+
+        // unknown tool
+        let req3 = JsonRpcRequest::new(
+            1,
+            "tools/call",
+            Some(serde_json::json!({"name": "unknown__tool"})),
+        );
+        assert!(ProxyServer::extract_tool_info(&req3, &tool_map).is_none());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::audit::AuditEntry;
 use crate::config::ServerConfig;
 use crate::protocol::{Tool, ToolCallResult};
 use crate::registry::RegistryServer;
@@ -319,12 +320,61 @@ fn print_tools_info_text(tools: &[Tool]) -> Result<()> {
     Ok(())
 }
 
+/// Try to format a MCP validation error into a human-readable message.
+/// Returns None if the text doesn't match the expected pattern.
+fn format_validation_error(text: &str) -> Option<String> {
+    // Pattern: "MCP error -NNNNN: ... Invalid arguments for tool <name>: [JSON]"
+    let marker = "Invalid arguments for tool ";
+    let marker_pos = text.find(marker)?;
+    let after_marker = &text[marker_pos + marker.len()..];
+    let colon_pos = after_marker.find(':')?;
+    let tool_name = &after_marker[..colon_pos];
+    let json_str = after_marker[colon_pos + 1..].trim();
+
+    let errors: Vec<serde_json::Value> = serde_json::from_str(json_str).ok()?;
+    if errors.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![format!(
+        "{}",
+        style(format!("missing required arguments for {tool_name}:")).red()
+    )];
+
+    for err in &errors {
+        let path = err
+            .get("path")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("invalid");
+        let expected = err.get("expected").and_then(|e| e.as_str()).unwrap_or("");
+
+        if expected.is_empty() {
+            lines.push(format!("  {} — {}", style(&path).yellow(), message));
+        } else {
+            lines.push(format!(
+                "  {} — {} ({})",
+                style(&path).yellow(),
+                message,
+                style(expected).dim()
+            ));
+        }
+    }
+
+    Some(lines.join("\n"))
+}
+
 fn print_tool_result_text(result: &ToolCallResult) -> Result<()> {
     let is_error = result.is_error.unwrap_or(false);
-
-    if is_error {
-        eprint!("{} ", style("error:").red().bold());
-    }
 
     macro_rules! out {
         ($is_error:expr, $($arg:tt)*) => {
@@ -337,7 +387,7 @@ fn print_tool_result_text(result: &ToolCallResult) -> Result<()> {
     }
 
     if is_error && result.content.is_empty() {
-        eprintln!("(no details)");
+        eprintln!("{} (no details)", style("error:").red().bold());
         return Ok(());
     }
 
@@ -345,7 +395,16 @@ fn print_tool_result_text(result: &ToolCallResult) -> Result<()> {
         match content.content_type.as_str() {
             "text" => {
                 if let Some(ref text) = content.text {
-                    out!(is_error, "{}", text);
+                    if is_error {
+                        // Try to parse validation errors into readable format
+                        if let Some(formatted) = format_validation_error(text) {
+                            eprintln!("{formatted}");
+                        } else {
+                            eprintln!("{} {}", style("error:").red().bold(), text);
+                        }
+                    } else {
+                        println!("{}", text);
+                    }
                 }
             }
             "image" => {
@@ -413,6 +472,103 @@ fn print_search_results_text(servers: &[RegistryServer]) -> Result<()> {
 
     println!("{table}");
     println!("\n{}", style(format!("{} result(s)", servers.len())).dim());
+    Ok(())
+}
+
+// --- Audit logs ---
+
+pub fn print_audit_logs(entries: &[AuditEntry], fmt: OutputFormat) -> Result<()> {
+    match fmt {
+        OutputFormat::Json => print_audit_logs_json(entries),
+        OutputFormat::Text => print_audit_logs_text(entries),
+    }
+}
+
+pub fn print_audit_log_entry(entry: &AuditEntry, fmt: OutputFormat) -> Result<()> {
+    match fmt {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string(entry)?);
+            Ok(())
+        }
+        OutputFormat::Text => {
+            let status = if entry.success {
+                "ok".to_string()
+            } else {
+                match &entry.error_message {
+                    Some(msg) => format!("error: {msg}"),
+                    None => "error".to_string(),
+                }
+            };
+            let detail = entry.detail();
+            let detail_str = if detail == "-" {
+                String::new()
+            } else {
+                format!("  {detail}")
+            };
+            // Extract short time from ISO timestamp
+            let short_time = entry.timestamp.get(11..19).unwrap_or(&entry.timestamp);
+            println!(
+                "[{}] {}  {}  {}  {}  {}ms  {}{}",
+                short_time,
+                entry.source,
+                entry.method,
+                entry.tool_name.as_deref().unwrap_or("-"),
+                entry.identity,
+                entry.duration_ms,
+                status,
+                detail_str,
+            );
+            Ok(())
+        }
+    }
+}
+
+fn print_audit_logs_text(entries: &[AuditEntry]) -> Result<()> {
+    let mut table = Table::new();
+    table
+        .load_preset(presets::NOTHING)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            header_cell("Timestamp"),
+            header_cell("Source"),
+            header_cell("Method"),
+            header_cell("Tool"),
+            header_cell("Server"),
+            header_cell("Identity"),
+            header_cell("Duration"),
+            header_cell("Status"),
+            header_cell("Detail"),
+        ]);
+
+    for entry in entries {
+        let status_cell = if entry.success {
+            Cell::new("ok").fg(Color::Green)
+        } else {
+            Cell::new("error").fg(Color::Red)
+        };
+
+        let detail = entry.detail();
+
+        table.add_row(vec![
+            Cell::new(&entry.timestamp),
+            Cell::new(&entry.source),
+            Cell::new(&entry.method),
+            Cell::new(entry.tool_name.as_deref().unwrap_or("-")),
+            Cell::new(entry.server_name.as_deref().unwrap_or("-")),
+            Cell::new(&entry.identity),
+            Cell::new(format!("{}ms", entry.duration_ms)),
+            status_cell,
+            Cell::new(&detail).fg(Color::DarkGrey),
+        ]);
+    }
+
+    println!("{table}");
+    println!("\n{}", style(format!("{} entry(ies)", entries.len())).dim());
+    Ok(())
+}
+
+fn print_audit_logs_json(entries: &[AuditEntry]) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(entries)?);
     Ok(())
 }
 
@@ -776,6 +932,79 @@ mod tests {
     }
 
     // --- Dispatch: format selection routes correctly ---
+
+    fn sample_audit_entry(success: bool) -> AuditEntry {
+        AuditEntry {
+            timestamp: "2026-03-16T18:30:00Z".to_string(),
+            source: "serve:http".to_string(),
+            method: "tools/call".to_string(),
+            tool_name: Some("sentry__search_issues".to_string()),
+            server_name: Some("sentry".to_string()),
+            identity: "alice".to_string(),
+            duration_ms: 142,
+            success,
+            error_message: if success {
+                None
+            } else {
+                Some("connection timeout".to_string())
+            },
+            arguments: None,
+        }
+    }
+
+    #[test]
+    fn test_print_audit_logs_json() {
+        let entries = vec![sample_audit_entry(true)];
+        print_audit_logs_json(&entries).unwrap();
+    }
+
+    #[test]
+    fn test_print_audit_logs_text_empty() {
+        // Should not panic with empty entries
+        print_audit_logs_text(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_print_audit_logs_text_with_entries() {
+        let entries = vec![sample_audit_entry(true), sample_audit_entry(false)];
+        print_audit_logs_text(&entries).unwrap();
+    }
+
+    #[test]
+    fn test_print_audit_log_entry_text() {
+        let entry = sample_audit_entry(true);
+        print_audit_log_entry(&entry, OutputFormat::Text).unwrap();
+    }
+
+    #[test]
+    fn test_print_audit_log_entry_error() {
+        let entry = sample_audit_entry(false);
+        print_audit_log_entry(&entry, OutputFormat::Text).unwrap();
+    }
+
+    #[test]
+    fn test_format_validation_error_parses_sentry_style() {
+        let text = r#"MCP error -32602: Input validation error: Invalid arguments for tool search_issues: [
+  {
+    "code": "invalid_type",
+    "expected": "string",
+    "received": "undefined",
+    "path": ["organizationSlug"],
+    "message": "Required"
+  }
+]"#;
+        let formatted = format_validation_error(text);
+        assert!(formatted.is_some());
+        let formatted = formatted.unwrap();
+        assert!(formatted.contains("organizationSlug"));
+        assert!(formatted.contains("Required"));
+    }
+
+    #[test]
+    fn test_format_validation_error_returns_none_for_normal_text() {
+        assert!(format_validation_error("connection timeout").is_none());
+        assert!(format_validation_error("some random error").is_none());
+    }
 
     #[test]
     fn test_print_servers_dispatches_json() {

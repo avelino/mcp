@@ -5,10 +5,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::audit::AuditConfig;
 use crate::server_auth::ServerAuthConfig;
 
 const RESERVED_NAMES: &[&str] = &[
-    "search", "add", "remove", "list", "help", "version", "serve",
+    "search", "add", "remove", "list", "help", "version", "serve", "logs",
 ];
 
 #[derive(Debug, Deserialize, Clone)]
@@ -32,6 +33,7 @@ pub enum ServerConfig {
 pub struct Config {
     pub servers: HashMap<String, ServerConfig>,
     pub server_auth: ServerAuthConfig,
+    pub audit: AuditConfig,
     pub path: PathBuf,
 }
 
@@ -57,6 +59,7 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         return Ok(Config {
             servers: HashMap::new(),
             server_auth: ServerAuthConfig::default(),
+            audit: AuditConfig::default(),
             path: path.clone(),
         });
     }
@@ -84,9 +87,17 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         .transpose()?
         .unwrap_or_default();
 
+    let audit: AuditConfig = raw
+        .get("audit")
+        .cloned()
+        .map(|v| serde_json::from_value(v).context("failed to parse audit from config"))
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(Config {
         servers,
         server_auth,
+        audit,
         path: path.clone(),
     })
 }
@@ -294,7 +305,35 @@ mod tests {
         assert!(is_reserved_name("search"));
         assert!(is_reserved_name("add"));
         assert!(is_reserved_name("remove"));
+        assert!(is_reserved_name("logs"));
         assert!(!is_reserved_name("github"));
         assert!(!is_reserved_name("filesystem"));
+    }
+
+    #[test]
+    fn test_parse_audit_config() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {},
+                "audit": {
+                    "enabled": true,
+                    "log_arguments": true,
+                    "path": "/tmp/audit/data",
+                    "index_path": "/tmp/audit/index"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(config.audit.enabled);
+        assert!(config.audit.log_arguments);
+        assert_eq!(config.audit.path.unwrap(), "/tmp/audit/data");
+    }
+
+    #[test]
+    fn test_parse_config_without_audit() {
+        let config = config_from_json(r#"{"mcpServers": {}}"#).unwrap();
+        assert!(config.audit.enabled); // default
+        assert!(!config.audit.log_arguments); // default
+        assert!(config.audit.path.is_none());
     }
 }
