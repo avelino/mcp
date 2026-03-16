@@ -126,6 +126,9 @@ Tokens are saved in `~/.config/mcp/auth.json` and refreshed automatically.
 | `mcp add --url <url> <name>` | Add an HTTP server |
 | `mcp remove <name>` | Remove a server |
 | `mcp serve` | Start proxy — all servers as one MCP endpoint |
+| `mcp logs` | Show audit log entries |
+| `mcp logs --errors` | Show only failures |
+| `mcp logs -f` | Follow mode — stream new entries live |
 
 ## Piping JSON from stdin
 
@@ -181,6 +184,20 @@ Use `mcp serve` to expose all your configured servers as a single MCP endpoint. 
 ```
 
 This works with Claude Code, Cursor, Windsurf, or any MCP-compatible client. Tools are namespaced as `server__tool` (e.g. `sentry__search_issues`). See the [proxy mode guide](docs/guides/proxy-mode.md) for details.
+
+## Audit logging
+
+Every operation is logged — tool calls, searches, config changes, proxy requests. Query the log with filters or stream it in real-time:
+
+```bash
+mcp logs                          # recent entries
+mcp logs --server sentry --errors # sentry failures only
+mcp logs --since 1h               # last hour
+mcp logs -f                       # follow mode (tail -f)
+mcp logs --json | jq '...'        # pipe to jq
+```
+
+Logs are stored locally in an embedded database. No external services, no network calls. See the [audit logging guide](docs/guides/audit-logging.md) for configuration and details.
 
 ## Environment variables
 
