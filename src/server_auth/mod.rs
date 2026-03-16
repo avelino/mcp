@@ -1,8 +1,12 @@
 mod acl;
 mod providers;
 
-pub use acl::{AclConfig, AclPolicy, AclRule};
+pub use acl::AclConfig;
 pub use providers::{BearerTokenAuth, ForwardedUserAuth, NoAuth};
+
+// Re-exported for tests in other modules (serve.rs)
+#[cfg(test)]
+pub use acl::{AclPolicy, AclRule};
 
 use anyhow::Result;
 use async_trait::async_trait;
