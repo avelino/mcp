@@ -19,6 +19,24 @@ chmod +x mcp-*
 sudo mv mcp-* /usr/local/bin/mcp
 ```
 
+**Docker:**
+
+```bash
+docker pull ghcr.io/avelino/mcp
+```
+
+To use it like a native command, create an alias:
+
+```bash
+alias mcp='docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp'
+```
+
+Add the alias to your shell profile (`~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`) to make it permanent. If your servers need environment variables (API tokens, etc.), pass them with `-e`:
+
+```bash
+alias mcp='docker run --rm -v ~/.config/mcp:/root/.config/mcp -e GITHUB_TOKEN ghcr.io/avelino/mcp'
+```
+
 **From source (requires Rust):**
 
 ```bash

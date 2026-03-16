@@ -28,6 +28,10 @@ Output is always JSON. Pipe it, `jq` it, script it.
 # Homebrew (macOS and Linux)
 brew install avelino/mcp/mcp
 
+# Docker
+docker pull ghcr.io/avelino/mcp
+alias mcp='docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp'
+
 # Pre-built binary from GitHub Releases
 # Download the latest from https://github.com/avelino/mcp/releases
 
@@ -129,6 +133,36 @@ If you don't pass JSON arguments on the command line, `mcp` reads from stdin:
 ```bash
 echo '{"query": "is:unresolved"}' | mcp sentry search_issues
 ```
+
+## Docker
+
+The CLI is available as a multi-arch Docker image (amd64/arm64):
+
+```bash
+# Run directly
+docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp --list
+
+# Call a tool
+docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp sentry search_issues '{"query": "is:unresolved"}'
+
+# Pass environment variables for servers that need them
+docker run --rm \
+  -v ~/.config/mcp:/root/.config/mcp \
+  -e GITHUB_TOKEN \
+  ghcr.io/avelino/mcp github search_repositories '{"query": "mcp"}'
+
+# Use an alias for convenience
+alias mcp='docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp'
+mcp sentry --list
+```
+
+Available tags:
+
+| Tag | Description |
+|---|---|
+| `latest` | Latest stable release |
+| `x.y.z` | Pinned version |
+| `beta` | Latest build from main branch |
 
 ## Environment variables
 

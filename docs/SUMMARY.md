@@ -17,6 +17,7 @@
 
 ## How-to
 
+* [Docker](howto/docker.md)
 * [Supported services](howto/services.md)
 * [Troubleshooting](howto/troubleshooting.md)
 
