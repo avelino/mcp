@@ -87,9 +87,7 @@ const AUTH_HINTS: &[AuthHint] = &[
 
 fn find_auth_hint(server_url: &str) -> Option<&'static AuthHint> {
     let url_lower = server_url.to_lowercase();
-    AUTH_HINTS
-        .iter()
-        .find(|h| url_lower.contains(h.name))
+    AUTH_HINTS.iter().find(|h| url_lower.contains(h.name))
 }
 
 /// Prompt user for a token and store it.
@@ -109,7 +107,9 @@ pub fn prompt_for_token(server_url: &str) -> Result<String> {
 
     eprintln!("Enter access token for {key}:");
     eprint!("> ");
-    std::io::stderr().flush().context("failed to flush stderr")?;
+    std::io::stderr()
+        .flush()
+        .context("failed to flush stderr")?;
 
     let mut token = String::new();
     std::io::stdin()

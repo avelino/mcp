@@ -78,8 +78,14 @@ mod tests {
 
     #[test]
     fn test_server_key_normalization() {
-        assert_eq!(server_key("https://mcp.sentry.dev/"), "https://mcp.sentry.dev");
-        assert_eq!(server_key("https://mcp.sentry.dev"), "https://mcp.sentry.dev");
+        assert_eq!(
+            server_key("https://mcp.sentry.dev/"),
+            "https://mcp.sentry.dev"
+        );
+        assert_eq!(
+            server_key("https://mcp.sentry.dev"),
+            "https://mcp.sentry.dev"
+        );
     }
 
     #[test]

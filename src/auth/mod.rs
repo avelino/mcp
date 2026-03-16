@@ -3,16 +3,13 @@ pub mod oauth;
 pub mod store;
 
 use anyhow::{Context, Result};
-use store::{server_key, load_auth_store};
+use store::{load_auth_store, server_key};
 
 /// Get a saved token without triggering any OAuth flow.
 pub fn get_saved_token(server_url: &str) -> Result<String> {
     let key = server_key(server_url);
     let auth_store = load_auth_store()?;
-    let tokens = auth_store
-        .tokens
-        .get(&key)
-        .context("no saved token")?;
+    let tokens = auth_store.tokens.get(&key).context("no saved token")?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -164,8 +164,8 @@ fn parse_response(text: &str) -> Result<JsonRpcResponse> {
     if text.starts_with("data:") || text.contains("\ndata:") {
         let last_data = text
             .lines()
-            .filter(|l| l.starts_with("data:"))
-            .last()
+            .rev()
+            .find(|l| l.starts_with("data:"))
             .context("no data in SSE response")?;
         let json = last_data.trim_start_matches("data:").trim();
         serde_json::from_str(json).context("failed to parse SSE JSON response")

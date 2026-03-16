@@ -64,7 +64,8 @@ pub async fn run_oauth_flow(server_url: &str) -> Result<String> {
 
     let scopes = metadata.scopes_supported.join(" ");
     let mut auth_url = Url::parse(&metadata.authorization_endpoint)?;
-    auth_url.query_pairs_mut()
+    auth_url
+        .query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &client_id)
         .append_pair("redirect_uri", &redirect_uri)
@@ -101,7 +102,10 @@ pub async fn run_oauth_flow(server_url: &str) -> Result<String> {
         bail!("token exchange failed: {text}");
     }
 
-    let token_resp: TokenResponse = resp.json().await.context("failed to parse token response")?;
+    let token_resp: TokenResponse = resp
+        .json()
+        .await
+        .context("failed to parse token response")?;
     let tokens = to_stored_tokens(&token_resp);
     let access_token = tokens.access_token.clone();
 
@@ -154,13 +158,19 @@ pub async fn try_refresh(server_key_str: &str, refresh_token: &str) -> Result<St
 async fn discover_auth_server(server_url: &str) -> Result<AuthServerMetadata> {
     let http = reqwest::Client::new();
     let base = Url::parse(server_url)?;
-    let origin = format!("{}://{}", base.scheme(), base.host_str().unwrap_or("localhost"));
+    let origin = format!(
+        "{}://{}",
+        base.scheme(),
+        base.host_str().unwrap_or("localhost")
+    );
 
     let resource_url = format!("{origin}/.well-known/oauth-protected-resource");
     let auth_server_origin = if let Ok(resp) = http.get(&resource_url).send().await {
         if resp.status().is_success() {
             if let Ok(resource) = resp.json::<ProtectedResourceMetadata>().await {
-                resource.authorization_servers.first()
+                resource
+                    .authorization_servers
+                    .first()
                     .map(|s| s.trim_end_matches('/').to_string())
             } else {
                 None
@@ -314,9 +324,15 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
         bail!("authorization error: {error} — {desc}");
     }
 
-    let state = params.get("state").context("callback missing state parameter")?;
+    let state = params
+        .get("state")
+        .context("callback missing state parameter")?;
     if state != expected_state {
-        send_callback_response(&mut stream, "Authorization failed (invalid state). You can close this tab.").await;
+        send_callback_response(
+            &mut stream,
+            "Authorization failed (invalid state). You can close this tab.",
+        )
+        .await;
         bail!("state mismatch in OAuth callback");
     }
 
@@ -325,16 +341,18 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
         .context("callback missing code parameter")?
         .to_string();
 
-    send_callback_response(&mut stream, "Authorization successful! You can close this tab and return to the terminal.").await;
+    send_callback_response(
+        &mut stream,
+        "Authorization successful! You can close this tab and return to the terminal.",
+    )
+    .await;
 
     Ok(code)
 }
 
 async fn send_callback_response(stream: &mut tokio::net::TcpStream, message: &str) {
     use tokio::io::AsyncWriteExt;
-    let body = format!(
-        "<html><body><h2>{message}</h2></body></html>"
-    );
+    let body = format!("<html><body><h2>{message}</h2></body></html>");
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -367,7 +385,9 @@ mod tests {
     fn test_generate_random_string() {
         let s = generate_random_string(32);
         assert_eq!(s.len(), 32);
-        assert!(s.chars().all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
     }
 
     #[test]
@@ -379,7 +399,10 @@ mod tests {
             "scopes_supported": ["org:read", "project:write"]
         });
         let metadata: AuthServerMetadata = serde_json::from_value(json).unwrap();
-        assert_eq!(metadata.authorization_endpoint, "https://mcp.sentry.dev/oauth/authorize");
+        assert_eq!(
+            metadata.authorization_endpoint,
+            "https://mcp.sentry.dev/oauth/authorize"
+        );
         assert_eq!(metadata.scopes_supported.len(), 2);
     }
 }

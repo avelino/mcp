@@ -44,18 +44,13 @@ async fn run() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     let json_flag = raw_args.iter().any(|a| a == "--json");
-    let args: Vec<String> = raw_args
-        .into_iter()
-        .filter(|a| a != "--json")
-        .collect();
+    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--json").collect();
     let fmt = OutputFormat::detect(json_flag);
 
     let cfg = config::load_config()?;
     let conflicts = config::validate_server_names(&cfg);
     for name in &conflicts {
-        eprintln!(
-            "warning: server \"{name}\" conflicts with a reserved command name"
-        );
+        eprintln!("warning: server \"{name}\" conflicts with a reserved command name");
         eprintln!(
             "  → rename it in {} to avoid unexpected behavior",
             cfg.path.display()
@@ -101,7 +96,11 @@ async fn run() -> Result<()> {
     handle_server_command(&args, &cfg, fmt).await
 }
 
-async fn handle_server_command(args: &[String], cfg: &config::Config, fmt: OutputFormat) -> Result<()> {
+async fn handle_server_command(
+    args: &[String],
+    cfg: &config::Config,
+    fmt: OutputFormat,
+) -> Result<()> {
     let server_name = &args[0];
     let server_config = cfg
         .servers

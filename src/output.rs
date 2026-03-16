@@ -1,9 +1,9 @@
-use anyhow::Result;
-use comfy_table::{presets, Attribute, Cell, Color, ContentArrangement, Table};
-use console::style;
 use crate::config::ServerConfig;
 use crate::protocol::{Tool, ToolCallResult};
 use crate::registry::RegistryServer;
+use anyhow::Result;
+use comfy_table::{presets, Attribute, Cell, Color, ContentArrangement, Table};
+use console::style;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -191,9 +191,7 @@ fn print_servers_text(servers: &HashMap<String, ServerConfig>) -> Result<()> {
                 };
                 (name.clone(), "stdio".to_string(), endpoint)
             }
-            ServerConfig::Http { url, .. } => {
-                (name.clone(), "http".to_string(), url.clone())
-            }
+            ServerConfig::Http { url, .. } => (name.clone(), "http".to_string(), url.clone()),
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -234,10 +232,7 @@ fn print_tools_text(tools: &[Tool]) -> Result<()> {
     table
         .load_preset(presets::NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            header_cell("Tool"),
-            header_cell("Description"),
-        ]);
+        .set_header(vec![header_cell("Tool"), header_cell("Description")]);
 
     for t in tools {
         let desc = t.description.as_deref().unwrap_or("-");
@@ -284,10 +279,7 @@ fn print_tools_info_text(tools: &[Tool]) -> Result<()> {
 
                     println!("  {}:", style("Parameters").dim());
                     for (name, prop) in obj {
-                        let ptype = prop
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("any");
+                        let ptype = prop.get("type").and_then(|v| v.as_str()).unwrap_or("any");
                         let is_req = required.contains(name);
                         let pdesc = prop
                             .get("description")
@@ -373,7 +365,11 @@ fn print_tool_result_text(result: &ToolCallResult) -> Result<()> {
                 if let Some(ref text) = content.text {
                     out!(is_error, "{}", text);
                 } else {
-                    out!(is_error, "{}", style(format!("[{other}: unsupported content type]")).dim());
+                    out!(
+                        is_error,
+                        "{}",
+                        style(format!("[{other}: unsupported content type]")).dim()
+                    );
                 }
             }
         }
@@ -423,10 +419,7 @@ fn print_search_results_text(servers: &[RegistryServer]) -> Result<()> {
     }
 
     println!("{table}");
-    println!(
-        "\n{}",
-        style(format!("{} result(s)", servers.len())).dim()
-    );
+    println!("\n{}", style(format!("{} result(s)", servers.len())).dim());
     Ok(())
 }
 

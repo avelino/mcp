@@ -108,7 +108,10 @@ mod tests {
         assert_eq!(server.name, "github");
         assert_eq!(server.description.unwrap(), "GitHub MCP server");
         assert_eq!(server.packages.len(), 1);
-        assert_eq!(server.packages[0].name, "@modelcontextprotocol/server-github");
+        assert_eq!(
+            server.packages[0].name,
+            "@modelcontextprotocol/server-github"
+        );
         assert_eq!(server.packages[0].environment_variables.len(), 1);
         assert_eq!(
             server.packages[0].environment_variables[0].name,

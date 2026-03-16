@@ -68,8 +68,8 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    let servers: HashMap<String, ServerConfig> = serde_json::from_value(servers_value)
-        .context("failed to parse mcpServers from config")?;
+    let servers: HashMap<String, ServerConfig> =
+        serde_json::from_value(servers_value).context("failed to parse mcpServers from config")?;
 
     Ok(Config {
         servers,

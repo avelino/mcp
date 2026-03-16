@@ -1,11 +1,14 @@
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
 use crate::config::{self, is_reserved_name};
 use crate::registry;
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 
 pub async fn add_from_registry(name: &str) -> Result<()> {
     if is_reserved_name(name) {
-        bail!("\"{}\" is a reserved command name and cannot be used as a server name", name);
+        bail!(
+            "\"{}\" is a reserved command name and cannot be used as a server name",
+            name
+        );
     }
 
     let server = registry::find_server(name)
@@ -42,9 +45,7 @@ pub async fn add_from_registry(name: &str) -> Result<()> {
     if !env_vars.is_empty() {
         eprintln!("\nConfigure the following environment variables:");
         for (var_name, description) in &env_vars {
-            let desc = description
-                .as_deref()
-                .unwrap_or("(no description)");
+            let desc = description.as_deref().unwrap_or("(no description)");
             eprintln!("  {var_name}  — {desc}");
         }
     }
@@ -57,7 +58,10 @@ pub async fn add_from_registry(name: &str) -> Result<()> {
 
 pub fn add_http(name: &str, url: &str) -> Result<()> {
     if is_reserved_name(name) {
-        bail!("\"{}\" is a reserved command name and cannot be used as a server name", name);
+        bail!(
+            "\"{}\" is a reserved command name and cannot be used as a server name",
+            name
+        );
     }
 
     let path = config::config_path()?;
@@ -135,18 +139,14 @@ fn load_or_create_config(path: &std::path::Path) -> Result<Value> {
 
 fn save_config(path: &std::path::Path, root: &Value) -> Result<()> {
     let content = serde_json::to_string_pretty(root)?;
-    std::fs::write(path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
 fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
     // Prefer packages (stdio) over remotes (http)
     if let Some(pkg) = server.packages.first() {
-        let command = pkg
-            .runtime
-            .as_deref()
-            .unwrap_or(&pkg.name);
+        let command = pkg.runtime.as_deref().unwrap_or(&pkg.name);
 
         let mut args: Vec<String> = pkg.runtime_args.clone();
         args.push(pkg.name.clone());
@@ -154,10 +154,7 @@ fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
 
         let mut env = serde_json::Map::new();
         for ev in &pkg.environment_variables {
-            env.insert(
-                ev.name.clone(),
-                Value::String(format!("${{{}}}", ev.name)),
-            );
+            env.insert(ev.name.clone(), Value::String(format!("${{{}}}", ev.name)));
         }
 
         let mut entry = json!({
@@ -182,9 +179,7 @@ fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
     }
 }
 
-fn collect_env_vars(
-    server: &registry::RegistryServer,
-) -> Vec<(String, Option<String>)> {
+fn collect_env_vars(server: &registry::RegistryServer) -> Vec<(String, Option<String>)> {
     let mut vars = Vec::new();
     for pkg in &server.packages {
         for ev in &pkg.environment_variables {

@@ -75,10 +75,9 @@ impl McpClient {
                 bail!("tools/list failed: {} (code {})", err.message, err.code);
             }
 
-            let result: ToolsListResult = serde_json::from_value(
-                resp.result.context("tools/list returned no result")?,
-            )
-            .context("failed to parse tools/list result")?;
+            let result: ToolsListResult =
+                serde_json::from_value(resp.result.context("tools/list returned no result")?)
+                    .context("failed to parse tools/list result")?;
 
             all_tools.extend(result.tools);
 
@@ -113,10 +112,9 @@ impl McpClient {
             bail!("tools/call failed: {} (code {})", err.message, err.code);
         }
 
-        let result: ToolCallResult = serde_json::from_value(
-            resp.result.context("tools/call returned no result")?,
-        )
-        .context("failed to parse tools/call result")?;
+        let result: ToolCallResult =
+            serde_json::from_value(resp.result.context("tools/call returned no result")?)
+                .context("failed to parse tools/call result")?;
 
         Ok(result)
     }
