@@ -91,6 +91,101 @@ These names cannot be used as server names:
 
 Using a reserved name won't break the config, but you'll get a warning and the server may be shadowed by built-in commands.
 
+## Server authentication (`serverAuth`)
+
+Optional. Configures authentication for `mcp serve --http`. Ignored for direct CLI usage.
+
+```json
+{
+  "mcpServers": { ... },
+  "serverAuth": {
+    "provider": "<provider>",
+    "bearer": { ... },
+    "forwarded": { ... },
+    "acl": { ... }
+  }
+}
+```
+
+### Provider
+
+| Value | Description |
+|-------|-------------|
+| `"none"` (default) | No authentication — all requests are anonymous |
+| `"bearer"` | Static bearer token validation |
+| `"forwarded"` | Trust reverse proxy header |
+
+### Bearer config
+
+Required when `provider` is `"bearer"`.
+
+```json
+{
+  "bearer": {
+    "tokens": {
+      "<token>": "<subject>",
+      "secret-abc": "alice"
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tokens` | object | Map of token → subject identity |
+
+### Forwarded config
+
+Optional when `provider` is `"forwarded"`. Defaults to `x-forwarded-user`.
+
+```json
+{
+  "forwarded": {
+    "header": "x-forwarded-user"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `header` | string | `"x-forwarded-user"` | Header name to read the authenticated user from |
+
+### ACL config
+
+Optional. Controls which users can access which tools.
+
+```json
+{
+  "acl": {
+    "default": "allow",
+    "rules": [
+      {
+        "subjects": ["bob"],
+        "roles": ["viewer"],
+        "tools": ["sentry__*"],
+        "policy": "deny"
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `default` | `"allow"` \| `"deny"` | `"allow"` | Default policy when no rule matches |
+| `rules` | array | `[]` | Ordered list of ACL rules (first match wins) |
+
+#### ACL rule
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `subjects` | string[] | `[]` (match all) | User subjects to match (`*` = any) |
+| `roles` | string[] | `[]` (match all) | Roles to match (`*` = any) |
+| `tools` | string[] | *required* | Tool name patterns (supports `*` prefix/suffix globs) |
+| `policy` | `"allow"` \| `"deny"` | *required* | Action when rule matches |
+
+Both `subjects` and `roles` must match for a rule to apply. Empty means "match all".
+
 ## Auth store
 
 Tokens and OAuth client registrations are stored separately in:

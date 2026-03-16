@@ -150,3 +150,44 @@ When multiple auth sources exist, the priority is:
 2. **Saved token** — Token from `auth.json` (loaded on connect)
 3. **OAuth flow** — Triggered on 401 response
 4. **Manual prompt** — If OAuth registration fails
+
+## Server-side authentication (proxy mode)
+
+The sections above cover **client-side** authentication — how `mcp` authenticates when calling remote MCP servers. When running `mcp serve --http`, the proxy itself can also **authenticate incoming requests** from clients.
+
+This is configured via the `serverAuth` key in `servers.json`. See the [proxy mode guide](proxy-mode.md#authentication) for full details.
+
+### Quick example
+
+```json
+{
+  "mcpServers": { ... },
+  "serverAuth": {
+    "provider": "bearer",
+    "bearer": {
+      "tokens": {
+        "tok-alice": "alice",
+        "tok-bob": "bob"
+      }
+    },
+    "acl": {
+      "default": "allow",
+      "rules": [
+        { "subjects": ["bob"], "tools": ["sentry__*"], "policy": "deny" }
+      ]
+    }
+  }
+}
+```
+
+### Available providers
+
+| Provider | Use case |
+|----------|----------|
+| `none` (default) | No auth — all requests are anonymous |
+| `bearer` | Static token-to-user mapping |
+| `forwarded` | Trust reverse proxy `X-Forwarded-User` header |
+
+### Access control (ACL)
+
+Rules control which authenticated users can access which tools. Rules are evaluated in order — first match wins. See [proxy mode ACL docs](proxy-mode.md#access-control-acl) for the full rule syntax.

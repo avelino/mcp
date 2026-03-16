@@ -122,6 +122,24 @@ The proxy reuses the same `McpClient` and `Transport` abstractions — no new pr
 
 Error handling is partial-availability: if one backend fails to connect, the others still work. If a backend dies mid-session, the proxy returns an MCP-level error for that tool call without crashing.
 
+### Server-side authentication
+
+The proxy supports an optional authentication layer for HTTP mode, designed to be transport-independent:
+
+```
+HTTP headers → extract_credentials() → Credentials (HashMap)
+                                            ↓
+                                    AuthProvider.authenticate()
+                                            ↓
+                                    AuthIdentity { subject, roles }
+                                            ↓
+                                    ACL.is_tool_allowed()
+```
+
+The `AuthProvider` trait and `AuthIdentity` type are transport-agnostic — only `extract_credentials()` knows about HTTP headers. This means the same auth logic works across any transport. Stdio mode always uses `AuthIdentity::anonymous()`.
+
+Three providers are available: `NoAuth` (default), `BearerTokenAuth` (static token mapping), and `ForwardedUserAuth` (reverse proxy header trust). The ACL system filters `tools/list` responses and blocks unauthorized `tools/call` requests before they reach backends.
+
 ## Design principles
 
 - **No daemon** — Each invocation is independent. Start, connect, do the thing, exit. Tokens are persisted to disk, everything else is ephemeral.

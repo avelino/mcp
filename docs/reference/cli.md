@@ -157,13 +157,18 @@ Content items have a `type` field:
 
 ### `mcp serve`
 
-Start a proxy server that aggregates all configured backends into a single MCP endpoint over stdio.
+Start a proxy server that aggregates all configured backends into a single MCP endpoint.
 
 ```bash
-mcp serve
+mcp serve               # stdio mode (default)
+mcp serve --http        # HTTP mode on 127.0.0.1:8080
+mcp serve --http :9090  # HTTP mode on custom port
+mcp serve --http 0.0.0.0:8080 --insecure  # HTTP on all interfaces
 ```
 
 The proxy connects to every server in `servers.json`, merges their tool lists with namespaced names (`server__tool`), and routes `tools/call` requests to the correct backend.
+
+#### Stdio mode (default)
 
 Designed to be used as a stdio transport in any MCP client:
 
@@ -180,7 +185,32 @@ Designed to be used as a stdio transport in any MCP client:
 
 Diagnostics are logged to stderr. Protocol messages use stdin/stdout.
 
-See **[Proxy mode guide](../guides/proxy-mode.md)** for full details and client configuration examples.
+#### HTTP mode (`--http`)
+
+Exposes the proxy over HTTP with the following endpoints:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/mcp` | JSON-RPC 2.0 request/response endpoint |
+| `GET` | `/mcp/sse` | SSE endpoint for streaming (per MCP spec) |
+| `GET` | `/health` | Health check (returns JSON status) |
+
+Default bind address is `127.0.0.1:8080` (localhost only). To bind to a different address:
+
+```bash
+mcp serve --http 127.0.0.1:9090
+mcp serve --http :3000              # shorthand for 0.0.0.0:3000 — requires --insecure
+```
+
+#### `--insecure`
+
+Allow binding to non-loopback addresses without TLS. Required when using addresses like `0.0.0.0`, `192.168.x.x`, etc. Without this flag, the server refuses to start on non-loopback interfaces to prevent accidental plaintext exposure.
+
+#### Graceful shutdown
+
+The HTTP server handles `SIGTERM` and `SIGINT` (Ctrl+C) gracefully: stops accepting new connections, finishes in-flight requests, and disconnects all backends.
+
+See **[Proxy mode guide](../guides/proxy-mode.md)** for full details, client configuration examples, and team setup.
 
 ## Registry commands
 

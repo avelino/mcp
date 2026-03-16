@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "example": {
+      "url": "https://mcp.example.com/sse",
+      "headers": {
+        "Authorization": "Bearer ${MCP_EXAMPLE_TOKEN}"
+      }
+    }
+  },
+  "serverAuth": {
+    "provider": "bearer",
+    "bearer": {
+      "tokens": {
+        "change-me-alice": "alice",
+        "change-me-bob": "bob"
+      }
+    },
+    "acl": {
+      "default": "allow",
+      "rules": [
+        {
+          "subjects": ["bob"],
+          "tools": ["example__admin_*"],
+          "policy": "deny"
+        }
+      ]
+    }
+  }
+}

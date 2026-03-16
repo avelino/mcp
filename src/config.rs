@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::server_auth::ServerAuthConfig;
+
 const RESERVED_NAMES: &[&str] = &[
     "search", "add", "remove", "list", "help", "version", "serve",
 ];
@@ -29,6 +31,7 @@ pub enum ServerConfig {
 #[derive(Debug)]
 pub struct Config {
     pub servers: HashMap<String, ServerConfig>,
+    pub server_auth: ServerAuthConfig,
     pub path: PathBuf,
 }
 
@@ -53,6 +56,7 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
     if !path.exists() {
         return Ok(Config {
             servers: HashMap::new(),
+            server_auth: ServerAuthConfig::default(),
             path: path.clone(),
         });
     }
@@ -73,8 +77,16 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
     let servers: HashMap<String, ServerConfig> =
         serde_json::from_value(servers_value).context("failed to parse mcpServers from config")?;
 
+    let server_auth: ServerAuthConfig = raw
+        .get("serverAuth")
+        .cloned()
+        .map(|v| serde_json::from_value(v).context("failed to parse serverAuth from config"))
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(Config {
         servers,
+        server_auth,
         path: path.clone(),
     })
 }
