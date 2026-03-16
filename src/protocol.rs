@@ -8,7 +8,7 @@ pub const PROTOCOL_VERSION: &str = "2025-03-26";
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: Value,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
@@ -18,7 +18,7 @@ impl JsonRpcRequest {
     pub fn new(id: u64, method: &str, params: Option<Value>) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: Value::from(id),
             method: method.to_string(),
             params,
         }
@@ -29,7 +29,8 @@ impl JsonRpcRequest {
 pub struct JsonRpcResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jsonrpc: Option<String>,
-    pub id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,7 +38,7 @@ pub struct JsonRpcResponse {
 }
 
 impl JsonRpcResponse {
-    pub fn success(id: u64, result: Value) -> Self {
+    pub fn success(id: Value, result: Value) -> Self {
         Self {
             jsonrpc: Some("2.0".to_string()),
             id: Some(id),
@@ -46,7 +47,7 @@ impl JsonRpcResponse {
         }
     }
 
-    pub fn error(id: u64, code: i64, message: &str) -> Self {
+    pub fn error(id: Value, code: i64, message: &str) -> Self {
         Self {
             jsonrpc: Some("2.0".to_string()),
             id: Some(id),
@@ -180,9 +181,25 @@ mod tests {
     fn test_jsonrpc_response_with_result() {
         let json = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
         let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.id, Some(1));
+        assert_eq!(resp.id, Some(Value::from(1)));
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_request_with_string_id() {
+        let json = r#"{"jsonrpc":"2.0","id":"abc-123","method":"tools/list"}"#;
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.id, Value::String("abc-123".to_string()));
+        assert_eq!(req.method, "tools/list");
+    }
+
+    #[test]
+    fn test_jsonrpc_response_with_string_id() {
+        let json = r#"{"jsonrpc":"2.0","id":"abc-123","result":{"tools":[]}}"#;
+        let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, Some(Value::String("abc-123".to_string())));
+        assert!(resp.result.is_some());
     }
 
     #[test]

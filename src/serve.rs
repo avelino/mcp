@@ -64,7 +64,7 @@ impl ProxyServer {
         );
     }
 
-    fn handle_initialize(&self, id: u64) -> JsonRpcResponse {
+    fn handle_initialize(&self, id: Value) -> JsonRpcResponse {
         JsonRpcResponse::success(
             id,
             json!({
@@ -80,7 +80,7 @@ impl ProxyServer {
         )
     }
 
-    fn handle_tools_list(&self, id: u64) -> JsonRpcResponse {
+    fn handle_tools_list(&self, id: Value) -> JsonRpcResponse {
         let tools: Vec<Value> = self
             .tools
             .iter()
@@ -89,7 +89,7 @@ impl ProxyServer {
         JsonRpcResponse::success(id, json!({ "tools": tools }))
     }
 
-    async fn handle_tools_call(&mut self, id: u64, params: Option<Value>) -> JsonRpcResponse {
+    async fn handle_tools_call(&mut self, id: Value, params: Option<Value>) -> JsonRpcResponse {
         let params = match params {
             Some(p) => p,
             None => {
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn test_proxy_server_initialize_response() {
         let server = ProxyServer::new();
-        let resp = server.handle_initialize(1);
+        let resp = server.handle_initialize(Value::from(1));
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
@@ -252,9 +252,17 @@ mod tests {
     }
 
     #[test]
+    fn test_proxy_server_initialize_with_string_id() {
+        let server = ProxyServer::new();
+        let resp = server.handle_initialize(Value::String("req-1".to_string()));
+        assert!(resp.error.is_none());
+        assert_eq!(resp.id, Some(Value::String("req-1".to_string())));
+    }
+
+    #[test]
     fn test_proxy_server_empty_tools_list() {
         let server = ProxyServer::new();
-        let resp = server.handle_tools_list(2);
+        let resp = server.handle_tools_list(Value::from(2));
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
@@ -274,7 +282,7 @@ mod tests {
             ("sentry".to_string(), "search_issues".to_string()),
         );
 
-        let resp = server.handle_tools_list(3);
+        let resp = server.handle_tools_list(Value::from(3));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -286,7 +294,7 @@ mod tests {
     async fn test_proxy_server_unknown_tool() {
         let mut server = ProxyServer::new();
         let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
-        let resp = server.handle_tools_call(4, params).await;
+        let resp = server.handle_tools_call(Value::from(4), params).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
@@ -296,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_server_missing_params() {
         let mut server = ProxyServer::new();
-        let resp = server.handle_tools_call(5, None).await;
+        let resp = server.handle_tools_call(Value::from(5), None).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
@@ -306,7 +314,7 @@ mod tests {
     async fn test_proxy_server_missing_name_in_params() {
         let mut server = ProxyServer::new();
         let params = Some(serde_json::json!({"arguments": {}}));
-        let resp = server.handle_tools_call(6, params).await;
+        let resp = server.handle_tools_call(Value::from(6), params).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
@@ -321,7 +329,7 @@ mod tests {
             ("ghost".to_string(), "tool".to_string()),
         );
         let params = Some(serde_json::json!({"name": "ghost__tool"}));
-        let resp = server.handle_tools_call(7, params).await;
+        let resp = server.handle_tools_call(Value::from(7), params).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32603);
