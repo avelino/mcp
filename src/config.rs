@@ -5,7 +5,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const RESERVED_NAMES: &[&str] = &["search", "add", "remove", "list", "help", "version", "serve"];
+const RESERVED_NAMES: &[&str] = &[
+    "search", "add", "remove", "list", "help", "version", "serve",
+];
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
