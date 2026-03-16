@@ -1,8 +1,19 @@
 # Scripting
 
-`mcp` outputs JSON to stdout and errors to stderr. This makes it easy to use in shell scripts, CI/CD pipelines, and automation.
+`mcp` automatically switches to JSON output when piped or redirected, making it easy to use in shell scripts, CI/CD pipelines, and automation. You can also force JSON with `--json`.
 
 ## Basics
+
+### Output format detection
+
+When piped (non-interactive), `mcp` outputs JSON by default. In interactive terminals, it shows human-readable tables. Use `--json` to force JSON in any context:
+
+```bash
+# These all produce JSON:
+mcp sentry search_issues '{"query": "..."}' | jq '.'   # piped → JSON
+mcp sentry --list > tools.json                           # redirected → JSON
+mcp sentry --list --json                                 # explicit → JSON
+```
 
 ### Output goes to stdout
 

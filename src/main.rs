@@ -5,9 +5,11 @@ mod manager;
 mod output;
 mod protocol;
 mod registry;
+mod spinner;
 mod transport;
 
 use anyhow::{bail, Result};
+use output::OutputFormat;
 use std::io::{IsTerminal, Read};
 
 #[tokio::main]
@@ -30,10 +32,23 @@ fn print_usage() {
     eprintln!("  mcp add <name>                      Add server from registry");
     eprintln!("  mcp add --url <url> <name>          Add HTTP server manually");
     eprintln!("  mcp remove <name>                   Remove server from config");
+    eprintln!();
+    eprintln!("Flags:");
+    eprintln!("  --json                              Force JSON output");
+    eprintln!();
+    eprintln!("Output defaults to human-readable tables when run interactively.");
+    eprintln!("Piped output defaults to JSON for scripting.");
 }
 
 async fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
+    let json_flag = raw_args.iter().any(|a| a == "--json");
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .filter(|a| a != "--json")
+        .collect();
+    let fmt = OutputFormat::detect(json_flag);
 
     let cfg = config::load_config()?;
     let conflicts = config::validate_server_names(&cfg);
@@ -53,7 +68,7 @@ async fn run() -> Result<()> {
     }
 
     if args[0] == "--list" {
-        return output::print_servers(&cfg.servers);
+        return output::print_servers(&cfg.servers, fmt);
     }
 
     let first = &args[0];
@@ -64,11 +79,13 @@ async fn run() -> Result<()> {
                 bail!("usage: mcp search <query>");
             }
             let query = args[1..].join(" ");
+            let sp = spinner::Spinner::start("searching registry...");
             let results = registry::search_servers(&query).await?;
+            sp.stop();
             if results.is_empty() {
                 eprintln!("no servers found for \"{query}\"");
             } else {
-                output::print_search_results(&results)?;
+                output::print_search_results(&results, fmt)?;
             }
             return Ok(());
         }
@@ -85,28 +102,34 @@ async fn run() -> Result<()> {
         _ => {}
     }
 
-    handle_server_command(&args, &cfg).await
+    handle_server_command(&args, &cfg, fmt).await
 }
 
-async fn handle_server_command(args: &[String], cfg: &config::Config) -> Result<()> {
+async fn handle_server_command(args: &[String], cfg: &config::Config, fmt: OutputFormat) -> Result<()> {
     let server_name = &args[0];
     let server_config = cfg
         .servers
         .get(server_name)
         .ok_or_else(|| anyhow::anyhow!("server \"{server_name}\" not found in config"))?;
 
+    let sp = spinner::Spinner::start(&format!("connecting to {server_name}..."));
     let mut client = client::McpClient::connect(server_config).await?;
+    sp.stop();
 
     if args.len() == 1 || (args.len() >= 2 && args[1] == "--list") {
+        let sp = spinner::Spinner::start("listing tools...");
         let tools = client.list_tools().await?;
-        output::print_tools(&tools)?;
+        sp.stop();
+        output::print_tools(&tools, fmt)?;
         client.shutdown().await?;
         return Ok(());
     }
 
     if args.len() >= 2 && args[1] == "--info" {
+        let sp = spinner::Spinner::start("listing tools...");
         let tools = client.list_tools().await?;
-        output::print_tools_info(&tools)?;
+        sp.stop();
+        output::print_tools_info(&tools, fmt)?;
         client.shutdown().await?;
         return Ok(());
     }
@@ -118,8 +141,10 @@ async fn handle_server_command(args: &[String], cfg: &config::Config) -> Result<
         read_stdin_or_empty()?
     };
 
+    let sp = spinner::Spinner::start(&format!("calling {tool_name}..."));
     let result = client.call_tool(tool_name, json_args).await?;
-    output::print_tool_result(&result)?;
+    sp.stop();
+    output::print_tool_result(&result, fmt)?;
     client.shutdown().await?;
 
     Ok(())
