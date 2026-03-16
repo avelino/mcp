@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
+use std::io::IsTerminal;
 use std::time::Duration;
 
 pub struct Spinner {
@@ -7,6 +8,12 @@ pub struct Spinner {
 
 impl Spinner {
     pub fn start(message: &str) -> Self {
+        if !std::io::stderr().is_terminal() {
+            return Self {
+                bar: ProgressBar::hidden(),
+            };
+        }
+
         let bar = ProgressBar::new_spinner();
         bar.set_style(
             ProgressStyle::default_spinner()
@@ -20,6 +27,12 @@ impl Spinner {
     }
 
     pub fn stop(self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
         self.bar.finish_and_clear();
     }
 }
