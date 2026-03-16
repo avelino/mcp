@@ -134,23 +134,27 @@ The HTTP server shuts down cleanly on `SIGTERM` or `SIGINT` (Ctrl+C). It stops a
 
 Run one proxy server on shared infrastructure. Every developer connects to it:
 
-```
-┌──────────────────────────────────────────────────┐
-│  Private server (team infra)                     │
-│                                                  │
-│  mcp serve --http :8080                          │
-│    ↓ proxy to backends                           │
-│  ┌─────────┐ ┌──────┐ ┌────────┐ ┌──────────┐  │
-│  │  Slack  │ │Sentry│ │ GitHub │ │ Postgres │   │
-│  │ (token) │ │(token)│ │(token) │ │ (token)  │   │
-│  └─────────┘ └──────┘ └────────┘ └──────────┘  │
-└──────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Server["Private server (team infra)"]
+        Proxy["mcp serve --http :8080"]
+        Slack["Slack (token)"]
+        Sentry["Sentry (token)"]
+        GitHub["GitHub (token)"]
+        Postgres["Postgres (token)"]
+        Proxy --> Slack
+        Proxy --> Sentry
+        Proxy --> GitHub
+        Proxy --> Postgres
+    end
 
-Dev 1: mcp add --url http://mcp.internal:8080/mcp team
-Dev 2: mcp add --url http://mcp.internal:8080/mcp team
+    D1["Dev 1"] -->|"mcp add --url http://mcp.internal:8080/mcp team"| Proxy
+    D2["Dev 2"] -->|"mcp add --url http://mcp.internal:8080/mcp team"| Proxy
+
+    style Proxy fill:#4a9,color:#fff
 ```
 
-Tokens stay on the server. Developers just connect.
+Tokens stay on the server. Developers just connect. For a deeper look at the enterprise use case, see [Enterprise token management](enterprise-token-management.md).
 
 ## Client configuration
 

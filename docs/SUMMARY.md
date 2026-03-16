@@ -15,6 +15,7 @@
 * [Registry](guides/registry.md)
 * [Scripting](guides/scripting.md)
 * [Proxy mode](guides/proxy-mode.md)
+* [Enterprise token management](guides/enterprise-token-management.md)
 
 ## How-to
 
