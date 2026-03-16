@@ -100,7 +100,10 @@ impl StdioTransport {
         loop {
             let mut line = String::new();
             let n = match timeout(duration, self.reader.read_line(&mut line)).await {
-                Err(_) => bail!("timeout waiting for server response{}", self.stderr_context()),
+                Err(_) => bail!(
+                    "timeout waiting for server response{}",
+                    self.stderr_context()
+                ),
                 Ok(result) => result.context("failed to read from stdout")?,
             };
 

@@ -359,12 +359,10 @@ mod tests {
         let mut root = json!([1, 2, 3]);
         let result = get_servers_mut(&mut root);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("JSON object at the top level")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("JSON object at the top level"));
     }
 
     #[test]
