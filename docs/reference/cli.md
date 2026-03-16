@@ -34,7 +34,7 @@ Interactive output:
 
 ```
 Server     Type   Endpoint
-sentry     http   https://mcp.sentry.dev/mcp
+sentry     http   https://mcp.sentry.dev/sse
 slack      stdio  npx -y slack-mcp-server@latest
 grafana    stdio  uvx mcp-grafana
 
@@ -45,7 +45,7 @@ JSON output (`--json` or piped):
 
 ```json
 [
-  { "name": "sentry", "type": "http", "url": "https://mcp.sentry.dev/mcp" },
+  { "name": "sentry", "type": "http", "url": "https://mcp.sentry.dev/sse" },
   { "name": "slack", "type": "stdio", "command": "npx", "args": ["-y", "slack-mcp-server@latest"] }
 ]
 ```
