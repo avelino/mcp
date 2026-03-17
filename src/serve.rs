@@ -342,6 +342,10 @@ impl ProxyServer {
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
     ) -> JsonRpcResponse {
+        if !self.discovered {
+            self.discover_tools().await;
+            self.discovered = true;
+        }
         let params = match params {
             Some(p) => p,
             None => {
@@ -991,6 +995,22 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32603);
         assert!(err.message.contains("failed to connect"));
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_triggers_discovery() {
+        // tools/call before tools/list should trigger discovery (discovered flag)
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        assert!(!server.discovered);
+        let identity = AuthIdentity::anonymous();
+        let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
+        let resp = server
+            .handle_tools_call(Value::from(20), params, &identity, &None)
+            .await;
+        // Discovery ran (no backends configured, so tool_map is empty → unknown tool)
+        assert!(server.discovered);
+        assert!(resp.error.is_some());
+        assert!(resp.error.unwrap().message.contains("unknown tool"));
     }
 
     #[test]
