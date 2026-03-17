@@ -510,10 +510,14 @@ async fn mcp_handler(
     let response_json = serde_json::to_value(&response).unwrap();
 
     // If this POST came from an SSE session, send the response over the SSE stream
-    // and return 202 Accepted (old HTTP+SSE transport)
+    // and return 202 Accepted (old HTTP+SSE transport).
+    // Clone the sender and drop the lock before awaiting to avoid deadlock.
     if let Some(session_id) = query.get("session_id") {
-        let sessions = state.sessions.lock().await;
-        if let Some(tx) = sessions.get(session_id) {
+        let tx = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(session_id).cloned()
+        };
+        if let Some(tx) = tx {
             let event = Event::default()
                 .event("message")
                 .data(serde_json::to_string(&response_json).unwrap());
