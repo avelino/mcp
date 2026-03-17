@@ -2,56 +2,162 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::audit::{AuditEntry, AuditLogger};
 use crate::client::McpClient;
-use crate::config::Config;
+use crate::config::{parse_duration_str, Config, IdleTimeoutPolicy, ServerConfig};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, Tool, PROTOCOL_VERSION};
 use crate::server_auth::{self, AclConfig, AuthIdentity, AuthProvider, Credentials};
 
 const SEPARATOR: &str = "__";
 
+/// Tracks per-backend usage patterns for adaptive idle timeout.
+#[derive(Debug, Clone)]
+struct UsageStats {
+    request_count: u64,
+    first_used: Instant,
+    last_used: Instant,
+    /// Exponential moving average of intervals between requests (ms).
+    ema_interval_ms: f64,
+}
+
+impl UsageStats {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            request_count: 0,
+            first_used: now,
+            last_used: now,
+            ema_interval_ms: 0.0,
+        }
+    }
+
+    fn record_request(&mut self) {
+        let now = Instant::now();
+        if self.request_count > 0 {
+            let interval = now.duration_since(self.last_used).as_millis() as f64;
+            // EMA with α=0.3: recent intervals weigh more
+            self.ema_interval_ms = 0.3 * interval + 0.7 * self.ema_interval_ms;
+        }
+        self.last_used = now;
+        self.request_count += 1;
+    }
+
+    fn idle_duration(&self) -> Duration {
+        self.last_used.elapsed()
+    }
+
+    fn compute_adaptive_timeout(&self, min: Duration, max: Duration) -> Duration {
+        if self.request_count < 2 {
+            return min;
+        }
+        let elapsed_hours = self.first_used.elapsed().as_secs_f64() / 3600.0;
+        let rph = if elapsed_hours > 0.001 {
+            self.request_count as f64 / elapsed_hours
+        } else {
+            self.request_count as f64 * 3600.0 // extrapolate
+        };
+
+        let timeout = if rph > 20.0 {
+            Duration::from_secs(5 * 60) // hot: 5min
+        } else if rph > 5.0 {
+            Duration::from_secs(3 * 60) // warm: 3min
+        } else {
+            Duration::from_secs(60) // cold: 1min
+        };
+
+        timeout.clamp(min, max)
+    }
+}
+
+enum BackendState {
+    Disconnected {
+        #[allow(dead_code)]
+        cached_tools: Vec<Tool>,
+        usage_stats: UsageStats,
+    },
+    Connected {
+        client: McpClient,
+        usage_stats: UsageStats,
+    },
+}
+
 struct ProxyServer {
-    backends: HashMap<String, McpClient>,
+    configs: HashMap<String, ServerConfig>,
+    backends: HashMap<String, BackendState>,
     tool_map: HashMap<String, (String, String)>, // namespaced -> (server, original_name)
     tools: Vec<Tool>,
     audit: Arc<AuditLogger>,
+    discovered: bool,
 }
 
 impl ProxyServer {
-    fn new(audit: Arc<AuditLogger>) -> Self {
+    fn new(audit: Arc<AuditLogger>, configs: HashMap<String, ServerConfig>) -> Self {
         Self {
+            configs,
             backends: HashMap::new(),
             tool_map: HashMap::new(),
             tools: Vec::new(),
             audit,
+            discovered: false,
         }
     }
 
-    async fn connect_backends(&mut self, config: &Config) {
-        for (name, server_config) in &config.servers {
-            eprintln!("[serve] connecting to {name}...");
+    fn register_tools(&mut self, server_name: &str, tools: &[Tool]) {
+        for tool in tools {
+            let namespaced = format!("{server_name}{SEPARATOR}{}", tool.name);
+            let description = match &tool.description {
+                Some(desc) => Some(format!("[{server_name}] {desc}")),
+                None => Some(format!("[{server_name}]")),
+            };
+            self.tool_map
+                .insert(namespaced.clone(), (server_name.to_string(), tool.name.clone()));
+            self.tools.push(Tool {
+                name: namespaced,
+                description,
+                input_schema: tool.input_schema.clone(),
+            });
+        }
+    }
+
+    fn unregister_tools(&mut self, server_name: &str) {
+        let prefix = format!("{server_name}{SEPARATOR}");
+        self.tools.retain(|t| !t.name.starts_with(&prefix));
+        self.tool_map.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Collect cached tools for a server from the current tool list (for storing in Disconnected state).
+    fn collect_cached_tools(&self, server_name: &str) -> Vec<Tool> {
+        let prefix = format!("{server_name}{SEPARATOR}");
+        self.tools
+            .iter()
+            .filter(|t| t.name.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
+    /// Discover tools from all backends. Connects, fetches tool list, then keeps connection alive.
+    async fn discover_tools(&mut self) {
+        for (name, server_config) in &self.configs.clone() {
+            if self.backends.contains_key(name) {
+                continue; // already known
+            }
+            eprintln!("[serve] discovering tools from {name}...");
             match McpClient::connect(server_config).await {
                 Ok(mut client) => match client.list_tools().await {
                     Ok(tools) => {
                         eprintln!("[serve] {name}: {} tool(s)", tools.len());
-                        for tool in tools {
-                            let namespaced = format!("{name}{SEPARATOR}{}", tool.name);
-                            let description = match &tool.description {
-                                Some(desc) => Some(format!("[{name}] {desc}")),
-                                None => Some(format!("[{name}]")),
-                            };
-                            self.tool_map
-                                .insert(namespaced.clone(), (name.clone(), tool.name.clone()));
-                            self.tools.push(Tool {
-                                name: namespaced,
-                                description,
-                                input_schema: tool.input_schema,
-                            });
-                        }
-                        self.backends.insert(name.clone(), client);
+                        self.register_tools(name, &tools);
+                        self.backends.insert(
+                            name.clone(),
+                            BackendState::Connected {
+                                client,
+                                usage_stats: UsageStats::new(),
+                            },
+                        );
                     }
                     Err(e) => {
                         eprintln!("[serve] {name}: failed to list tools: {e:#}");
@@ -70,6 +176,127 @@ impl ProxyServer {
         );
     }
 
+    /// Lazily connect (or reconnect) a specific backend, returning a mutable reference to its client.
+    async fn ensure_connected(&mut self, server_name: &str) -> Result<&mut McpClient> {
+        // Check if already connected — use a bool to avoid holding borrow across branches
+        let is_connected = matches!(
+            self.backends.get(server_name),
+            Some(BackendState::Connected { .. })
+        );
+
+        if !is_connected {
+            // Need to connect or reconnect
+            let config = self
+                .configs
+                .get(server_name)
+                .ok_or_else(|| anyhow::anyhow!("unknown backend: {server_name}"))?
+                .clone();
+
+            eprintln!("[serve] connecting to {server_name}...");
+            let mut client = McpClient::connect(&config).await?;
+            let tools = client.list_tools().await?;
+
+            // Carry over usage stats from previous connection
+            let mut stats = match self.backends.remove(server_name) {
+                Some(BackendState::Disconnected { usage_stats, .. }) => usage_stats,
+                Some(BackendState::Connected {
+                    usage_stats,
+                    mut client,
+                }) => {
+                    let _ = client.shutdown().await;
+                    usage_stats
+                }
+                None => UsageStats::new(),
+            };
+            stats.record_request();
+
+            // Refresh tool cache
+            self.unregister_tools(server_name);
+            self.register_tools(server_name, &tools);
+            eprintln!("[serve] {server_name}: {} tool(s) (reconnected)", tools.len());
+
+            self.backends.insert(
+                server_name.to_string(),
+                BackendState::Connected {
+                    client,
+                    usage_stats: stats,
+                },
+            );
+        } else {
+            // Update usage stats for already-connected backend
+            if let Some(BackendState::Connected { usage_stats, .. }) =
+                self.backends.get_mut(server_name)
+            {
+                usage_stats.record_request();
+            }
+        }
+
+        match self.backends.get_mut(server_name) {
+            Some(BackendState::Connected { client, .. }) => Ok(client),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Shut down idle backends based on their timeout policy.
+    async fn reap_idle_backends(&mut self) {
+        let mut to_shutdown = Vec::new();
+
+        for (name, state) in &self.backends {
+            if let BackendState::Connected { usage_stats, .. } = state {
+                let config = self.configs.get(name);
+                let (policy, min, max) = match config {
+                    Some(c) => (
+                        c.idle_timeout_policy().clone(),
+                        c.min_idle_timeout(),
+                        c.max_idle_timeout(),
+                    ),
+                    None => (
+                        IdleTimeoutPolicy::Adaptive,
+                        crate::config::DEFAULT_MIN_IDLE_TIMEOUT,
+                        crate::config::DEFAULT_MAX_IDLE_TIMEOUT,
+                    ),
+                };
+
+                let timeout = match policy {
+                    IdleTimeoutPolicy::Never => continue,
+                    IdleTimeoutPolicy::Fixed(ref s) => {
+                        parse_duration_str(s).unwrap_or(Duration::from_secs(300))
+                    }
+                    IdleTimeoutPolicy::Adaptive => {
+                        usage_stats.compute_adaptive_timeout(min, max)
+                    }
+                };
+
+                if usage_stats.idle_duration() > timeout {
+                    to_shutdown.push(name.clone());
+                }
+            }
+        }
+
+        for name in to_shutdown {
+            if let Some(BackendState::Connected {
+                mut client,
+                usage_stats,
+            }) = self.backends.remove(&name)
+            {
+                let cached_tools = self.collect_cached_tools(&name);
+                eprintln!(
+                    "[serve] shutting down idle backend: {name} (idle {:?}, {} reqs)",
+                    usage_stats.idle_duration(),
+                    usage_stats.request_count,
+                );
+                let _ = client.shutdown().await;
+                self.backends.insert(
+                    name,
+                    BackendState::Disconnected {
+                        cached_tools,
+                        usage_stats,
+                    },
+                );
+            }
+        }
+    }
+
     fn handle_initialize(&self, id: Value) -> JsonRpcResponse {
         JsonRpcResponse::success(
             id,
@@ -86,12 +313,16 @@ impl ProxyServer {
         )
     }
 
-    fn handle_tools_list(
-        &self,
+    async fn handle_tools_list(
+        &mut self,
         id: Value,
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
     ) -> JsonRpcResponse {
+        if !self.discovered {
+            self.discover_tools().await;
+            self.discovered = true;
+        }
         let tools: Vec<Value> = self
             .tools
             .iter()
@@ -142,13 +373,13 @@ impl ProxyServer {
             }
         };
 
-        let client = match self.backends.get_mut(&server_name) {
-            Some(c) => c,
-            None => {
+        let client = match self.ensure_connected(&server_name).await {
+            Ok(c) => c,
+            Err(e) => {
                 return JsonRpcResponse::error(
                     id,
                     -32603,
-                    &format!("backend '{server_name}' is not connected"),
+                    &format!("failed to connect to backend '{server_name}': {e:#}"),
                 );
             }
         };
@@ -186,7 +417,7 @@ impl ProxyServer {
 
         let response = match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id),
-            "tools/list" => self.handle_tools_list(req.id, identity, acl),
+            "tools/list" => self.handle_tools_list(req.id, identity, acl).await,
             "tools/call" => {
                 self.handle_tools_call(req.id, req.params, identity, acl)
                     .await
@@ -213,9 +444,11 @@ impl ProxyServer {
     }
 
     async fn shutdown_all(&mut self) {
-        for (name, mut client) in self.backends.drain() {
-            if let Err(e) = client.shutdown().await {
-                eprintln!("[serve] {name}: shutdown error: {e:#}");
+        for (name, state) in self.backends.drain() {
+            if let BackendState::Connected { mut client, .. } = state {
+                if let Err(e) = client.shutdown().await {
+                    eprintln!("[serve] {name}: shutdown error: {e:#}");
+                }
             }
         }
     }
@@ -225,49 +458,50 @@ impl ProxyServer {
 
 pub async fn run_stdio(config: Config) -> Result<()> {
     let audit = AuditLogger::open(&config.audit).unwrap_or(AuditLogger::Disabled);
-    let mut server = ProxyServer::new(Arc::new(audit));
+    let mut server = ProxyServer::new(Arc::new(audit), config.servers.clone());
     let identity = AuthIdentity::anonymous();
     let acl = config.server_auth.acl.clone();
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
-    let mut backends_connected = false;
+    let mut reap_interval = tokio::time::interval(Duration::from_secs(30));
 
     eprintln!("[serve] waiting for MCP client...");
 
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF
-        }
+        tokio::select! {
+            result = reader.read_line(&mut line) => {
+                let n = result?;
+                if n == 0 {
+                    break; // EOF
+                }
 
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
 
-        // Try parsing as a request (has "id")
-        if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(line) {
-            if !backends_connected && req.method != "initialize" {
-                server.connect_backends(&config).await;
-                backends_connected = true;
+                // Try parsing as a request (has "id")
+                if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(line) {
+                    let response = server
+                        .handle_request(req, &identity, &acl, "serve:stdio")
+                        .await;
+
+                    let mut data = serde_json::to_string(&response)?;
+                    data.push('\n');
+                    stdout.write_all(data.as_bytes()).await?;
+                    stdout.flush().await?;
+                    continue;
+                }
+
+                // Notifications (no id) — just acknowledge silently
             }
-
-            let response = server
-                .handle_request(req, &identity, &acl, "serve:stdio")
-                .await;
-
-            let mut data = serde_json::to_string(&response)?;
-            data.push('\n');
-            stdout.write_all(data.as_bytes()).await?;
-            stdout.flush().await?;
-            continue;
+            _ = reap_interval.tick() => {
+                server.reap_idle_backends().await;
+            }
         }
-
-        // Notifications (no id) — just acknowledge silently
-        // e.g. "notifications/initialized", "notifications/cancelled"
     }
 
     server.shutdown_all().await;
@@ -347,8 +581,7 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let acl = config.server_auth.acl.clone();
 
     let audit = AuditLogger::open(&config.audit).unwrap_or(AuditLogger::Disabled);
-    let mut server = ProxyServer::new(Arc::new(audit));
-    server.connect_backends(&config).await;
+    let server = ProxyServer::new(Arc::new(audit), config.servers.clone());
     let shared: SharedProxy = Arc::new(Mutex::new(server));
 
     let state = AppState {
@@ -357,6 +590,17 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         acl,
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    // Background reaper: shuts down idle backends periodically
+    let reaper_proxy = shared.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let mut proxy = reaper_proxy.lock().await;
+            proxy.reap_idle_backends().await;
+        }
+    });
 
     // Log all incoming requests for debugging
     let request_logger = axum::middleware::from_fn(
@@ -447,9 +691,15 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
 // GET /health
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let proxy = state.proxy.lock().await;
+    let connected = proxy
+        .backends
+        .values()
+        .filter(|s| matches!(s, BackendState::Connected { .. }))
+        .count();
     let body = json!({
         "status": "ok",
-        "backends": proxy.backends.len(),
+        "backends_configured": proxy.configs.len(),
+        "backends_connected": connected,
         "tools": proxy.tools.len(),
         "version": env!("CARGO_PKG_VERSION"),
     });
@@ -626,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_proxy_server_initialize_response() {
-        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let resp = server.handle_initialize(Value::from(1));
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -637,26 +887,28 @@ mod tests {
 
     #[test]
     fn test_proxy_server_initialize_with_string_id() {
-        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let resp = server.handle_initialize(Value::String("req-1".to_string()));
         assert!(resp.error.is_none());
         assert_eq!(resp.id, Some(Value::String("req-1".to_string())));
     }
 
-    #[test]
-    fn test_proxy_server_empty_tools_list() {
-        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+    #[tokio::test]
+    async fn test_proxy_server_empty_tools_list() {
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        server.discovered = true; // skip discovery in test
         let identity = AuthIdentity::anonymous();
-        let resp = server.handle_tools_list(Value::from(2), &identity, &None);
+        let resp = server.handle_tools_list(Value::from(2), &identity, &None).await;
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert!(tools.is_empty());
     }
 
-    #[test]
-    fn test_proxy_server_tools_list_with_tools() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+    #[tokio::test]
+    async fn test_proxy_server_tools_list_with_tools() {
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        server.discovered = true; // skip discovery in test
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search for issues".to_string()),
@@ -668,7 +920,7 @@ mod tests {
         );
 
         let identity = AuthIdentity::anonymous();
-        let resp = server.handle_tools_list(Value::from(3), &identity, &None);
+        let resp = server.handle_tools_list(Value::from(3), &identity, &None).await;
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -678,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_unknown_tool() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
         let resp = server
@@ -692,7 +944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_params() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let identity = AuthIdentity::anonymous();
         let resp = server
             .handle_tools_call(Value::from(5), None, &identity, &None)
@@ -704,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_name_in_params() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"arguments": {}}));
         let resp = server
@@ -718,7 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_backend_not_connected() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let identity = AuthIdentity::anonymous();
         server.tool_map.insert(
             "ghost__tool".to_string(),
@@ -731,7 +983,7 @@ mod tests {
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32603);
-        assert!(err.message.contains("not connected"));
+        assert!(err.message.contains("failed to connect"));
     }
 
     #[test]
@@ -759,7 +1011,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_unknown_method() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "unknown/method", None);
         let resp = server.handle_request(req, &identity, &None, "test").await;
@@ -771,7 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_initialize() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "initialize", None);
         let resp = server.handle_request(req, &identity, &None, "test").await;
@@ -853,11 +1105,12 @@ mod tests {
         assert!(map.get("nonexistent").is_none());
     }
 
-    #[test]
-    fn test_tools_list_filtered_by_acl() {
+    #[tokio::test]
+    async fn test_tools_list_filtered_by_acl() {
         use crate::server_auth::{AclConfig, AclPolicy, AclRule};
 
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        server.discovered = true;
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search".to_string()),
@@ -880,7 +1133,7 @@ mod tests {
         });
 
         let bob = AuthIdentity::new("bob", vec![]);
-        let resp = server.handle_tools_list(Value::from(10), &bob, &acl);
+        let resp = server.handle_tools_list(Value::from(10), &bob, &acl).await;
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -891,7 +1144,7 @@ mod tests {
     async fn test_tools_call_denied_by_acl() {
         use crate::server_auth::{AclConfig, AclPolicy, AclRule};
 
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled));
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         server.tool_map.insert(
             "sentry__search".to_string(),
             ("sentry".to_string(), "search".to_string()),
@@ -959,5 +1212,126 @@ mod tests {
         let creds = extract_credentials(&headers);
         assert_eq!(creds.get("authorization").unwrap(), "Bearer tok-123");
         assert_eq!(creds.get("x-forwarded-user").unwrap(), "alice");
+    }
+
+    // --- UsageStats tests ---
+
+    #[test]
+    fn test_usage_stats_new() {
+        let stats = UsageStats::new();
+        assert_eq!(stats.request_count, 0);
+        assert_eq!(stats.ema_interval_ms, 0.0);
+    }
+
+    #[test]
+    fn test_usage_stats_record_request() {
+        let mut stats = UsageStats::new();
+        stats.record_request();
+        assert_eq!(stats.request_count, 1);
+
+        stats.record_request();
+        assert_eq!(stats.request_count, 2);
+        // After second request, EMA should be > 0
+        assert!(stats.ema_interval_ms >= 0.0);
+    }
+
+    #[test]
+    fn test_usage_stats_adaptive_timeout_cold() {
+        let mut stats = UsageStats::new();
+        stats.request_count = 3;
+        // Simulate: 3 requests over 2 hours → 1.5 rph = cold tier = 1min
+        stats.first_used = Instant::now() - Duration::from_secs(7200);
+        let timeout = stats.compute_adaptive_timeout(
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        );
+        assert_eq!(timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_usage_stats_adaptive_timeout_minimum_requests() {
+        let stats = UsageStats::new();
+        // < 2 requests returns min
+        let timeout = stats.compute_adaptive_timeout(
+            Duration::from_secs(90),
+            Duration::from_secs(1800),
+        );
+        assert_eq!(timeout, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn test_usage_stats_adaptive_timeout_clamped() {
+        let mut stats = UsageStats::new();
+        stats.request_count = 100;
+        // hot tier = 5min, but max is 2min, should clamp to max
+        let timeout = stats.compute_adaptive_timeout(
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        );
+        assert_eq!(timeout, Duration::from_secs(120)); // clamped to max
+    }
+
+    // --- BackendState + register/unregister tests ---
+
+    #[test]
+    fn test_register_and_unregister_tools() {
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let tools = vec![
+            Tool {
+                name: "search".to_string(),
+                description: Some("Search stuff".to_string()),
+                input_schema: None,
+            },
+            Tool {
+                name: "create".to_string(),
+                description: None,
+                input_schema: None,
+            },
+        ];
+
+        server.register_tools("sentry", &tools);
+        assert_eq!(server.tools.len(), 2);
+        assert_eq!(server.tool_map.len(), 2);
+        assert!(server.tool_map.contains_key("sentry__search"));
+        assert!(server.tool_map.contains_key("sentry__create"));
+
+        // Register more tools from another server
+        server.register_tools("slack", &[Tool {
+            name: "send".to_string(),
+            description: Some("Send msg".to_string()),
+            input_schema: None,
+        }]);
+        assert_eq!(server.tools.len(), 3);
+
+        // Unregister sentry tools
+        server.unregister_tools("sentry");
+        assert_eq!(server.tools.len(), 1);
+        assert_eq!(server.tool_map.len(), 1);
+        assert!(server.tool_map.contains_key("slack__send"));
+    }
+
+    #[test]
+    fn test_collect_cached_tools() {
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        server.register_tools("sentry", &[Tool {
+            name: "search".to_string(),
+            description: Some("Search".to_string()),
+            input_schema: None,
+        }]);
+        server.register_tools("slack", &[Tool {
+            name: "send".to_string(),
+            description: Some("Send".to_string()),
+            input_schema: None,
+        }]);
+
+        let cached = server.collect_cached_tools("sentry");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].name, "sentry__search");
+
+        let cached_slack = server.collect_cached_tools("slack");
+        assert_eq!(cached_slack.len(), 1);
+
+        let cached_unknown = server.collect_cached_tools("unknown");
+        assert!(cached_unknown.is_empty());
     }
 }

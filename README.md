@@ -185,6 +185,35 @@ Use `mcp serve` to expose all your configured servers as a single MCP endpoint. 
 
 This works with Claude Code, Cursor, Windsurf, or any MCP-compatible client. Tools are namespaced as `server__tool` (e.g. `sentry__search_issues`). See the [proxy mode guide](docs/guides/proxy-mode.md) for details.
 
+### Smart resource management
+
+Every MCP client (Claude Code, Cursor, Windsurf) spawns all backend servers at startup and keeps them alive forever. With 10 servers and 3 sessions open, that's 30 idle processes eating ~3 GB of RAM.
+
+The `mcp` proxy fixes this with **lazy initialization** and **adaptive idle shutdown**:
+
+- Backends only connect when you actually use them
+- Idle backends are shut down automatically (1-5 min based on usage frequency)
+- Tools stay visible — reconnection is transparent on next call
+- Usage stats drive the timeout: hot backends stay longer, cold ones shut down fast
+
+```json
+{
+  "mcpServers": {
+    "slack": {
+      "command": "npx",
+      "args": ["@anthropic/mcp-slack"],
+      "idle_timeout": "adaptive"
+    },
+    "sentry": {
+      "url": "https://mcp.sentry.io",
+      "idle_timeout": "never"
+    }
+  }
+}
+```
+
+Read the full story: **[MCP servers are draining your hardware](https://mcp.avelino.run/mcp-servers-are-draining-your-hardware)**
+
 ## Audit logging
 
 Every operation is logged — tool calls, searches, config changes, proxy requests. Query the log with filters or stream it in real-time:

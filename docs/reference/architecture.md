@@ -82,8 +82,8 @@ Server configs use serde's untagged enum:
 
 ```rust
 enum ServerConfig {
-    Stdio { command, args, env },
-    Http { url, headers },
+    Stdio { command, args, env, idle_timeout, min_idle_timeout, max_idle_timeout },
+    Http { url, headers, idle_timeout, min_idle_timeout, max_idle_timeout },
 }
 ```
 
@@ -116,7 +116,11 @@ MCP Client  ←stdin/stdout→  mcp serve  ←→  backend 1 (stdio)
                                         ←→  backend N
 ```
 
-On `initialize`, the proxy connects to all configured backends in parallel (reusing `McpClient`). It merges their tool lists with namespaced names (`server__tool`) and builds a routing table. On `tools/call`, it splits the namespaced name, looks up the backend, and forwards the request.
+Backends are managed lazily. On startup, no connections are made. On the first `tools/list`, the proxy connects to all backends to discover their tools, then builds a routing table with namespaced names (`server__tool`). On `tools/call`, it splits the namespaced name, ensures the target backend is connected (reconnecting on demand if it was shut down), and forwards the request.
+
+Each backend tracks usage statistics: request count, first/last use timestamps, and an exponential moving average (EMA) of inter-request intervals. A background reaper task runs every 30 seconds and shuts down backends that exceed their idle timeout. The timeout is adaptive by default — frequently used backends (>20 req/h) get 5 minutes, moderately used (5-20 req/h) get 3 minutes, and rarely used (<5 req/h) get 1 minute. Users can override this per backend with fixed timeouts or `"never"`.
+
+When a backend is shut down, its tools remain in the tool list (cached). On the next `tools/call` targeting that backend, the proxy transparently reconnects, refreshes the tool cache, and forwards the request. Usage stats are preserved across reconnections for adaptive timeout continuity.
 
 The proxy reuses the same `McpClient` and `Transport` abstractions — no new protocol code was needed. It just listens on stdin instead of connecting to a server's stdin.
 
@@ -143,6 +147,7 @@ Three providers are available: `NoAuth` (default), `BearerTokenAuth` (static tok
 ## Design principles
 
 - **No daemon** — Each invocation is independent. Start, connect, do the thing, exit. Tokens are persisted to disk, everything else is ephemeral.
+- **Lazy by default** — In proxy mode, backends are only connected when needed and shut down when idle. No process runs longer than it has to.
 - **Protocol over implementation** — The Transport trait means the client code is completely decoupled from transport details. Adding WebSocket support is adding a file, not refactoring the client.
 - **Fail loud** — Errors propagate up with context (`anyhow` chains). No silent failures, no swallowed errors, no default fallbacks that hide problems.
 - **JSON in, JSON out** — The CLI is a pipe-friendly citizen. Structured input, structured output, errors on stderr.

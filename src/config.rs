@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::audit::AuditConfig;
 use crate::server_auth::ServerAuthConfig;
@@ -11,6 +12,37 @@ use crate::server_auth::ServerAuthConfig;
 const RESERVED_NAMES: &[&str] = &[
     "search", "add", "remove", "list", "help", "version", "serve", "logs",
 ];
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleTimeoutPolicy {
+    Adaptive,
+    Never,
+    #[serde(untagged)]
+    Fixed(String),
+}
+
+impl Default for IdleTimeoutPolicy {
+    fn default() -> Self {
+        IdleTimeoutPolicy::Adaptive
+    }
+}
+
+pub fn parse_duration_str(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('h') {
+        n.parse::<u64>().ok().map(|n| Duration::from_secs(n * 3600))
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.parse::<u64>().ok().map(|n| Duration::from_secs(n * 60))
+    } else if let Some(n) = s.strip_suffix('s') {
+        n.parse::<u64>().ok().map(Duration::from_secs)
+    } else {
+        s.parse::<u64>().ok().map(Duration::from_secs)
+    }
+}
+
+pub const DEFAULT_MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
@@ -21,12 +53,49 @@ pub enum ServerConfig {
         args: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        #[serde(default)]
+        idle_timeout: IdleTimeoutPolicy,
+        #[serde(default)]
+        min_idle_timeout: Option<String>,
+        #[serde(default)]
+        max_idle_timeout: Option<String>,
     },
     Http {
         url: String,
         #[serde(default)]
         headers: HashMap<String, String>,
+        #[serde(default)]
+        idle_timeout: IdleTimeoutPolicy,
+        #[serde(default)]
+        min_idle_timeout: Option<String>,
+        #[serde(default)]
+        max_idle_timeout: Option<String>,
     },
+}
+
+impl ServerConfig {
+    pub fn idle_timeout_policy(&self) -> &IdleTimeoutPolicy {
+        match self {
+            ServerConfig::Stdio { idle_timeout, .. } => idle_timeout,
+            ServerConfig::Http { idle_timeout, .. } => idle_timeout,
+        }
+    }
+
+    pub fn min_idle_timeout(&self) -> Duration {
+        let raw = match self {
+            ServerConfig::Stdio { min_idle_timeout, .. } => min_idle_timeout.as_deref(),
+            ServerConfig::Http { min_idle_timeout, .. } => min_idle_timeout.as_deref(),
+        };
+        raw.and_then(parse_duration_str).unwrap_or(DEFAULT_MIN_IDLE_TIMEOUT)
+    }
+
+    pub fn max_idle_timeout(&self) -> Duration {
+        let raw = match self {
+            ServerConfig::Stdio { max_idle_timeout, .. } => max_idle_timeout.as_deref(),
+            ServerConfig::Http { max_idle_timeout, .. } => max_idle_timeout.as_deref(),
+        };
+        raw.and_then(parse_duration_str).unwrap_or(DEFAULT_MAX_IDLE_TIMEOUT)
+    }
 }
 
 #[derive(Debug)]
@@ -154,7 +223,7 @@ mod tests {
 
         assert_eq!(config.servers.len(), 1);
         match &config.servers["github"] {
-            ServerConfig::Stdio { command, args, env } => {
+            ServerConfig::Stdio { command, args, env, .. } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args.len(), 2);
                 assert_eq!(env["GITHUB_TOKEN"], "test123");
@@ -178,7 +247,7 @@ mod tests {
         .unwrap();
 
         match &config.servers["remote"] {
-            ServerConfig::Http { url, headers } => {
+            ServerConfig::Http { url, headers, .. } => {
                 assert_eq!(url, "https://example.com/mcp");
                 assert_eq!(headers["Authorization"], "Bearer tok");
             }
@@ -308,6 +377,118 @@ mod tests {
         assert!(is_reserved_name("logs"));
         assert!(!is_reserved_name("github"));
         assert!(!is_reserved_name("filesystem"));
+    }
+
+    #[test]
+    fn test_parse_duration_str() {
+        assert_eq!(parse_duration_str("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration_str("5m"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_duration_str("2h"), Some(Duration::from_secs(7200)));
+        assert_eq!(parse_duration_str("60"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_duration_str(" 10m "), Some(Duration::from_secs(600)));
+        assert_eq!(parse_duration_str("abc"), None);
+        assert_eq!(parse_duration_str(""), None);
+    }
+
+    #[test]
+    fn test_idle_timeout_defaults() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {
+                    "test": {"command": "echo", "args": []}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let server = &config.servers["test"];
+        assert_eq!(*server.idle_timeout_policy(), IdleTimeoutPolicy::Adaptive);
+        assert_eq!(server.min_idle_timeout(), DEFAULT_MIN_IDLE_TIMEOUT);
+        assert_eq!(server.max_idle_timeout(), DEFAULT_MAX_IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn test_idle_timeout_fixed() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {
+                    "test": {
+                        "command": "echo",
+                        "args": [],
+                        "idle_timeout": "10m"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let server = &config.servers["test"];
+        assert_eq!(
+            *server.idle_timeout_policy(),
+            IdleTimeoutPolicy::Fixed("10m".to_string())
+        );
+    }
+
+    #[test]
+    fn test_idle_timeout_never() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {
+                    "test": {
+                        "command": "echo",
+                        "args": [],
+                        "idle_timeout": "never"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *config.servers["test"].idle_timeout_policy(),
+            IdleTimeoutPolicy::Never
+        );
+    }
+
+    #[test]
+    fn test_idle_timeout_custom_bounds() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {
+                    "test": {
+                        "command": "echo",
+                        "args": [],
+                        "min_idle_timeout": "30s",
+                        "max_idle_timeout": "1h"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let server = &config.servers["test"];
+        assert_eq!(server.min_idle_timeout(), Duration::from_secs(30));
+        assert_eq!(server.max_idle_timeout(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_idle_timeout_http_server() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {
+                    "remote": {
+                        "url": "https://example.com/mcp",
+                        "idle_timeout": "never"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *config.servers["remote"].idle_timeout_policy(),
+            IdleTimeoutPolicy::Never
+        );
     }
 
     #[test]

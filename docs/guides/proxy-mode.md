@@ -40,8 +40,8 @@ graph LR
 ```
 
 1. Client sends `initialize` — the proxy responds immediately with capabilities
-2. Client calls `tools/list` — the proxy connects to all backends (lazy), merges their tool lists
-3. Client calls `tools/call` — the proxy routes to the correct backend
+2. Client calls `tools/list` — the proxy connects to all backends (lazy), discovers their tool lists, then lets idle backends shut down automatically
+3. Client calls `tools/call` — the proxy reconnects the target backend on demand (if it was shut down), routes the request, and tracks usage for adaptive timeout
 
 ## Tool namespacing
 
@@ -68,11 +68,14 @@ That's it. It reads the same `servers.json` (or `$MCP_CONFIG_PATH`) and connects
 Diagnostics go to stderr:
 
 ```
-[serve] connecting to sentry...
+[serve] discovering tools from sentry...
 [serve] sentry: 8 tool(s)
-[serve] connecting to slack...
+[serve] discovering tools from slack...
 [serve] slack: 12 tool(s)
 [serve] ready — 2 backend(s), 20 tool(s)
+[serve] shutting down idle backend: sentry (idle 62s, 0 reqs)
+[serve] connecting to sentry... (on next tools/call)
+[serve] sentry: 8 tool(s) (reconnected)
 ```
 
 ## HTTP mode
@@ -150,9 +153,10 @@ Returns the proxy status:
 ```json
 {
   "status": "ok",
-  "backends": 2,
+  "backends_configured": 3,
+  "backends_connected": 1,
   "tools": 20,
-  "version": "0.1.0"
+  "version": "0.3.0"
 }
 ```
 
@@ -279,9 +283,84 @@ Any client that supports HTTP transport can connect to the HTTP endpoint:
 mcp add --url http://localhost:8080/mcp local-proxy
 ```
 
+## Lazy initialization and idle shutdown
+
+The proxy does **not** keep all backends running permanently. It uses a lazy initialization strategy combined with adaptive idle shutdown to minimize resource usage.
+
+### How it works
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected: proxy starts
+    Disconnected --> Connected: first tools/list (discovery)<br/>or tools/call targeting this backend
+    Connected --> Disconnected: idle timeout exceeded
+    Disconnected --> Connected: tools/call targeting this backend
+```
+
+1. **Startup** — No backends are connected. The proxy starts instantly.
+2. **First `tools/list`** — The proxy connects to all backends, fetches their tool lists, and caches them. Backends are kept alive after discovery.
+3. **Idle shutdown** — A background task checks every 30 seconds for idle backends. If a backend exceeds its idle timeout, it is shut down. Its tools remain visible in `tools/list`.
+4. **On-demand reconnect** — When `tools/call` targets a disconnected backend, the proxy reconnects it transparently, refreshes the tool cache, and forwards the request.
+
+Usage statistics (request count, frequency) are preserved across reconnections, so the adaptive timeout algorithm maintains continuity.
+
+### Adaptive timeout tiers
+
+The default idle timeout is `adaptive`. The proxy classifies each backend by its usage frequency:
+
+| Tier | Requests/hour | Idle timeout |
+|------|--------------|-------------|
+| **Hot** | > 20 | 5 min |
+| **Warm** | 5–20 | 3 min |
+| **Cold** | < 5 | 1 min |
+
+Backends with fewer than 2 requests use the minimum timeout (default: 1 min).
+
+### Configuring idle timeout
+
+Per-backend in `servers.json`:
+
+```json
+{
+  "mcpServers": {
+    "slack": {
+      "command": "npx",
+      "args": ["@anthropic/mcp-slack"],
+      "idle_timeout": "adaptive"
+    },
+    "sentry": {
+      "url": "https://mcp.sentry.io",
+      "idle_timeout": "never"
+    },
+    "github": {
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-github"],
+      "idle_timeout": "2m",
+      "min_idle_timeout": "30s",
+      "max_idle_timeout": "5m"
+    }
+  }
+}
+```
+
+| Value | Behavior |
+|-------|----------|
+| `"adaptive"` (default) | Usage-based timeout with automatic tier assignment |
+| `"never"` | Keep alive forever (old behavior) |
+| `"<duration>"` | Fixed timeout (e.g. `"2m"`, `"30s"`, `"1h"`) |
+
+See the [config file reference](../reference/config-file.md#idle-timeout) for full details.
+
+### Why this matters
+
+With 10 MCP servers configured and 3 Claude Code sessions open:
+- **Before:** 30 backend processes running permanently (~3-4 GB RAM)
+- **After:** Only the backends you're actively using stay alive. Idle ones are shut down within 1-5 minutes and reconnected on demand.
+
 ## Error handling
 
 - **Backend fails to connect** — logged to stderr, skipped. Other backends still work.
+- **Backend disconnected (idle shutdown)** — `tools/call` reconnects the backend transparently. If reconnection fails, returns an MCP error with context.
 - **Backend disconnects mid-session** — `tools/call` returns an MCP error with context about which backend failed.
 - **Unknown tool** — returns a JSON-RPC error with the unknown tool name.
 - **Malformed JSON-RPC** — HTTP mode returns a parse error with details. Stdio mode silently ignores.

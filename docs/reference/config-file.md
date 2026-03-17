@@ -38,6 +38,9 @@ Two variants, distinguished by their fields:
 | `command` | string | *required* | Executable to spawn |
 | `args` | string[] | `[]` | Arguments passed to the command |
 | `env` | object | `{}` | Environment variables for the process |
+| `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
+| `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
+| `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
 
 ### HTTP server
 
@@ -54,6 +57,62 @@ Two variants, distinguished by their fields:
 |---|---|---|---|
 | `url` | string | *required* | Server endpoint URL |
 | `headers` | object | `{}` | HTTP headers for every request |
+| `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
+| `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
+| `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
+
+## Idle timeout
+
+Controls when the proxy shuts down idle backend connections to reclaim resources. Applies to both stdio and HTTP backends in proxy mode (`mcp serve`).
+
+### Policy values
+
+| Value | Behavior |
+|-------|----------|
+| `"adaptive"` (default) | Timeout adjusts based on usage frequency — frequently used backends stay alive longer |
+| `"never"` | Never shut down — backend stays connected for the entire proxy lifetime |
+| `"<duration>"` | Fixed timeout (e.g. `"3m"`, `"30s"`, `"1h"`) |
+
+Duration format: number followed by `s` (seconds), `m` (minutes), or `h` (hours). Plain numbers are treated as seconds.
+
+### Adaptive mode
+
+When `idle_timeout` is `"adaptive"` (the default), the proxy tracks how often each backend is used and assigns a timeout tier:
+
+| Usage tier | Requests/hour | Idle timeout |
+|-----------|--------------|-------------|
+| Hot | > 20 | 5 min |
+| Warm | 5–20 | 3 min |
+| Cold | < 5 | 1 min |
+
+The tier is computed from the backend's total request count divided by its uptime. The result is clamped between `min_idle_timeout` (default `1m`) and `max_idle_timeout` (default `5m`).
+
+When a backend is shut down due to inactivity, its tools remain visible in `tools/list`. On the next `tools/call`, the proxy reconnects automatically (lazy initialization). Usage history is preserved across reconnections so the adaptive algorithm has continuity.
+
+### Examples
+
+```json
+{
+  "mcpServers": {
+    "slack": {
+      "command": "npx",
+      "args": ["@anthropic/mcp-slack"],
+      "idle_timeout": "adaptive",
+      "min_idle_timeout": "30s",
+      "max_idle_timeout": "5m"
+    },
+    "sentry": {
+      "url": "https://mcp.sentry.io",
+      "idle_timeout": "never"
+    },
+    "github": {
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-github"],
+      "idle_timeout": "2m"
+    }
+  }
+}
+```
 
 ## Type detection
 

@@ -6,6 +6,8 @@ CLI that turns MCP servers into terminal commands.
 
 Companies invested years building MCP server integrations. 5,800+ servers, 10,000+ in production, 97M+ monthly SDK downloads. All that work exposes structured APIs over a standard protocol. **[Why MCP on the command line?](why-mcp-cli.md)** explains why this matters and how `mcp` lets you reuse all of it from your terminal.
 
+**[MCP servers are draining your hardware](mcp-servers-are-draining-your-hardware.md)** — Every MCP client spawns all backend processes at startup and keeps them alive forever. We built lazy initialization and adaptive idle shutdown so the proxy only keeps alive what you're actually using.
+
 ## First steps
 
 Are you new to `mcp`? Start here:

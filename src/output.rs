@@ -605,6 +605,9 @@ mod tests {
                 command: "echo".to_string(),
                 args: vec!["hello".to_string()],
                 env: HashMap::new(),
+                idle_timeout: Default::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
             },
         );
         servers.insert(
@@ -612,6 +615,9 @@ mod tests {
             ServerConfig::Http {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
+                idle_timeout: Default::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
             },
         );
         // Should not panic and produces valid JSON
@@ -631,6 +637,9 @@ mod tests {
             ServerConfig::Http {
                 url: "https://mcp.sentry.dev/sse".to_string(),
                 headers: HashMap::new(),
+                idle_timeout: Default::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
             },
         );
         servers.insert(
@@ -639,6 +648,9 @@ mod tests {
                 command: "npx".to_string(),
                 args: vec!["-y".to_string(), "slack-mcp-server".to_string()],
                 env: HashMap::new(),
+                idle_timeout: Default::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
             },
         );
         servers.insert(
@@ -647,6 +659,9 @@ mod tests {
                 command: "uvx".to_string(),
                 args: vec![],
                 env: HashMap::new(),
+                idle_timeout: Default::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
             },
         );
         print_servers_text(&servers).unwrap();
