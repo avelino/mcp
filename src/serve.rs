@@ -91,7 +91,9 @@ struct ProxyServer {
     tool_map: HashMap<String, (String, String)>, // namespaced -> (server, original_name)
     tools: Vec<Tool>,
     audit: Arc<AuditLogger>,
-    discovered: bool,
+    /// Tracks which backends have been successfully discovered.
+    /// Backends that fail discovery are excluded so they can be retried.
+    discovered_backends: std::collections::HashSet<String>,
 }
 
 impl ProxyServer {
@@ -102,7 +104,7 @@ impl ProxyServer {
             tool_map: HashMap::new(),
             tools: Vec::new(),
             audit,
-            discovered: false,
+            discovered_backends: std::collections::HashSet::new(),
         }
     }
 
@@ -141,11 +143,18 @@ impl ProxyServer {
             .collect()
     }
 
+    /// Returns true if any configured backend has not yet been successfully discovered.
+    fn has_undiscovered_backends(&self) -> bool {
+        self.configs
+            .keys()
+            .any(|name| !self.discovered_backends.contains(name))
+    }
+
     /// Discover tools from all backends. Connects, fetches tool list, then keeps connection alive.
     async fn discover_tools(&mut self) {
         for (name, server_config) in &self.configs.clone() {
-            if self.backends.contains_key(name) {
-                continue; // already known
+            if self.discovered_backends.contains(name) {
+                continue; // already discovered successfully
             }
             eprintln!("[serve] discovering tools from {name}...");
             match McpClient::connect(server_config).await {
@@ -160,6 +169,7 @@ impl ProxyServer {
                                 usage_stats: UsageStats::new(),
                             },
                         );
+                        self.discovered_backends.insert(name.clone());
                     }
                     Err(e) => {
                         eprintln!("[serve] {name}: failed to list tools: {e:#}");
@@ -220,6 +230,7 @@ impl ProxyServer {
                 tools.len()
             );
 
+            self.discovered_backends.insert(server_name.to_string());
             self.backends.insert(
                 server_name.to_string(),
                 BackendState::Connected {
@@ -322,9 +333,8 @@ impl ProxyServer {
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
     ) -> JsonRpcResponse {
-        if !self.discovered {
+        if self.has_undiscovered_backends() {
             self.discover_tools().await;
-            self.discovered = true;
         }
         let tools: Vec<Value> = self
             .tools
@@ -342,9 +352,8 @@ impl ProxyServer {
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
     ) -> JsonRpcResponse {
-        if !self.discovered {
+        if self.has_undiscovered_backends() {
             self.discover_tools().await;
-            self.discovered = true;
         }
         let params = match params {
             Some(p) => p,
@@ -903,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_server_empty_tools_list() {
         let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
-        server.discovered = true; // skip discovery in test
+        // No configs → has_undiscovered_backends() is false, discovery is skipped
         let identity = AuthIdentity::anonymous();
         let resp = server
             .handle_tools_list(Value::from(2), &identity, &None)
@@ -917,7 +926,7 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_server_tools_list_with_tools() {
         let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
-        server.discovered = true; // skip discovery in test
+        // No configs → has_undiscovered_backends() is false, discovery is skipped
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search for issues".to_string()),
@@ -999,16 +1008,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_call_triggers_discovery() {
-        // tools/call before tools/list should trigger discovery (discovered flag)
+        // tools/call before tools/list should trigger discovery
         let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
-        assert!(!server.discovered);
+        assert!(server.discovered_backends.is_empty());
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
         let resp = server
             .handle_tools_call(Value::from(20), params, &identity, &None)
             .await;
-        // Discovery ran (no backends configured, so tool_map is empty → unknown tool)
-        assert!(server.discovered);
+        // No backends configured, so tool_map is empty → unknown tool
         assert!(resp.error.is_some());
         assert!(resp.error.unwrap().message.contains("unknown tool"));
     }
@@ -1137,7 +1145,7 @@ mod tests {
         use crate::server_auth::{AclConfig, AclPolicy, AclRule};
 
         let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
-        server.discovered = true;
+        // No configs → has_undiscovered_backends() is false, discovery is skipped
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search".to_string()),
