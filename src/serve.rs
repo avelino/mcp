@@ -113,8 +113,10 @@ impl ProxyServer {
                 Some(desc) => Some(format!("[{server_name}] {desc}")),
                 None => Some(format!("[{server_name}]")),
             };
-            self.tool_map
-                .insert(namespaced.clone(), (server_name.to_string(), tool.name.clone()));
+            self.tool_map.insert(
+                namespaced.clone(),
+                (server_name.to_string(), tool.name.clone()),
+            );
             self.tools.push(Tool {
                 name: namespaced,
                 description,
@@ -213,7 +215,10 @@ impl ProxyServer {
             // Refresh tool cache
             self.unregister_tools(server_name);
             self.register_tools(server_name, &tools);
-            eprintln!("[serve] {server_name}: {} tool(s) (reconnected)", tools.len());
+            eprintln!(
+                "[serve] {server_name}: {} tool(s) (reconnected)",
+                tools.len()
+            );
 
             self.backends.insert(
                 server_name.to_string(),
@@ -262,9 +267,7 @@ impl ProxyServer {
                     IdleTimeoutPolicy::Fixed(ref s) => {
                         parse_duration_str(s).unwrap_or(Duration::from_secs(300))
                     }
-                    IdleTimeoutPolicy::Adaptive => {
-                        usage_stats.compute_adaptive_timeout(min, max)
-                    }
+                    IdleTimeoutPolicy::Adaptive => usage_stats.compute_adaptive_timeout(min, max),
                 };
 
                 if usage_stats.idle_duration() > timeout {
@@ -898,7 +901,9 @@ mod tests {
         let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
         server.discovered = true; // skip discovery in test
         let identity = AuthIdentity::anonymous();
-        let resp = server.handle_tools_list(Value::from(2), &identity, &None).await;
+        let resp = server
+            .handle_tools_list(Value::from(2), &identity, &None)
+            .await;
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
@@ -920,7 +925,9 @@ mod tests {
         );
 
         let identity = AuthIdentity::anonymous();
-        let resp = server.handle_tools_list(Value::from(3), &identity, &None).await;
+        let resp = server
+            .handle_tools_list(Value::from(3), &identity, &None)
+            .await;
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -1241,10 +1248,8 @@ mod tests {
         stats.request_count = 3;
         // Simulate: 3 requests over 2 hours → 1.5 rph = cold tier = 1min
         stats.first_used = Instant::now() - Duration::from_secs(7200);
-        let timeout = stats.compute_adaptive_timeout(
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-        );
+        let timeout =
+            stats.compute_adaptive_timeout(Duration::from_secs(60), Duration::from_secs(300));
         assert_eq!(timeout, Duration::from_secs(60));
     }
 
@@ -1252,10 +1257,8 @@ mod tests {
     fn test_usage_stats_adaptive_timeout_minimum_requests() {
         let stats = UsageStats::new();
         // < 2 requests returns min
-        let timeout = stats.compute_adaptive_timeout(
-            Duration::from_secs(90),
-            Duration::from_secs(1800),
-        );
+        let timeout =
+            stats.compute_adaptive_timeout(Duration::from_secs(90), Duration::from_secs(1800));
         assert_eq!(timeout, Duration::from_secs(90));
     }
 
@@ -1264,10 +1267,8 @@ mod tests {
         let mut stats = UsageStats::new();
         stats.request_count = 100;
         // hot tier = 5min, but max is 2min, should clamp to max
-        let timeout = stats.compute_adaptive_timeout(
-            Duration::from_secs(60),
-            Duration::from_secs(120),
-        );
+        let timeout =
+            stats.compute_adaptive_timeout(Duration::from_secs(60), Duration::from_secs(120));
         assert_eq!(timeout, Duration::from_secs(120)); // clamped to max
     }
 
@@ -1296,11 +1297,14 @@ mod tests {
         assert!(server.tool_map.contains_key("sentry__create"));
 
         // Register more tools from another server
-        server.register_tools("slack", &[Tool {
-            name: "send".to_string(),
-            description: Some("Send msg".to_string()),
-            input_schema: None,
-        }]);
+        server.register_tools(
+            "slack",
+            &[Tool {
+                name: "send".to_string(),
+                description: Some("Send msg".to_string()),
+                input_schema: None,
+            }],
+        );
         assert_eq!(server.tools.len(), 3);
 
         // Unregister sentry tools
@@ -1313,16 +1317,22 @@ mod tests {
     #[test]
     fn test_collect_cached_tools() {
         let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
-        server.register_tools("sentry", &[Tool {
-            name: "search".to_string(),
-            description: Some("Search".to_string()),
-            input_schema: None,
-        }]);
-        server.register_tools("slack", &[Tool {
-            name: "send".to_string(),
-            description: Some("Send".to_string()),
-            input_schema: None,
-        }]);
+        server.register_tools(
+            "sentry",
+            &[Tool {
+                name: "search".to_string(),
+                description: Some("Search".to_string()),
+                input_schema: None,
+            }],
+        );
+        server.register_tools(
+            "slack",
+            &[Tool {
+                name: "send".to_string(),
+                description: Some("Send".to_string()),
+                input_schema: None,
+            }],
+        );
 
         let cached = server.collect_cached_tools("sentry");
         assert_eq!(cached.len(), 1);

@@ -15,9 +15,9 @@ pub struct McpClient {
 impl McpClient {
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
         let transport: Box<dyn Transport> = match config {
-            ServerConfig::Stdio { command, args, env, .. } => {
-                Box::new(StdioTransport::new(command, args, env)?)
-            }
+            ServerConfig::Stdio {
+                command, args, env, ..
+            } => Box::new(StdioTransport::new(command, args, env)?),
             ServerConfig::Http { url, headers, .. } => {
                 let mut t = HttpTransport::new(url, headers)?;
                 t.load_saved_token();
