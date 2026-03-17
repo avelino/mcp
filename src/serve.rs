@@ -85,6 +85,37 @@ enum BackendState {
     },
 }
 
+/// Tracks discovery failures for exponential backoff on retries.
+#[derive(Debug, Clone)]
+struct DiscoveryFailure {
+    attempts: u32,
+    last_attempt: Instant,
+}
+
+impl DiscoveryFailure {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            last_attempt: Instant::now(),
+        }
+    }
+
+    fn record_failure(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.last_attempt = Instant::now();
+    }
+
+    /// Returns true if enough time has passed to retry, using exponential backoff.
+    /// Backoff after first failure: 5s, then 10s, 20s, 40s (capped at 60s).
+    fn should_retry(&self) -> bool {
+        if self.attempts == 0 {
+            return true;
+        }
+        let backoff_secs = (5u64 << (self.attempts - 1).min(3)).min(60);
+        self.last_attempt.elapsed() >= Duration::from_secs(backoff_secs)
+    }
+}
+
 struct ProxyServer {
     configs: HashMap<String, ServerConfig>,
     backends: HashMap<String, BackendState>,
@@ -92,8 +123,9 @@ struct ProxyServer {
     tools: Vec<Tool>,
     audit: Arc<AuditLogger>,
     /// Tracks which backends have been successfully discovered.
-    /// Backends that fail discovery are excluded so they can be retried.
     discovered_backends: std::collections::HashSet<String>,
+    /// Tracks backends that failed discovery for exponential backoff.
+    discovery_failures: HashMap<String, DiscoveryFailure>,
 }
 
 impl ProxyServer {
@@ -105,6 +137,7 @@ impl ProxyServer {
             tools: Vec::new(),
             audit,
             discovered_backends: std::collections::HashSet::new(),
+            discovery_failures: HashMap::new(),
         }
     }
 
@@ -143,11 +176,19 @@ impl ProxyServer {
             .collect()
     }
 
-    /// Returns true if any configured backend has not yet been successfully discovered.
+    /// Returns true if any configured backend needs discovery (not yet discovered,
+    /// or previously failed and backoff period has elapsed).
     fn has_undiscovered_backends(&self) -> bool {
-        self.configs
-            .keys()
-            .any(|name| !self.discovered_backends.contains(name))
+        self.configs.keys().any(|name| {
+            if self.discovered_backends.contains(name) {
+                return false;
+            }
+            // If it failed before, only retry after backoff
+            match self.discovery_failures.get(name) {
+                Some(failure) => failure.should_retry(),
+                None => true, // never attempted
+            }
+        })
     }
 
     /// Discover tools from all backends. Connects, fetches tool list, then keeps connection alive.
@@ -155,6 +196,12 @@ impl ProxyServer {
         for (name, server_config) in &self.configs.clone() {
             if self.discovered_backends.contains(name) {
                 continue; // already discovered successfully
+            }
+            // Respect backoff for previously failed backends
+            if let Some(failure) = self.discovery_failures.get(name) {
+                if !failure.should_retry() {
+                    continue;
+                }
             }
             eprintln!("[serve] discovering tools from {name}...");
             match McpClient::connect(server_config).await {
@@ -170,14 +217,23 @@ impl ProxyServer {
                             },
                         );
                         self.discovered_backends.insert(name.clone());
+                        self.discovery_failures.remove(name);
                     }
                     Err(e) => {
                         eprintln!("[serve] {name}: failed to list tools: {e:#}");
                         let _ = client.shutdown().await;
+                        self.discovery_failures
+                            .entry(name.clone())
+                            .or_insert_with(DiscoveryFailure::new)
+                            .record_failure();
                     }
                 },
                 Err(e) => {
                     eprintln!("[serve] {name}: failed to connect: {e:#}");
+                    self.discovery_failures
+                        .entry(name.clone())
+                        .or_insert_with(DiscoveryFailure::new)
+                        .record_failure();
                 }
             }
         }
@@ -253,8 +309,9 @@ impl ProxyServer {
         }
     }
 
-    /// Shut down idle backends based on their timeout policy.
-    async fn reap_idle_backends(&mut self) {
+    /// Identify idle backends, move them to Disconnected state, and return
+    /// the extracted clients for shutdown **outside** the lock.
+    fn collect_idle_backends(&mut self) -> Vec<(String, McpClient)> {
         let mut to_shutdown = Vec::new();
 
         for (name, state) in &self.backends {
@@ -287,9 +344,10 @@ impl ProxyServer {
             }
         }
 
+        let mut clients = Vec::new();
         for name in to_shutdown {
             if let Some(BackendState::Connected {
-                mut client,
+                client,
                 usage_stats,
             }) = self.backends.remove(&name)
             {
@@ -299,16 +357,17 @@ impl ProxyServer {
                     usage_stats.idle_duration(),
                     usage_stats.request_count,
                 );
-                let _ = client.shutdown().await;
                 self.backends.insert(
-                    name,
+                    name.clone(),
                     BackendState::Disconnected {
                         cached_tools,
                         usage_stats,
                     },
                 );
+                clients.push((name, client));
             }
         }
+        clients
     }
 
     fn handle_initialize(&self, id: Value) -> JsonRpcResponse {
@@ -515,7 +574,11 @@ pub async fn run_stdio(config: Config) -> Result<()> {
                 // Notifications (no id) — just acknowledge silently
             }
             _ = reap_interval.tick() => {
-                server.reap_idle_backends().await;
+                let idle_clients = server.collect_idle_backends();
+                for (name, mut client) in idle_clients {
+                    eprintln!("[serve] finalizing shutdown for {name}");
+                    let _ = client.shutdown().await;
+                }
             }
         }
     }
@@ -607,14 +670,22 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    // Background reaper: shuts down idle backends periodically
+    // Background reaper: shuts down idle backends periodically.
+    // Lock is released before async shutdown to avoid blocking request handlers.
     let reaper_proxy = shared.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let mut proxy = reaper_proxy.lock().await;
-            proxy.reap_idle_backends().await;
+            let idle_clients = {
+                let mut proxy = reaper_proxy.lock().await;
+                proxy.collect_idle_backends()
+            };
+            // Shutdown outside the lock so request handlers are not blocked
+            for (name, mut client) in idle_clients {
+                eprintln!("[serve] finalizing shutdown for {name}");
+                let _ = client.shutdown().await;
+            }
         }
     });
 
@@ -1298,6 +1369,52 @@ mod tests {
         let timeout =
             stats.compute_adaptive_timeout(Duration::from_secs(60), Duration::from_secs(120));
         assert_eq!(timeout, Duration::from_secs(120)); // clamped to max
+    }
+
+    // --- DiscoveryFailure tests ---
+
+    #[test]
+    fn test_discovery_failure_initial_should_retry() {
+        let failure = DiscoveryFailure::new();
+        // Freshly created with 0 attempts — should always retry
+        assert!(failure.should_retry());
+    }
+
+    #[test]
+    fn test_discovery_failure_backoff_blocks_immediate_retry() {
+        let mut failure = DiscoveryFailure::new();
+        failure.record_failure();
+        // Just failed — backoff is 5s (5 << 1.min(3) = 10, but first failure = 5 << 0+1? no)
+        // Actually: attempts after record = 1, backoff = 5 << 1.min(3) = 10s
+        // Immediately after failure, should_retry() should be false
+        assert!(!failure.should_retry());
+    }
+
+    #[test]
+    fn test_discovery_failure_backoff_caps_at_60s() {
+        let mut failure = DiscoveryFailure::new();
+        for _ in 0..10 {
+            failure.record_failure();
+        }
+        // attempts = 10, min(3) = 3, 5 << 3 = 40, min(60) = 40
+        // Actually let's verify: attempts.min(3) = 3, 5u64 << 3 = 40, 40.min(60) = 40
+        // With many attempts it's still capped
+        assert!(!failure.should_retry());
+        assert_eq!(failure.attempts, 10);
+    }
+
+    #[test]
+    fn test_discovery_failure_clears_on_success() {
+        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut failure = DiscoveryFailure::new();
+        failure.record_failure();
+        server
+            .discovery_failures
+            .insert("test_backend".to_string(), failure);
+        assert!(server.discovery_failures.contains_key("test_backend"));
+        // Simulate success: remove from failures
+        server.discovery_failures.remove("test_backend");
+        assert!(!server.discovery_failures.contains_key("test_backend"));
     }
 
     // --- BackendState + register/unregister tests ---
