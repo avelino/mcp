@@ -286,12 +286,15 @@ use axum::Router;
 use tokio_stream::wrappers::ReceiverStream;
 
 type SharedProxy = Arc<Mutex<ProxyServer>>;
+type SseSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
+type SessionMap = Arc<Mutex<HashMap<String, SseSender>>>;
 
 #[derive(Clone)]
 struct AppState {
     proxy: SharedProxy,
     auth_provider: Arc<dyn AuthProvider>,
     acl: Option<AclConfig>,
+    sessions: SessionMap,
 }
 
 /// Extract credentials from HTTP headers (only transport-aware code).
@@ -352,12 +355,51 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         proxy: shared.clone(),
         auth_provider,
         acl,
+        sessions: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    // Log all incoming requests for debugging
+    let request_logger =
+        axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+            eprintln!(
+                "[serve] {} {} {}",
+                req.method(),
+                req.uri(),
+                req.headers()
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+            );
+            next.run(req).await
+        });
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/mcp", post(mcp_handler))
+        .route("/mcp", post(mcp_handler).get(mcp_sse_handler))
         .route("/mcp/sse", get(mcp_sse_handler))
+        .fallback(|req: axum::extract::Request| async move {
+            let path = req.uri().path().to_string();
+            let method = req.method().clone();
+            eprintln!(
+                "[serve] UNHANDLED {} {} (headers: {:?})",
+                method,
+                path,
+                req.headers()
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("?")))
+                    .collect::<Vec<_>>()
+            );
+            // OAuth/OIDC discovery endpoints: return 404 with valid JSON
+            // so clients that probe for auth don't crash on empty bodies
+            if path.contains(".well-known") || path == "/register" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "not_found", "error_description": "This server does not support OAuth"})),
+                );
+            }
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+        })
+        .layer(request_logger)
         .with_state(state.clone());
 
     eprintln!("[serve] HTTP server listening on {sock_addr}");
@@ -416,6 +458,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 // POST /mcp — JSON-RPC request/response
 async fn mcp_handler(
     State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -436,8 +479,21 @@ async fn mcp_handler(
         Err(resp) => return resp,
     };
 
-    // Parse JSON-RPC request
-    let req: JsonRpcRequest = match serde_json::from_slice(&body) {
+    // Parse JSON-RPC message (request or notification)
+    let msg: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = JsonRpcResponse::error(Value::Null, -32700, &format!("parse error: {e}"));
+            return (StatusCode::BAD_REQUEST, Json(json!(err)));
+        }
+    };
+
+    // Notifications have no "id" field — accept and return 202
+    if msg.get("id").is_none() {
+        return (StatusCode::ACCEPTED, Json(json!(null)));
+    }
+
+    let req: JsonRpcRequest = match serde_json::from_value(msg) {
         Ok(r) => r,
         Err(e) => {
             let err = JsonRpcResponse::error(Value::Null, -32700, &format!("parse error: {e}"));
@@ -450,15 +506,28 @@ async fn mcp_handler(
         .handle_request(req, &identity, &state.acl, "serve:http")
         .await;
 
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&response).unwrap()),
-    )
+    let response_json = serde_json::to_value(&response).unwrap();
+
+    // If this POST came from an SSE session, send the response over the SSE stream
+    // and return 202 Accepted (old HTTP+SSE transport)
+    if let Some(session_id) = query.get("session_id") {
+        let sessions = state.sessions.lock().await;
+        if let Some(tx) = sessions.get(session_id) {
+            let event = Event::default()
+                .event("message")
+                .data(serde_json::to_string(&response_json).unwrap());
+            let _ = tx.send(Ok(event)).await;
+            return (StatusCode::ACCEPTED, Json(json!(null)));
+        }
+    }
+
+    // Streamable HTTP transport: return response directly
+    (StatusCode::OK, Json(response_json))
 }
 
-// GET /mcp/sse — SSE endpoint for streaming
-// Implements the MCP SSE transport: client connects via SSE, sends requests via POST to /mcp,
-// and receives responses as SSE events.
+// GET /mcp/sse — SSE endpoint for streaming (old HTTP+SSE transport)
+// Client connects via SSE, receives `endpoint` event, sends requests via POST,
+// and receives JSON-RPC responses as SSE `message` events.
 async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Authenticate
     if let Err(resp) = authenticate_request(&state, &headers).await {
@@ -473,34 +542,22 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
         .event("endpoint")
         .data(format!("/mcp?session_id={session_id}"));
 
-    let proxy_clone = state.proxy.clone();
+    // Register this session so POST handler can send responses via SSE
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), tx.clone());
+    }
+
+    let sessions_clone = state.sessions.clone();
+    let session_id_clone = session_id.clone();
     tokio::spawn(async move {
         // Send endpoint URI
         if tx.send(Ok(endpoint_event)).await.is_err() {
             return;
         }
 
-        // Send server info as first message event
-        let info = {
-            let p = proxy_clone.lock().await;
-            json!({
-                "serverInfo": {
-                    "name": "mcp-proxy",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "backends": p.backends.len(),
-                "tools": p.tools.len(),
-            })
-        };
-
-        let info_event = Event::default()
-            .event("message")
-            .data(serde_json::to_string(&info).unwrap());
-
-        let _ = tx.send(Ok(info_event)).await;
-
         // Keep connection alive with periodic pings
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
             let ping = Event::default().comment("ping");
@@ -508,6 +565,10 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
                 break; // Client disconnected
             }
         }
+
+        // Cleanup session on disconnect
+        let mut sessions = sessions_clone.lock().await;
+        sessions.remove(&session_id_clone);
     });
 
     Sse::new(ReceiverStream::new(rx)).into_response()
@@ -711,6 +772,79 @@ mod tests {
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn test_protocol_version_is_current() {
+        assert_eq!(PROTOCOL_VERSION, "2025-11-25");
+    }
+
+    #[test]
+    fn test_notification_has_no_id() {
+        // JSON-RPC notifications have no "id" field
+        let notification: Value = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        assert!(notification.get("id").is_none());
+
+        // Requests have an "id" field
+        let request: Value =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        assert!(request.get("id").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sse_session_registration_and_cleanup() {
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = "test-session-123".to_string();
+
+        // Simulate registration
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        {
+            let mut map = sessions.lock().await;
+            map.insert(session_id.clone(), tx);
+            assert!(map.contains_key(&session_id));
+        }
+
+        // Simulate cleanup on disconnect
+        {
+            let mut map = sessions.lock().await;
+            map.remove(&session_id);
+            assert!(!map.contains_key(&session_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_session_response_routing() {
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = "route-test".to_string();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        {
+            let mut map = sessions.lock().await;
+            map.insert(session_id.clone(), tx);
+        }
+
+        // Simulate sending a response via the session channel
+        {
+            let map = sessions.lock().await;
+            let sender = map.get(&session_id).unwrap();
+            let event = Event::default()
+                .event("message")
+                .data(r#"{"id":1,"jsonrpc":"2.0","result":{"ok":true}}"#);
+            sender.send(Ok(event)).await.unwrap();
+        }
+
+        // Verify the response arrives
+        let received = rx.recv().await.unwrap().unwrap();
+        // Event was received successfully
+        assert!(format!("{:?}", received).contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn test_sse_session_missing_does_not_panic() {
+        let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let map = sessions.lock().await;
+        // Looking up a nonexistent session returns None, not panic
+        assert!(map.get("nonexistent").is_none());
     }
 
     #[test]

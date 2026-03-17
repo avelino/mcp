@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: &str = "2025-03-26";
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
 
 // --- JSON-RPC 2.0 ---
 
