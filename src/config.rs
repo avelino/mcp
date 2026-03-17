@@ -13,19 +13,14 @@ const RESERVED_NAMES: &[&str] = &[
     "search", "add", "remove", "list", "help", "version", "serve", "logs",
 ];
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Default, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleTimeoutPolicy {
+    #[default]
     Adaptive,
     Never,
     #[serde(untagged)]
     Fixed(String),
-}
-
-impl Default for IdleTimeoutPolicy {
-    fn default() -> Self {
-        IdleTimeoutPolicy::Adaptive
-    }
 }
 
 pub fn parse_duration_str(s: &str) -> Option<Duration> {
