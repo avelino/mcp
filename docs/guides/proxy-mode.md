@@ -6,6 +6,29 @@
 
 Without proxy mode, every LLM tool (Claude Code, Cursor, Windsurf, etc.) needs its own copy of your MCP server configuration. Add a new server? Update it in 3 places. Change a token? Same. The config drifts, breaks, and wastes time.
 
+There's another problem: **resource waste**. When you configure MCP servers with `command` in `mcpServers`, each client session spawns its own copy of every server process. Open 5 Claude Code sessions and you get 5 copies of every MCP server — easily 3-4 GB of RAM wasted on duplicate processes.
+
+### Stdio vs HTTP: when to use each
+
+| Approach | How it works | Trade-off |
+|----------|-------------|-----------|
+| `"command": "mcp", "args": ["serve"]` | Each session spawns a new proxy (which spawns all backends) | Simple, but duplicates everything per session |
+| `"type": "sse", "url": "http://…/mcp/sse"` | All sessions share one persistent proxy | One process, one set of backends, zero duplication |
+
+**Recommendation:** Run `mcp serve --http` as a persistent service (systemd, launchd, etc.) and point all your clients to it via SSE. This gives you a single set of backend connections shared across every session, every client, every terminal.
+
+```mermaid
+graph LR
+    C1["Claude Code #1"] --> Proxy
+    C2["Claude Code #2"] --> Proxy
+    C3["Cursor"] --> Proxy
+    Proxy["mcp serve --http<br/>(single process)"] --> Slack
+    Proxy --> Sentry
+    Proxy --> GitHub
+
+    style Proxy fill:#4a9,color:#fff
+```
+
 ## How it works
 
 ```mermaid
@@ -74,19 +97,27 @@ mcp serve --http 0.0.0.0:9090 --insecure
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/mcp` | JSON-RPC 2.0 request/response |
-| `GET` | `/mcp/sse` | SSE stream (per MCP transport spec) |
+| `POST` | `/mcp` | JSON-RPC 2.0 request/response (Streamable HTTP) |
+| `GET` | `/mcp` | SSE stream (same as `/mcp/sse`, for backward compatibility) |
+| `GET` | `/mcp/sse` | SSE stream (old HTTP+SSE transport) |
 | `GET` | `/health` | Health check (JSON) |
+
+The proxy supports both the **Streamable HTTP** transport (protocol version `2025-11-25`) and the older **HTTP+SSE** transport (`2024-11-05`) for backward compatibility.
 
 ### POST /mcp
 
-Send any MCP JSON-RPC request and get the response:
+Send any MCP JSON-RPC request and get the response. Supports both requests (with `id`) and notifications (without `id`):
 
 ```bash
 # Initialize
 curl -s http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}'
+
+# Send initialized notification (no id — returns 202)
+curl -s http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
 # List tools
 curl -s http://localhost:8080/mcp \
@@ -99,19 +130,18 @@ curl -s http://localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sentry__search_issues","arguments":{"query":"is:unresolved"}}}'
 ```
 
+When used with an SSE session (`?session_id=<uuid>`), responses are delivered via the SSE stream and the POST returns `202 Accepted`.
+
 ### GET /mcp/sse
 
-SSE endpoint for clients that use the MCP SSE transport. On connect, the server sends an `endpoint` event with the URL to POST requests to:
+SSE endpoint for clients that use the old HTTP+SSE transport (protocol version `2024-11-05`). On connect, the server sends an `endpoint` event with the URL to POST requests to:
 
 ```
 event: endpoint
 data: /mcp?session_id=<uuid>
-
-event: message
-data: {"serverInfo":{"name":"mcp-proxy","version":"0.1.0"},"backends":2,"tools":20}
 ```
 
-The connection stays open with periodic pings to keep it alive.
+JSON-RPC responses are delivered as `message` events on the SSE stream. The connection stays open with periodic pings (every 15 seconds) to keep it alive. Sessions are cleaned up automatically when the client disconnects.
 
 ### GET /health
 
@@ -175,15 +205,20 @@ In your Claude Code MCP settings (`.claude/mcp.json` or via Claude Code settings
 
 ### Claude Code (HTTP — shared server)
 
+Use the SSE transport type pointing to the `/mcp/sse` endpoint:
+
 ```json
 {
   "mcpServers": {
     "team": {
-      "url": "http://mcp.internal:8080/mcp"
+      "type": "sse",
+      "url": "http://localhost:8080/mcp/sse"
     }
   }
 }
 ```
+
+> **Note:** The Streamable HTTP transport (`type: "http"`) requires OAuth which is not yet supported. Use `type: "sse"` for now.
 
 ### Cursor (stdio)
 
@@ -233,7 +268,7 @@ Any client that supports stdio transport can use it. The proxy speaks standard J
 
 ```bash
 # Manual test — list tools
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | mcp serve 2>/dev/null
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | mcp serve 2>/dev/null
 ```
 
 ### Any MCP client (HTTP)
@@ -390,9 +425,11 @@ All standard `mcp` env vars apply:
 
 | Scenario | Mode |
 |----------|------|
-| Single developer, local LLM tools | `mcp serve` (stdio) |
-| Multiple LLM tools, single machine | `mcp serve` (stdio) |
-| Team sharing one MCP endpoint | `mcp serve --http` |
+| Single session, quick test | `mcp serve` (stdio) |
+| Multiple sessions on same machine | `mcp serve --http` + SSE clients |
+| Team sharing one MCP endpoint | `mcp serve --http` + SSE clients |
 | CI/CD pipeline calling tools | `mcp serve --http` + curl |
 | Production with auth & TLS | `mcp serve --http` + reverse proxy |
 | Calling one tool from a script | `mcp <server> <tool>` directly |
+
+> **If you regularly open multiple Claude Code sessions**, use HTTP mode as a persistent service. Stdio mode spawns a full copy of every backend per session — HTTP mode shares one.
