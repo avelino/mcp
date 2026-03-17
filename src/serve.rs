@@ -502,12 +502,13 @@ async fn mcp_handler(
         }
     };
 
-    let mut proxy = state.proxy.lock().await;
-    let response = proxy
-        .handle_request(req, &identity, &state.acl, "serve:http")
-        .await;
-
-    let response_json = serde_json::to_value(&response).unwrap();
+    let response_json = {
+        let mut proxy = state.proxy.lock().await;
+        let response = proxy
+            .handle_request(req, &identity, &state.acl, "serve:http")
+            .await;
+        serde_json::to_value(&response).unwrap()
+    };
 
     // If this POST came from an SSE session, send the response over the SSE stream
     // and return 202 Accepted (old HTTP+SSE transport).
