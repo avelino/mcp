@@ -359,8 +359,8 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     };
 
     // Log all incoming requests for debugging
-    let request_logger =
-        axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+    let request_logger = axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
             eprintln!(
                 "[serve] {} {} {}",
                 req.method(),
@@ -371,7 +371,8 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
                     .unwrap_or("-")
             );
             next.run(req).await
-        });
+        },
+    );
 
     let app = Router::new()
         .route("/health", get(health_handler))
