@@ -83,18 +83,28 @@ impl ServerConfig {
 
     pub fn min_idle_timeout(&self) -> Duration {
         let raw = match self {
-            ServerConfig::Stdio { min_idle_timeout, .. } => min_idle_timeout.as_deref(),
-            ServerConfig::Http { min_idle_timeout, .. } => min_idle_timeout.as_deref(),
+            ServerConfig::Stdio {
+                min_idle_timeout, ..
+            } => min_idle_timeout.as_deref(),
+            ServerConfig::Http {
+                min_idle_timeout, ..
+            } => min_idle_timeout.as_deref(),
         };
-        raw.and_then(parse_duration_str).unwrap_or(DEFAULT_MIN_IDLE_TIMEOUT)
+        raw.and_then(parse_duration_str)
+            .unwrap_or(DEFAULT_MIN_IDLE_TIMEOUT)
     }
 
     pub fn max_idle_timeout(&self) -> Duration {
         let raw = match self {
-            ServerConfig::Stdio { max_idle_timeout, .. } => max_idle_timeout.as_deref(),
-            ServerConfig::Http { max_idle_timeout, .. } => max_idle_timeout.as_deref(),
+            ServerConfig::Stdio {
+                max_idle_timeout, ..
+            } => max_idle_timeout.as_deref(),
+            ServerConfig::Http {
+                max_idle_timeout, ..
+            } => max_idle_timeout.as_deref(),
         };
-        raw.and_then(parse_duration_str).unwrap_or(DEFAULT_MAX_IDLE_TIMEOUT)
+        raw.and_then(parse_duration_str)
+            .unwrap_or(DEFAULT_MAX_IDLE_TIMEOUT)
     }
 }
 
@@ -223,7 +233,9 @@ mod tests {
 
         assert_eq!(config.servers.len(), 1);
         match &config.servers["github"] {
-            ServerConfig::Stdio { command, args, env, .. } => {
+            ServerConfig::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args.len(), 2);
                 assert_eq!(env["GITHUB_TOKEN"], "test123");
