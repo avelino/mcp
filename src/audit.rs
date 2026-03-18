@@ -176,10 +176,77 @@ impl AuditFilter {
     }
 }
 
+/// How long the ChronDB connection can be idle before the GC closes it.
+const AUDIT_DB_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often the GC thread checks for idle connections.
+const AUDIT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Manages the ChronDB connection lifecycle: open on first use, close when idle.
+///
+/// ChronDB loads a GraalVM native-image shared library whose internal threads
+/// consume CPU even when no operations are in flight. This struct ensures the
+/// isolate only exists while the database is actively being used.
+///
+/// A background GC thread monitors `last_used` and drops the connection after
+/// [`AUDIT_DB_IDLE_TIMEOUT`] of inactivity, tearing down the GraalVM isolate.
+/// The next operation transparently reopens it (like Go's `defer` on each use
+/// cycle).
+pub(crate) struct DbPool {
+    data_path: String,
+    index_path: String,
+    inner: std::sync::Mutex<DbPoolInner>,
+}
+
+struct DbPoolInner {
+    db: Option<Arc<ChronDB>>,
+    last_used: std::time::Instant,
+}
+
+impl DbPool {
+    fn new(data_path: String, index_path: String) -> Self {
+        Self {
+            data_path,
+            index_path,
+            inner: std::sync::Mutex::new(DbPoolInner {
+                db: None,
+                last_used: std::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Acquire a handle to ChronDB — opens if not connected.
+    fn acquire(&self) -> Result<Arc<ChronDB>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.last_used = std::time::Instant::now();
+        if let Some(ref db) = inner.db {
+            return Ok(db.clone());
+        }
+        let db = ChronDB::open(&self.data_path, &self.index_path)
+            .map_err(|e| anyhow::anyhow!("failed to open audit db: {e:?}"))?;
+        let db = Arc::new(db);
+        inner.db = Some(db.clone());
+        eprintln!("[audit] database opened");
+        Ok(db)
+    }
+
+    /// GC tick: close if idle longer than `max_idle`.
+    /// Returns true if the connection was closed.
+    fn gc(&self, max_idle: std::time::Duration) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.db.is_some() && inner.last_used.elapsed() >= max_idle {
+            inner.db = None; // Drop → SharedWorker::drop → graal_tear_down_isolate
+            eprintln!("[audit] database closed (idle {:?})", max_idle);
+            return true;
+        }
+        false
+    }
+}
+
 pub enum AuditLogger {
     Active {
         sender: tokio::sync::mpsc::UnboundedSender<AuditEntry>,
-        db: Arc<ChronDB>,
+        pool: Arc<DbPool>,
     },
     Disabled,
 }
@@ -199,12 +266,11 @@ impl AuditLogger {
         std::fs::create_dir_all(&index_path)
             .with_context(|| format!("failed to create audit index dir: {index_path}"))?;
 
-        let db = ChronDB::open(&data_path, &index_path)
-            .map_err(|e| anyhow::anyhow!("failed to open audit db: {e:?}"))?;
-        let db = Arc::new(db);
+        let pool = Arc::new(DbPool::new(data_path, index_path));
 
+        // Writer thread: receives entries via channel, writes to ChronDB on demand.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
-        let db_clone = db.clone();
+        let writer_pool = pool.clone();
         tokio::task::spawn_blocking(move || {
             while let Some(entry) = rx.blocking_recv() {
                 let key = format!(
@@ -213,12 +279,24 @@ impl AuditLogger {
                     uuid::Uuid::new_v4()
                 );
                 if let Ok(doc) = serde_json::to_value(&entry) {
-                    let _ = db_clone.put(&key, &doc, None);
+                    if let Ok(db) = writer_pool.acquire() {
+                        let _ = db.put(&key, &doc, None);
+                    }
                 }
             }
         });
 
-        Ok(AuditLogger::Active { sender: tx, db })
+        // GC thread: monitors idle time, closes ChronDB when not in use.
+        let gc_pool = pool.clone();
+        std::thread::Builder::new()
+            .name("audit-gc".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(AUDIT_GC_INTERVAL);
+                gc_pool.gc(AUDIT_DB_IDLE_TIMEOUT);
+            })
+            .ok();
+
+        Ok(AuditLogger::Active { sender: tx, pool })
     }
 
     pub fn log(&self, entry: AuditEntry) {
@@ -230,7 +308,8 @@ impl AuditLogger {
     pub fn query_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
         match self {
             AuditLogger::Disabled => Ok(vec![]),
-            AuditLogger::Active { db, .. } => {
+            AuditLogger::Active { pool, .. } => {
+                let db = pool.acquire()?;
                 let raw = db
                     .list_by_prefix("audit:", None)
                     .map_err(|e| anyhow::anyhow!("failed to query audit logs: {e:?}"))?;
@@ -242,7 +321,8 @@ impl AuditLogger {
     pub fn query_filtered(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
         match self {
             AuditLogger::Disabled => Ok(vec![]),
-            AuditLogger::Active { db, .. } => {
+            AuditLogger::Active { pool, .. } => {
+                let db = pool.acquire()?;
                 let raw = db
                     .list_by_prefix("audit:", None)
                     .map_err(|e| anyhow::anyhow!("failed to query audit logs: {e:?}"))?;
