@@ -118,8 +118,7 @@ pub fn remove_server(name: &str) -> Result<()> {
 }
 
 fn validate_http_url(url: &str) -> Result<()> {
-    let parsed =
-        url::Url::parse(url).with_context(|| format!("invalid URL: \"{url}\""))?;
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid URL: \"{url}\""))?;
     match parsed.scheme() {
         "http" | "https" => Ok(()),
         scheme => bail!("unsupported URL scheme \"{scheme}\": only http and https are allowed"),
