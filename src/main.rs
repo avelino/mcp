@@ -84,7 +84,7 @@ async fn run() -> Result<()> {
         let start = std::time::Instant::now();
         let result = output::print_servers(&cfg.servers, fmt);
         audit.log(audit::AuditEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: chrono::Local::now().to_rfc3339(),
             source: "cli".to_string(),
             method: "servers/list".to_string(),
             tool_name: None,
@@ -117,7 +117,7 @@ async fn run() -> Result<()> {
             };
 
             audit.log(audit::AuditEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: chrono::Local::now().to_rfc3339(),
                 source: "cli".to_string(),
                 method: "registry/search".to_string(),
                 tool_name: None,
@@ -158,7 +158,7 @@ async fn run() -> Result<()> {
             let result = manager::remove_server(&args[1]);
 
             audit.log(audit::AuditEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: chrono::Local::now().to_rfc3339(),
                 source: "cli".to_string(),
                 method: "config/remove".to_string(),
                 tool_name: None,
@@ -272,7 +272,7 @@ async fn handle_server_command(
         };
 
         audit.log(audit::AuditEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: chrono::Local::now().to_rfc3339(),
             source: "cli".to_string(),
             method: "tools/list".to_string(),
             tool_name: None,
@@ -305,7 +305,7 @@ async fn handle_server_command(
         };
 
         audit.log(audit::AuditEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: chrono::Local::now().to_rfc3339(),
             source: "cli".to_string(),
             method: "tools/info".to_string(),
             tool_name: None,
@@ -358,7 +358,7 @@ async fn handle_server_command(
     };
 
     audit.log(audit::AuditEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: chrono::Local::now().to_rfc3339(),
         source: "cli".to_string(),
         method: "tools/call".to_string(),
         tool_name: Some(tool_name.clone()),
@@ -396,7 +396,7 @@ async fn handle_add(args: &[String], audit: &Arc<audit::AuditLogger>) -> Result<
         let result = manager::add_http(name, url);
 
         audit.log(audit::AuditEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: chrono::Local::now().to_rfc3339(),
             source: "cli".to_string(),
             method: "config/add".to_string(),
             tool_name: None,
@@ -415,7 +415,7 @@ async fn handle_add(args: &[String], audit: &Arc<audit::AuditLogger>) -> Result<
     let result = manager::add_from_registry(name).await;
 
     audit.log(audit::AuditEntry {
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: chrono::Local::now().to_rfc3339(),
         source: "cli".to_string(),
         method: "config/add".to_string(),
         tool_name: None,

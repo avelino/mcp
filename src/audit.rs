@@ -451,7 +451,7 @@ mod tests {
 
     fn sample_entry() -> AuditEntry {
         AuditEntry {
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: chrono::Local::now().to_rfc3339(),
             source: "serve:http".to_string(),
             method: "tools/call".to_string(),
             tool_name: Some("sentry__search_issues".to_string()),
@@ -466,7 +466,7 @@ mod tests {
 
     fn sample_error_entry() -> AuditEntry {
         AuditEntry {
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: chrono::Local::now().to_rfc3339(),
             source: "cli".to_string(),
             method: "tools/call".to_string(),
             tool_name: Some("github__search_repos".to_string()),
