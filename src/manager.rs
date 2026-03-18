@@ -60,6 +60,8 @@ pub fn add_http(name: &str, url: &str) -> Result<()> {
         );
     }
 
+    validate_http_url(url)?;
+
     let path = config::config_path()?;
     let mut root = load_or_create_config(&path)?;
 
@@ -113,6 +115,14 @@ pub fn remove_server(name: &str) -> Result<()> {
     eprintln!("✓ Server \"{}\" removed from {}", name, path.display());
 
     Ok(())
+}
+
+fn validate_http_url(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid URL: \"{url}\""))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        scheme => bail!("unsupported URL scheme \"{scheme}\": only http and https are allowed"),
+    }
 }
 
 fn get_servers_mut(root: &mut Value) -> Result<&mut Value> {
@@ -374,6 +384,33 @@ mod tests {
         let mut root = load_or_create_config(&path).unwrap();
         let result = get_servers_mut(&mut root);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_http_url_accepts_http() {
+        assert!(validate_http_url("http://example.com/mcp").is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_url_accepts_https() {
+        assert!(validate_http_url("https://example.com/mcp").is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_url_rejects_invalid() {
+        let result = validate_http_url("not-a-url");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid URL"));
+    }
+
+    #[test]
+    fn test_validate_http_url_rejects_non_http_scheme() {
+        let result = validate_http_url("ftp://example.com/mcp");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported URL scheme"));
     }
 
     #[test]
