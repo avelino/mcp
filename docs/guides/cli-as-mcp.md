@@ -153,7 +153,7 @@ Controls how deep the discovery goes:
 - `1` — only parse the top-level `--help` (subcommand names + descriptions, no flag details)
 - `2` (default) — also run `<subcommand> --help` to discover flags and build `inputSchema`
 
-Higher values are possible but rarely useful and slow down discovery.
+Values greater than `2` are accepted but currently behave the same as `2` (no additional recursion depth).
 
 ## Preset tools
 
@@ -177,7 +177,7 @@ If automatic discovery doesn't work for a specific CLI, you can define tools man
 }
 ```
 
-When `tools` is provided, automatic discovery is skipped. The `args` in each tool define the exact arguments passed to the CLI when that tool is called.
+When `tools` is non-empty, automatic discovery is skipped. The `args` in each tool define the exact arguments passed to the CLI when that tool is called.
 
 ## Examples
 

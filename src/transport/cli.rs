@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use crate::cli_discovery;
 use crate::protocol::{
@@ -34,11 +36,16 @@ pub struct CliTransport {
     tools: Vec<Tool>,
     tool_args: HashMap<String, Vec<String>>,
     discovered: bool,
+    timeout_secs: u64,
 }
 
 impl CliTransport {
     pub fn new(config: CliTransportConfig) -> Self {
         let discovered = !config.preset_tools.is_empty();
+        let timeout_secs = std::env::var("MCP_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
         Self {
             command: config.command,
             base_args: config.base_args,
@@ -49,6 +56,7 @@ impl CliTransport {
             tools: config.preset_tools,
             tool_args: config.tool_args,
             discovered,
+            timeout_secs,
         }
     }
 
@@ -89,15 +97,51 @@ impl CliTransport {
         let tools_json: Vec<Value> = self
             .tools
             .iter()
-            .map(|t| serde_json::to_value(t).unwrap())
-            .collect();
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<_>>()?;
 
         Ok(JsonRpcResponse::success(id, json!({ "tools": tools_json })))
     }
 
     async fn handle_tools_call(&self, id: Value, params: Option<Value>) -> Result<JsonRpcResponse> {
-        let params = params.unwrap_or(json!({}));
-        let tool_name = params["name"].as_str().unwrap_or_default().to_string();
+        // Validate params is an object with a non-empty "name"
+        let params = match params {
+            Some(Value::Object(map)) => map,
+            _ => {
+                return Ok(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: expected object with non-empty \"name\"",
+                ));
+            }
+        };
+
+        let tool_name = match params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => name.to_string(),
+            None => {
+                return Ok(JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Invalid params: expected object with non-empty \"name\"",
+                ));
+            }
+        };
+
+        // Enforce allowlist: only permit tools that were discovered or preset
+        if !self.tools.iter().any(|t| t.name == tool_name)
+            && !self.tool_args.contains_key(&tool_name)
+        {
+            return Ok(JsonRpcResponse::error(
+                id,
+                -32602,
+                &format!("Unknown tool: {tool_name}"),
+            ));
+        }
+
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
         let mut cmd_args = self.base_args.clone();
@@ -108,10 +152,9 @@ impl CliTransport {
         } else {
             // Discovered tool: extract subcommand from tool name
             // e.g. "kubectl_get" → ["get"]
-            let cmd_base = self
-                .command
-                .rsplit('/')
-                .next()
+            let cmd_base = Path::new(&self.command)
+                .file_stem()
+                .and_then(|s| s.to_str())
                 .unwrap_or(&self.command)
                 .replace('-', "_");
             let subcommand = tool_name
@@ -140,7 +183,9 @@ impl CliTransport {
                     Value::Bool(true) => {
                         cmd_args.push(format!("--{flag_name}"));
                     }
-                    Value::Bool(false) => {}
+                    Value::Bool(false) => {
+                        cmd_args.push(format!("--{flag_name}=false"));
+                    }
                     Value::Null => {}
                     _ => {
                         cmd_args.push(format!("--{flag_name}"));
@@ -150,11 +195,26 @@ impl CliTransport {
             }
         }
 
-        // Run the command
+        // Run the command with timeout
         let mut cmd = Command::new(&self.command);
         cmd.args(&cmd_args).envs(&self.env);
 
-        let output = cmd.output().await;
+        let duration = Duration::from_secs(self.timeout_secs);
+        let output = match timeout(duration, cmd.output()).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Ok(JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": format!(
+                            "timeout: {} did not complete within {}s",
+                            self.command, self.timeout_secs
+                        )}],
+                        "isError": true
+                    }),
+                ));
+            }
+        };
 
         let (text, is_error) = match output {
             Ok(out) => {
