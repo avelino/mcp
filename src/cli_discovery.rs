@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde_json::json;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use crate::protocol::Tool;
 
@@ -24,9 +26,9 @@ pub async fn discover_tools(
     if subcommands.is_empty() {
         // No subcommands — expose the command itself as a single tool
         let flags = parse_flags(&help_output);
-        let tool_name = command
-            .rsplit('/')
-            .next()
+        let tool_name = Path::new(command)
+            .file_stem()
+            .and_then(|s| s.to_str())
             .unwrap_or(command)
             .replace('-', "_");
         let description = parse_description(&help_output);
@@ -41,9 +43,9 @@ pub async fn discover_tools(
 
         let tool_name = format!(
             "{}_{}",
-            command
-                .rsplit('/')
-                .next()
+            Path::new(command)
+                .file_stem()
+                .and_then(|s| s.to_str())
                 .unwrap_or(command)
                 .replace('-', "_"),
             sub_name.replace('-', "_")
@@ -77,12 +79,17 @@ async fn run_help(
     env: &HashMap<String, String>,
     help_flag: &str,
 ) -> Result<String> {
+    let timeout_secs: u64 = std::env::var("MCP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
     let mut cmd = Command::new(command);
     cmd.args(args).arg(help_flag).envs(env);
 
-    let output = cmd
-        .output()
+    let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
         .await
+        .with_context(|| format!("timeout running {command} {help_flag} after {timeout_secs}s"))?
         .with_context(|| format!("failed to run {command} {help_flag}"))?;
 
     // Some CLIs write help to stderr (e.g. when exit code != 0)
