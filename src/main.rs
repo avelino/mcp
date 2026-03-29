@@ -1,5 +1,6 @@
 mod audit;
 mod auth;
+mod cli_discovery;
 mod client;
 mod config;
 mod manager;

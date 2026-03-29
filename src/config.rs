@@ -40,8 +40,44 @@ pub const DEFAULT_MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct CliToolConfig {
+    pub name: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum ServerConfig {
+    // Cli must come before Stdio: both have `command`, but Cli requires `cli: true`.
+    // With untagged enums serde tries variants in order; Cli fails when `cli` is absent,
+    // falling through to Stdio.
+    Cli {
+        command: String,
+        cli: bool,
+        #[serde(default = "default_cli_help")]
+        cli_help: String,
+        #[serde(default = "default_cli_depth")]
+        cli_depth: u8,
+        #[serde(default)]
+        cli_only: Vec<String>,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
+        tools: Vec<CliToolConfig>,
+        #[serde(default)]
+        idle_timeout: IdleTimeoutPolicy,
+        #[serde(default)]
+        min_idle_timeout: Option<String>,
+        #[serde(default)]
+        max_idle_timeout: Option<String>,
+    },
     Stdio {
         command: String,
         #[serde(default)]
@@ -68,9 +104,18 @@ pub enum ServerConfig {
     },
 }
 
+fn default_cli_help() -> String {
+    "--help".to_string()
+}
+
+fn default_cli_depth() -> u8 {
+    2
+}
+
 impl ServerConfig {
     pub fn idle_timeout_policy(&self) -> &IdleTimeoutPolicy {
         match self {
+            ServerConfig::Cli { idle_timeout, .. } => idle_timeout,
             ServerConfig::Stdio { idle_timeout, .. } => idle_timeout,
             ServerConfig::Http { idle_timeout, .. } => idle_timeout,
         }
@@ -78,6 +123,9 @@ impl ServerConfig {
 
     pub fn min_idle_timeout(&self) -> Duration {
         let raw = match self {
+            ServerConfig::Cli {
+                min_idle_timeout, ..
+            } => min_idle_timeout.as_deref(),
             ServerConfig::Stdio {
                 min_idle_timeout, ..
             } => min_idle_timeout.as_deref(),
@@ -91,6 +139,9 @@ impl ServerConfig {
 
     pub fn max_idle_timeout(&self) -> Duration {
         let raw = match self {
+            ServerConfig::Cli {
+                max_idle_timeout, ..
+            } => max_idle_timeout.as_deref(),
             ServerConfig::Stdio {
                 max_idle_timeout, ..
             } => max_idle_timeout.as_deref(),
@@ -153,6 +204,16 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
 
     let servers: HashMap<String, ServerConfig> =
         serde_json::from_value(servers_value).context("failed to parse mcpServers from config")?;
+
+    for (name, config) in &servers {
+        if let ServerConfig::Cli { cli, .. } = config {
+            if !cli {
+                anyhow::bail!(
+                    "server '{name}': \"cli\" must be true (use a Stdio config without \"cli\" for MCP servers)"
+                );
+            }
+        }
+    }
 
     let server_auth: ServerAuthConfig = raw
         .get("serverAuth")

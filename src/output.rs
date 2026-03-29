@@ -79,6 +79,12 @@ fn print_servers_json(servers: &HashMap<String, ServerConfig>) -> Result<()> {
                 "type": "http",
                 "url": url,
             }),
+            ServerConfig::Cli { command, args, .. } => json!({
+                "name": name,
+                "type": "cli",
+                "command": command,
+                "args": args,
+            }),
         })
         .collect();
 
@@ -192,6 +198,14 @@ fn print_servers_text(servers: &HashMap<String, ServerConfig>) -> Result<()> {
                 (name.clone(), "stdio".to_string(), endpoint)
             }
             ServerConfig::Http { url, .. } => (name.clone(), "http".to_string(), url.clone()),
+            ServerConfig::Cli { command, args, .. } => {
+                let endpoint = if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{} {}", command, args.join(" "))
+                };
+                (name.clone(), "cli".to_string(), endpoint)
+            }
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));

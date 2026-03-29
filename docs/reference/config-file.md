@@ -19,7 +19,7 @@ Override: `MCP_CONFIG_PATH` environment variable.
 
 ## ServerConfig
 
-Two variants, distinguished by their fields:
+Three variants, distinguished by their fields:
 
 ### Stdio server
 
@@ -60,6 +60,34 @@ Two variants, distinguished by their fields:
 | `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
 | `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
 | `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
+
+### CLI server
+
+```json
+{
+  "command": "kubectl",
+  "cli": true,
+  "cli_help": "--help",
+  "cli_depth": 2,
+  "cli_only": ["get", "describe", "logs"]
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `command` | string | *required* | CLI executable to wrap |
+| `cli` | bool | *required* | Must be `true` — marks this as a CLI server |
+| `cli_help` | string | `"--help"` | Flag used to discover subcommands and options |
+| `cli_depth` | number | `2` | How deep to recurse into subcommands for flag discovery |
+| `cli_only` | string[] | `[]` (all) | Whitelist of subcommands to expose |
+| `args` | string[] | `[]` | Base arguments prepended to every invocation |
+| `env` | object | `{}` | Environment variables for the CLI process |
+| `tools` | array | `[]` | Preset tool definitions (skips auto-discovery when set) |
+| `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
+| `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
+| `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
+
+See the [CLI as MCP guide](../guides/cli-as-mcp.md) for discovery details and examples.
 
 ## Idle timeout
 
@@ -118,10 +146,11 @@ When a backend is shut down due to inactivity, its tools remain visible in `tool
 
 The config uses serde's untagged enum deserialization. The type is inferred from the fields:
 
-- Has `command` → Stdio
+- Has `command` + `cli: true` → CLI
+- Has `command` (without `cli`) → Stdio
 - Has `url` → HTTP
 
-If both are present, Stdio takes priority (it's checked first).
+CLI is checked first, then Stdio, then HTTP.
 
 ## Environment variable substitution
 
