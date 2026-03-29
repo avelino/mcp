@@ -12,6 +12,18 @@ use crate::protocol::{
 
 use super::Transport;
 
+pub struct CliTransportConfig {
+    pub command: String,
+    pub base_args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub help_flag: String,
+    pub depth: u8,
+    pub only: Vec<String>,
+    pub preset_tools: Vec<Tool>,
+    /// Maps tool name → fixed args for preset tools defined in config.
+    pub tool_args: HashMap<String, Vec<String>>,
+}
+
 pub struct CliTransport {
     command: String,
     base_args: Vec<String>,
@@ -20,32 +32,22 @@ pub struct CliTransport {
     depth: u8,
     only: Vec<String>,
     tools: Vec<Tool>,
-    /// Maps tool name → fixed args for preset tools defined in config.
     tool_args: HashMap<String, Vec<String>>,
     discovered: bool,
 }
 
 impl CliTransport {
-    pub fn new(
-        command: &str,
-        args: &[String],
-        env: &HashMap<String, String>,
-        help_flag: &str,
-        depth: u8,
-        only: &[String],
-        preset_tools: Vec<Tool>,
-        tool_args: HashMap<String, Vec<String>>,
-    ) -> Self {
-        let discovered = !preset_tools.is_empty();
+    pub fn new(config: CliTransportConfig) -> Self {
+        let discovered = !config.preset_tools.is_empty();
         Self {
-            command: command.to_string(),
-            base_args: args.to_vec(),
-            env: env.clone(),
-            help_flag: help_flag.to_string(),
-            depth,
-            only: only.to_vec(),
-            tools: preset_tools,
-            tool_args,
+            command: config.command,
+            base_args: config.base_args,
+            env: config.env,
+            help_flag: config.help_flag,
+            depth: config.depth,
+            only: config.only,
+            tools: config.preset_tools,
+            tool_args: config.tool_args,
             discovered,
         }
     }

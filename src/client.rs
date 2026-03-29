@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::config::ServerConfig;
 use crate::protocol::*;
-use crate::transport::cli::CliTransport;
+use crate::transport::cli::{CliTransport, CliTransportConfig};
 use crate::transport::http::HttpTransport;
 use crate::transport::stdio::StdioTransport;
 use crate::transport::Transport;
@@ -42,16 +42,16 @@ impl McpClient {
                         }
                     })
                     .collect();
-                Box::new(CliTransport::new(
-                    command,
-                    args,
-                    env,
-                    cli_help,
-                    *cli_depth,
-                    cli_only,
-                    preset,
-                    tool_args_map,
-                ))
+                Box::new(CliTransport::new(CliTransportConfig {
+                    command: command.clone(),
+                    base_args: args.clone(),
+                    env: env.clone(),
+                    help_flag: cli_help.clone(),
+                    depth: *cli_depth,
+                    only: cli_only.clone(),
+                    preset_tools: preset,
+                    tool_args: tool_args_map,
+                }))
             }
             ServerConfig::Stdio {
                 command, args, env, ..
