@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 
 use crate::config::ServerConfig;
 use crate::protocol::*;
+use crate::transport::cli::CliTransport;
 use crate::transport::http::HttpTransport;
 use crate::transport::stdio::StdioTransport;
 use crate::transport::Transport;
@@ -15,6 +18,41 @@ pub struct McpClient {
 impl McpClient {
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
         let transport: Box<dyn Transport> = match config {
+            ServerConfig::Cli {
+                command,
+                args,
+                env,
+                cli_help,
+                cli_depth,
+                cli_only,
+                tools: preset_tools,
+                ..
+            } => {
+                let mut tool_args_map = HashMap::new();
+                let preset: Vec<Tool> = preset_tools
+                    .iter()
+                    .map(|t| {
+                        if !t.args.is_empty() {
+                            tool_args_map.insert(t.name.clone(), t.args.clone());
+                        }
+                        Tool {
+                            name: t.name.clone(),
+                            description: t.description.clone(),
+                            input_schema: t.input_schema.clone(),
+                        }
+                    })
+                    .collect();
+                Box::new(CliTransport::new(
+                    command,
+                    args,
+                    env,
+                    cli_help,
+                    *cli_depth,
+                    cli_only,
+                    preset,
+                    tool_args_map,
+                ))
+            }
             ServerConfig::Stdio {
                 command, args, env, ..
             } => Box::new(StdioTransport::new(command, args, env)?),

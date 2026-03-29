@@ -2,6 +2,7 @@
 
 * [Introduction](README.md)
 * [Why MCP on the command line?](why-mcp-cli.md)
+* [Why MCP instead of CLI for teams](why-mcp-over-cli-for-teams.md)
 * [MCP servers are draining your hardware](mcp-servers-are-draining-your-hardware.md)
 
 ## First steps
@@ -15,6 +16,7 @@
 * [Authentication](guides/authentication.md)
 * [Registry](guides/registry.md)
 * [Scripting](guides/scripting.md)
+* [CLI as MCP](guides/cli-as-mcp.md)
 * [Proxy mode](guides/proxy-mode.md)
 * [Audit logging](guides/audit-logging.md)
 * [Enterprise token management](guides/enterprise-token-management.md)

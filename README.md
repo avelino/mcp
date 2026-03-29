@@ -97,9 +97,10 @@ Servers live in `~/.config/mcp/servers.json`:
 }
 ```
 
-Two types of servers:
+Three types of servers:
 - **Stdio** — the CLI spawns a local process (`command` + `args`)
 - **HTTP** — the CLI connects to a remote URL (`url` + optional `headers`)
+- **CLI** — wraps any command-line tool as an MCP server (`command` + `cli: true`)
 
 Environment variables use `${VAR_NAME}` syntax and are resolved at runtime.
 
@@ -167,6 +168,35 @@ Available tags:
 | `latest` | Latest stable release |
 | `x.y.z` | Pinned version |
 | `beta` | Latest build from main branch |
+
+## CLI as MCP
+
+Any command-line tool becomes an MCP server — no code, no wrapper:
+
+```json
+{
+  "mcpServers": {
+    "kubectl": {
+      "command": "kubectl",
+      "cli": true,
+      "cli_only": ["get", "describe", "logs", "version"]
+    }
+  }
+}
+```
+
+`mcp` parses `--help` automatically to discover subcommands and flags, then exposes them as MCP tools:
+
+```bash
+$ mcp kubectl --list
+kubectl_get        Display one or many resources
+kubectl_describe   Show details of a specific resource
+kubectl_version    Print the client and server version information
+
+$ mcp kubectl kubectl_get '{"args": "pods -A", "output": "json"}'
+```
+
+Works with kubectl, docker, terraform, git — anything with `--help`. See the [CLI as MCP guide](docs/guides/cli-as-mcp.md) for details.
 
 ## Proxy mode
 
