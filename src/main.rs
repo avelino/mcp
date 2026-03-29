@@ -32,6 +32,7 @@ fn print_usage() {
     eprintln!("  mcp --list                          List configured servers");
     eprintln!("  mcp <server> --list                 List tools from a server");
     eprintln!("  mcp <server> --info                 List tools with input schemas");
+    eprintln!("  mcp <server> --health               Check if server is reachable");
     eprintln!("  mcp <server> <tool> [json]          Call a tool");
     eprintln!("  mcp search <query>                  Search MCP registry");
     eprintln!("  mcp add <name>                      Add server from registry");
@@ -291,6 +292,38 @@ async fn handle_server_command(
             result?;
         }
         client.shutdown().await?;
+        return Ok(());
+    }
+
+    if args.len() >= 2 && args[1] == "--health" {
+        let start = std::time::Instant::now();
+
+        audit.log(audit::AuditEntry {
+            timestamp: chrono::Local::now().to_rfc3339(),
+            source: "cli".to_string(),
+            method: "health".to_string(),
+            tool_name: None,
+            server_name: Some(server_name.clone()),
+            identity: "local".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: true,
+            error_message: None,
+            arguments: None,
+        });
+
+        client.shutdown().await?;
+
+        match fmt {
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::json!({"server": server_name, "status": "ok"})
+                );
+            }
+            OutputFormat::Text => {
+                println!("{server_name}: ok");
+            }
+        }
         return Ok(());
     }
 

@@ -174,6 +174,61 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("servers.json"))
 }
 
+/// Strip single-line (`//`) and multi-line (`/* */`) comments from JSON,
+/// respecting string literals so that `"http://example.com"` is preserved.
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'"' => {
+                out.push('"');
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        out.push(bytes[i] as char);
+                        out.push(bytes[i + 1] as char);
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        out.push('"');
+                        i += 1;
+                        break;
+                    } else {
+                        out.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
+                // Single-line comment: skip until end of line
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // Multi-line comment: skip until */
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 < len {
+                    i += 2; // skip */
+                }
+            }
+            _ => {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     load_config_from_path(&path)
@@ -193,6 +248,7 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
     let content = substitute_env_vars(&content);
+    let content = strip_json_comments(&content);
 
     let raw: Value = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse config file: {}", path.display()))?;
@@ -584,5 +640,80 @@ mod tests {
         assert!(config.audit.enabled); // default
         assert!(!config.audit.log_arguments); // default
         assert!(config.audit.path.is_none());
+    }
+
+    #[test]
+    fn test_strip_single_line_comments() {
+        let input = r#"{
+            // this is a comment
+            "mcpServers": {}
+        }"#;
+        let stripped = strip_json_comments(input);
+        let _: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+    }
+
+    #[test]
+    fn test_strip_block_comments() {
+        let input = r#"{
+            /* block comment */
+            "mcpServers": {}
+        }"#;
+        let stripped = strip_json_comments(input);
+        let _: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+    }
+
+    #[test]
+    fn test_strip_comments_preserves_urls() {
+        let input = r#"{
+            "mcpServers": {
+                "sentry": {
+                    "url": "https://mcp.sentry.dev/mcp"
+                }
+            }
+        }"#;
+        let stripped = strip_json_comments(input);
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(
+            v["mcpServers"]["sentry"]["url"],
+            "https://mcp.sentry.dev/mcp"
+        );
+    }
+
+    #[test]
+    fn test_strip_comments_commented_out_server() {
+        let input = r#"{
+            "mcpServers": {
+                // "disabled": {
+                //   "url": "https://example.com"
+                // },
+                "enabled": {
+                    "url": "https://active.example.com"
+                }
+            }
+        }"#;
+        let stripped = strip_json_comments(input);
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert!(v["mcpServers"]["disabled"].is_null());
+        assert_eq!(
+            v["mcpServers"]["enabled"]["url"],
+            "https://active.example.com"
+        );
+    }
+
+    #[test]
+    fn test_config_with_comments() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {
+                    // "disabled": { "url": "https://example.com" },
+                    "active": {
+                        "url": "https://active.example.com"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(config.servers.contains_key("active"));
+        assert!(!config.servers.contains_key("disabled"));
     }
 }

@@ -146,15 +146,16 @@ fn parse_subcommands(help: &str) -> Vec<(String, String)> {
     // Match section headers like:
     //   "Commands:", "Available Commands:", "SUBCOMMANDS:",
     //   "Basic Commands (Beginner):", "Deploy Commands:", etc.
-    // Match section headers containing "command" or "subcommand" followed by ":"
-    // e.g. "Commands:", "Basic Commands (Beginner):", "Subcommands provided by plugins:"
-    let section_re = Regex::new(r"(?i)^.*\b(sub)?commands?\b.*:\s*$").unwrap();
-    let cmd_re = Regex::new(r"^\s{2,}(\w[\w-]*)\s{2,}(.*)$").unwrap();
+    // Match section headers containing "command" or "subcommand"
+    // e.g. "Commands:", "Basic Commands (Beginner):", "CORE COMMANDS", "ADDITIONAL COMMANDS"
+    let section_re = Regex::new(r"(?i)^.*\b(sub)?commands?\b.*:?\s*$").unwrap();
+    let cmd_re = Regex::new(r"^\s{2,}(\w[\w-]*):?\s{2,}(.*)$").unwrap();
 
     for line in help.lines() {
         let trimmed = line.trim();
 
-        if section_re.is_match(trimmed) {
+        // Section headers are not indented (e.g. "CORE COMMANDS", "Commands:")
+        if !line.starts_with(' ') && !line.starts_with('\t') && section_re.is_match(trimmed) {
             in_commands_section = true;
             continue;
         }
@@ -517,6 +518,55 @@ Subcommands provided by plugins:
         assert!(names.contains(&"scale"));
         assert!(names.contains(&"ctx"));
         assert_eq!(subs.len(), 7);
+    }
+
+    #[test]
+    fn test_parse_subcommands_gh_style() {
+        let help = r#"Work seamlessly with GitHub from the command line.
+
+USAGE
+  gh <command> <subcommand> [flags]
+
+CORE COMMANDS
+  auth:          Authenticate gh and git with GitHub
+  browse:        Open repositories, issues, pull requests, and more in the browser
+  issue:         Manage issues
+  pr:            Manage pull requests
+  repo:          Manage repositories
+
+GITHUB ACTIONS COMMANDS
+  run:           View details about workflow runs
+  workflow:      View details about GitHub Actions workflows
+
+ADDITIONAL COMMANDS
+  alias:         Create command shortcuts
+  api:           Make an authenticated GitHub API request
+  config:        Manage configuration for gh
+  extension:     Manage gh extensions
+  search:        Search for repositories, issues, and pull requests
+  secret:        Manage GitHub secrets
+  ssh-key:       Manage SSH keys
+  status:        Print information about relevant issues, pull requests, and notifications
+
+HELP TOPICS
+  environment:   Environment variables that can be used with gh
+
+FLAGS
+  --version   Show gh version
+
+LEARN MORE
+  Use `gh <command> <subcommand> --help` for more information about a command.
+"#;
+        let subs = parse_subcommands(help);
+        let names: Vec<&str> = subs.iter().map(|s| s.0.as_str()).collect();
+        assert!(names.contains(&"auth"), "missing auth: {:?}", names);
+        assert!(names.contains(&"pr"), "missing pr: {:?}", names);
+        assert!(names.contains(&"issue"), "missing issue: {:?}", names);
+        assert!(names.contains(&"repo"), "missing repo: {:?}", names);
+        assert!(names.contains(&"run"), "missing run: {:?}", names);
+        assert!(names.contains(&"api"), "missing api: {:?}", names);
+        assert!(names.contains(&"ssh-key"), "missing ssh-key: {:?}", names);
+        assert_eq!(subs.len(), 15);
     }
 
     #[test]
