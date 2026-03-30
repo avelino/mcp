@@ -91,10 +91,9 @@ pub async fn discover_tools(
 
     let mut tools = Vec::new();
     for handle in handles {
-        let (tool_name, sub_name, sub_desc, sub_help_result) =
-            handle.await.unwrap_or_else(|_| {
-                (String::new(), String::new(), String::new(), None)
-            });
+        let (tool_name, sub_name, sub_desc, sub_help_result) = handle
+            .await
+            .unwrap_or_else(|_| (String::new(), String::new(), String::new(), None));
 
         if tool_name.is_empty() {
             continue; // skip panicked tasks
