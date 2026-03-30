@@ -4,7 +4,7 @@ Every operation that passes through `mcp` is logged — CLI commands, proxy requ
 
 ## How it works
 
-`mcp` writes audit entries to an embedded [ChronDB](https://github.com/avelino/chrondb) database stored locally. Logging happens in a background thread via an async channel, so it never blocks your commands.
+`mcp` writes audit entries to an embedded [ChronDB](https://chrondb.avelino.run/) database stored locally. Logging happens in a background thread via an async channel, so it never blocks your commands.
 
 ```
 mcp <any command>  -->  AuditLogger (mpsc channel)  -->  ChronDB (background writer)
