@@ -219,12 +219,13 @@ This works with Claude Code, Cursor, Windsurf, or any MCP-compatible client. Too
 
 Every MCP client (Claude Code, Cursor, Windsurf) spawns all backend servers at startup and keeps them alive forever. With 10 servers and 3 sessions open, that's 30 idle processes eating ~3 GB of RAM.
 
-The `mcp` proxy fixes this with **lazy initialization** and **adaptive idle shutdown**:
+The `mcp` proxy fixes this with **persistent tool cache**, **lazy initialization**, and **adaptive idle shutdown**:
 
-- Backends only connect when you actually use them
+- **Instant startup** — tools are cached to disk and served immediately, even before backends connect
+- Backends only connect when you actually use them (background refresh keeps the cache fresh)
 - Idle backends are shut down automatically (1-5 min based on usage frequency)
 - Tools stay visible — reconnection is transparent on next call
-- Usage stats drive the timeout: hot backends stay longer, cold ones shut down fast
+- Cache invalidates automatically when backend config changes
 
 ```json
 {

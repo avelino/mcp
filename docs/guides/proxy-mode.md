@@ -40,7 +40,7 @@ graph LR
 ```
 
 1. Client sends `initialize` — the proxy responds immediately with capabilities
-2. Client calls `tools/list` — the proxy connects to all backends (lazy), discovers their tool lists, then lets idle backends shut down automatically
+2. Client calls `tools/list` — the proxy returns tools instantly from persistent cache (if available), while refreshing from real backends in the background. On first run, it connects to all backends to discover their tool lists.
 3. Client calls `tools/call` — the proxy reconnects the target backend on demand (if it was shut down), routes the request, and tracks usage for adaptive timeout
 
 ## Tool namespacing
@@ -283,6 +283,24 @@ Any client that supports HTTP transport can connect to the HTTP endpoint:
 mcp add --url http://localhost:8080/mcp local-proxy
 ```
 
+## Persistent tool cache
+
+The proxy caches discovered tools in a local [ChronDB](https://chrondb.avelino.run/) database so that subsequent startups serve tools instantly — no need to wait for backends to connect.
+
+### How it works
+
+On startup, the proxy loads cached tools and serves them immediately. A background task then connects to real backends to refresh the cache. If a backend's configuration changes (detected via SHA-256 hash), its cached entry is invalidated and re-discovered.
+
+First run with no cache falls back to blocking discovery (connecting to all backends before responding).
+
+### Cache invalidation
+
+The cache is invalidated per-backend when:
+- The backend's config in `servers.json` changes (command, args, url, env, etc.)
+- The backend is removed from config (cache entry is ignored)
+
+Cache location: `~/.config/mcp/db/` (shared database with audit logs, separated by key prefix).
+
 ## Lazy initialization and idle shutdown
 
 The proxy does **not** keep all backends running permanently. It uses a lazy initialization strategy combined with adaptive idle shutdown to minimize resource usage.
@@ -291,14 +309,14 @@ The proxy does **not** keep all backends running permanently. It uses a lazy ini
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Disconnected: proxy starts
-    Disconnected --> Connected: first tools/list (discovery)<br/>or tools/call targeting this backend
+    [*] --> Disconnected: proxy starts (tools loaded from cache)
+    Disconnected --> Connected: tools/call targeting this backend<br/>or background refresh
     Connected --> Disconnected: idle timeout exceeded
     Disconnected --> Connected: tools/call targeting this backend
 ```
 
-1. **Startup** — No backends are connected. The proxy starts instantly.
-2. **First `tools/list`** — The proxy connects to all backends, fetches their tool lists, and caches them. Backends are kept alive after discovery.
+1. **Startup** — No backends are connected. Cached tools are loaded from the local database and served immediately.
+2. **Background refresh** — The proxy connects to all backends in the background, refreshes tool lists, and updates the cache. Clients are not blocked.
 3. **Idle shutdown** — A background task checks every 30 seconds for idle backends. If a backend exceeds its idle timeout, it is shut down. Its tools remain visible in `tools/list`.
 4. **On-demand reconnect** — When `tools/call` targets a disconnected backend, the proxy reconnects it transparently, refreshes the tool cache, and forwards the request.
 
