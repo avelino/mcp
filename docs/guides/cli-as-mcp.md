@@ -65,7 +65,16 @@ mcp kubectl kubectl_version '{"client": true}'
 mcp kubectl kubectl_describe '{"args": "pod my-pod"}'
 ```
 
+The `args` field supports shell quoting for arguments with spaces:
+
+```bash
+# grep in a path with spaces
+mcp grep grep '{"args": "pattern \"my directory/file.txt\""}'
+```
+
 Each call spawns the CLI process, captures stdout, and returns it as MCP content. No long-running process — each invocation is independent.
+
+If the command writes to stderr on success (e.g. warnings), it's appended to the output under a `--- stderr ---` delimiter so nothing is lost silently.
 
 ## Configuration
 
@@ -259,6 +268,14 @@ mcp serve
 ```
 
 Idle timeout applies: since each CLI call is a separate process spawn, the CLI transport itself has no persistent connection to shut down. The idle timeout controls when the discovered tool cache is dropped.
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_TIMEOUT` | `60` | Timeout in seconds for each CLI command execution |
+| `MCP_MAX_OUTPUT` | `1048576` | Max output size in bytes (1 MB). Larger output is truncated |
+| `MCP_DISCOVERY_CONCURRENCY` | `10` | Max parallel `--help` calls during subcommand discovery |
 
 ## Help format support
 
