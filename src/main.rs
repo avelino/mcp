@@ -50,6 +50,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  --json                              Force JSON output");
+    eprintln!("  --dry-run                           Print JSON-RPC request without sending");
     eprintln!("  --insecure                          Allow HTTP on non-loopback interfaces");
     eprintln!();
     eprintln!("Output defaults to human-readable tables when run interactively.");
@@ -60,7 +61,11 @@ async fn run() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     let json_flag = raw_args.iter().any(|a| a == "--json");
-    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--json").collect();
+    let dry_run = raw_args.iter().any(|a| a == "--dry-run");
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .filter(|a| a != "--json" && a != "--dry-run")
+        .collect();
     let fmt = OutputFormat::detect(json_flag);
 
     let cfg = config::load_config()?;
@@ -180,7 +185,7 @@ async fn run() -> Result<()> {
         _ => {}
     }
 
-    handle_server_command(&args, &cfg, fmt, &audit).await
+    handle_server_command(&args, &cfg, fmt, &audit, dry_run).await
 }
 
 async fn handle_logs_command(
@@ -251,6 +256,7 @@ async fn handle_server_command(
     cfg: &config::Config,
     fmt: OutputFormat,
     audit: &Arc<audit::AuditLogger>,
+    dry_run: bool,
 ) -> Result<()> {
     let server_name = &args[0];
     let server_config = cfg
@@ -367,6 +373,13 @@ async fn handle_server_command(
         read_stdin_or_empty()?
     };
 
+    if dry_run {
+        let output = build_dry_run_request(tool_name, json_args)?;
+        println!("{output}");
+        client.shutdown().await?;
+        return Ok(());
+    }
+
     let start = std::time::Instant::now();
     let sp = spinner::Spinner::start(&format!("calling {tool_name}..."));
     let result = client.call_tool(tool_name, json_args.clone()).await;
@@ -464,6 +477,19 @@ async fn handle_add(args: &[String], audit: &Arc<audit::AuditLogger>) -> Result<
     result
 }
 
+fn build_dry_run_request(tool_name: &str, arguments: serde_json::Value) -> Result<String> {
+    let params = protocol::ToolCallParams {
+        name: tool_name.to_string(),
+        arguments,
+    };
+    let req = protocol::JsonRpcRequest::new(
+        1,
+        "tools/call",
+        Some(serde_json::to_value(&params)?),
+    );
+    Ok(serde_json::to_string_pretty(&req)?)
+}
+
 fn read_stdin_or_empty() -> Result<serde_json::Value> {
     if std::io::stdin().is_terminal() {
         return Ok(serde_json::json!({}));
@@ -476,5 +502,62 @@ fn read_stdin_or_empty() -> Result<serde_json::Value> {
         Ok(serde_json::json!({}))
     } else {
         Ok(serde_json::from_str(input)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_dry_run_request_structure() {
+        let output = build_dry_run_request("send_message", json!({"channel": "#general"})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["method"], "tools/call");
+        assert_eq!(parsed["params"]["name"], "send_message");
+        assert_eq!(parsed["params"]["arguments"]["channel"], "#general");
+    }
+
+    #[test]
+    fn test_dry_run_request_empty_arguments() {
+        let output = build_dry_run_request("ping", json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed["method"], "tools/call");
+        assert_eq!(parsed["params"]["name"], "ping");
+        assert_eq!(parsed["params"]["arguments"], json!({}));
+    }
+
+    #[test]
+    fn test_dry_run_request_complex_arguments() {
+        let args = json!({
+            "query": "SELECT * FROM users",
+            "limit": 10,
+            "filters": ["active", "verified"]
+        });
+        let output = build_dry_run_request("run_query", args.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed["params"]["name"], "run_query");
+        assert_eq!(parsed["params"]["arguments"], args);
+    }
+
+    #[test]
+    fn test_dry_run_output_is_valid_json() {
+        let output = build_dry_run_request("test_tool", json!({"key": "value"})).unwrap();
+        // Must parse as valid JSON without error
+        let result: Result<serde_json::Value, _> = serde_json::from_str(&output);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_dry_run_output_is_pretty_printed() {
+        let output = build_dry_run_request("test_tool", json!({"key": "value"})).unwrap();
+        // Pretty-printed JSON contains newlines
+        assert!(output.contains('\n'));
     }
 }
