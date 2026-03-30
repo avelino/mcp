@@ -9,6 +9,15 @@ use tokio::time::{timeout, Duration};
 
 use crate::protocol::Tool;
 
+/// A discovered tool paired with its original subcommand name.
+/// The subcommand name preserves hyphens (e.g. "api-versions") for correct
+/// execution, while the tool name uses underscores (e.g. "kubectl_api_versions").
+pub struct DiscoveredTool {
+    pub tool: Tool,
+    /// Original subcommand name (empty for single-tool CLIs without subcommands).
+    pub subcommand: String,
+}
+
 /// Discover MCP tools from a CLI binary by parsing its --help output.
 pub async fn discover_tools(
     command: &str,
@@ -17,11 +26,9 @@ pub async fn discover_tools(
     help_flag: &str,
     depth: u8,
     only: &[String],
-) -> Result<Vec<Tool>> {
+) -> Result<Vec<DiscoveredTool>> {
     let help_output = run_help(command, base_args, env, help_flag).await?;
     let subcommands = parse_subcommands(&help_output);
-
-    let mut tools = Vec::new();
 
     if subcommands.is_empty() {
         // No subcommands — expose the command itself as a single tool
@@ -32,42 +39,84 @@ pub async fn discover_tools(
             .unwrap_or(command)
             .replace('-', "_");
         let description = parse_description(&help_output);
-        tools.push(build_tool(&tool_name, &description, &flags));
-        return Ok(tools);
+        return Ok(vec![DiscoveredTool {
+            tool: build_tool(&tool_name, &description, &flags),
+            subcommand: String::new(),
+        }]);
     }
 
-    for (sub_name, sub_desc) in &subcommands {
-        if !only.is_empty() && !only.iter().any(|o| o == sub_name) {
-            continue;
-        }
+    let cmd_base = Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command)
+        .replace('-', "_");
 
-        let tool_name = format!(
-            "{}_{}",
-            Path::new(command)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(command)
-                .replace('-', "_"),
-            sub_name.replace('-', "_")
-        );
+    // Filter subcommands by cli_only early
+    let filtered: Vec<_> = subcommands
+        .into_iter()
+        .filter(|(name, _)| only.is_empty() || only.iter().any(|o| o == name))
+        .collect();
+
+    // Parallel discovery: spawn all subcommand --help calls concurrently
+    let max_concurrency: usize = std::env::var("MCP_DISCOVERY_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+
+    let mut handles = Vec::new();
+    for (sub_name, sub_desc) in filtered {
+        let tool_name = format!("{}_{}", cmd_base, sub_name.replace('-', "_"));
 
         if depth > 1 {
-            // Get flags from subcommand's own --help
+            let cmd = command.to_string();
             let mut sub_args = base_args.to_vec();
             sub_args.push(sub_name.clone());
-            if let Ok(sub_help) = run_help(command, &sub_args, env, help_flag).await {
-                let flags = parse_flags(&sub_help);
-                let desc = if sub_desc.is_empty() {
-                    parse_description(&sub_help)
-                } else {
-                    sub_desc.clone()
-                };
-                tools.push(build_tool(&tool_name, &desc, &flags));
-                continue;
-            }
+            let env_clone = env.clone();
+            let hf = help_flag.to_string();
+            let sem = semaphore.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                let sub_help = run_help(&cmd, &sub_args, &env_clone, &hf).await;
+                (tool_name, sub_name, sub_desc, Some(sub_help))
+            }));
+        } else {
+            // depth <= 1: no subcommand help needed
+            handles.push(tokio::spawn(async move {
+                (tool_name, sub_name, sub_desc, None)
+            }));
+        }
+    }
+
+    let mut tools = Vec::new();
+    for handle in handles {
+        let (tool_name, sub_name, sub_desc, sub_help_result) =
+            handle.await.unwrap_or_else(|_| {
+                (String::new(), String::new(), String::new(), None)
+            });
+
+        if tool_name.is_empty() {
+            continue; // skip panicked tasks
         }
 
-        tools.push(build_tool(&tool_name, sub_desc, &[]));
+        let (flags, desc) = match sub_help_result {
+            Some(Ok(help_text)) => {
+                let flags = parse_flags(&help_text);
+                let desc = if sub_desc.is_empty() {
+                    parse_description(&help_text)
+                } else {
+                    sub_desc
+                };
+                (flags, desc)
+            }
+            _ => (vec![], sub_desc),
+        };
+
+        tools.push(DiscoveredTool {
+            tool: build_tool(&tool_name, &desc, &flags),
+            subcommand: sub_name,
+        });
     }
 
     Ok(tools)
@@ -576,5 +625,30 @@ LEARN MORE
         assert_eq!(map_value_type("float"), "number");
         assert_eq!(map_value_type("bool"), "boolean");
         assert_eq!(map_value_type("path"), "string");
+    }
+
+    #[test]
+    fn test_hyphenated_subcommand_preserved_in_tool_name() {
+        // Subcommands with hyphens must preserve the original name
+        // e.g. "api-versions" → tool name "kubectl_api_versions", subcommand "api-versions"
+        let help = r#"kubectl controls the Kubernetes cluster manager.
+
+Available Commands:
+  get              Display one or many resources
+  api-versions     Print the supported API versions
+  api-resources    Print the supported API resources
+  help             Help about any command
+"#;
+        let subs = parse_subcommands(help);
+        assert_eq!(subs.len(), 3);
+        assert_eq!(subs[1].0, "api-versions");
+        assert_eq!(subs[2].0, "api-resources");
+
+        // Tool names use underscores
+        let tool_name = format!("kubectl_{}", subs[1].0.replace('-', "_"));
+        assert_eq!(tool_name, "kubectl_api_versions");
+
+        // But original subcommand preserves hyphens
+        assert_eq!(subs[1].0, "api-versions");
     }
 }

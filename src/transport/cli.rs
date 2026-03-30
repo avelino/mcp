@@ -14,6 +14,35 @@ use crate::protocol::{
 
 use super::Transport;
 
+/// Default max output size: 1 MB.
+const DEFAULT_MAX_OUTPUT: usize = 1_048_576;
+/// Max stderr to append on successful commands: 8 KB.
+const MAX_STDERR_ON_SUCCESS: usize = 8_192;
+
+fn max_output_bytes() -> usize {
+    std::env::var("MCP_MAX_OUTPUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_OUTPUT)
+}
+
+fn truncate_output(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Find a valid UTF-8 char boundary
+    let mut boundary = max;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!(
+        "{}\n\n... [truncated, {} bytes total, showing first {}]",
+        &s[..boundary],
+        s.len(),
+        boundary
+    )
+}
+
 pub struct CliTransportConfig {
     pub command: String,
     pub base_args: Vec<String>,
@@ -35,6 +64,8 @@ pub struct CliTransport {
     only: Vec<String>,
     tools: Vec<Tool>,
     tool_args: HashMap<String, Vec<String>>,
+    /// Maps tool name → original subcommand name (preserving hyphens).
+    subcommand_map: HashMap<String, String>,
     discovered: bool,
     timeout_secs: u64,
 }
@@ -55,6 +86,7 @@ impl CliTransport {
             only: config.only,
             tools: config.preset_tools,
             tool_args: config.tool_args,
+            subcommand_map: HashMap::new(),
             discovered,
             timeout_secs,
         }
@@ -64,7 +96,7 @@ impl CliTransport {
         if self.discovered {
             return Ok(());
         }
-        self.tools = cli_discovery::discover_tools(
+        let results = cli_discovery::discover_tools(
             &self.command,
             &self.base_args,
             &self.env,
@@ -73,6 +105,14 @@ impl CliTransport {
             &self.only,
         )
         .await?;
+
+        for dt in &results {
+            if !dt.subcommand.is_empty() {
+                self.subcommand_map
+                    .insert(dt.tool.name.clone(), dt.subcommand.clone());
+            }
+        }
+        self.tools = results.into_iter().map(|dt| dt.tool).collect();
         self.discovered = true;
         Ok(())
     }
@@ -103,7 +143,9 @@ impl CliTransport {
         Ok(JsonRpcResponse::success(id, json!({ "tools": tools_json })))
     }
 
-    async fn handle_tools_call(&self, id: Value, params: Option<Value>) -> Result<JsonRpcResponse> {
+    async fn handle_tools_call(&mut self, id: Value, params: Option<Value>) -> Result<JsonRpcResponse> {
+        self.ensure_discovered().await?;
+
         // Validate params is an object with a non-empty "name"
         let params = match params {
             Some(Value::Object(map)) => map,
@@ -149,9 +191,11 @@ impl CliTransport {
         if let Some(fixed_args) = self.tool_args.get(&tool_name) {
             // Preset tool: use the exact args from config
             cmd_args.extend(fixed_args.clone());
+        } else if let Some(original_sub) = self.subcommand_map.get(&tool_name) {
+            // Discovered tool: use the original subcommand name (preserves hyphens)
+            cmd_args.push(original_sub.clone());
         } else {
-            // Discovered tool: extract subcommand from tool name
-            // e.g. "kubectl_get" → ["get"]
+            // Fallback for tools without subcommand mapping
             let cmd_base = Path::new(&self.command)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -160,15 +204,17 @@ impl CliTransport {
             let subcommand = tool_name
                 .strip_prefix(&format!("{}_", cmd_base))
                 .unwrap_or(&tool_name);
-            for part in subcommand.split('_') {
-                cmd_args.push(part.replace('_', "-"));
-            }
+            cmd_args.push(subcommand.replace('_', "-"));
         }
 
-        // Add positional args if provided
+        // Add positional args if provided (supports shell quoting, e.g. "my file.txt")
         if let Some(pos_args) = arguments.get("args").and_then(|v| v.as_str()) {
-            for arg in pos_args.split_whitespace() {
-                cmd_args.push(arg.to_string());
+            match shell_words::split(pos_args) {
+                Ok(parsed) => cmd_args.extend(parsed),
+                Err(_) => {
+                    // Fallback to whitespace splitting if quotes are unbalanced
+                    cmd_args.extend(pos_args.split_whitespace().map(String::from));
+                }
             }
         }
 
@@ -216,14 +262,26 @@ impl CliTransport {
             }
         };
 
+        let max_out = max_output_bytes();
         let (text, is_error) = match output {
             Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
                 if out.status.success() {
-                    (stdout, false)
+                    let mut result = truncate_output(&stdout, max_out);
+                    if !stderr.trim().is_empty() {
+                        let stderr_truncated =
+                            truncate_output(&stderr, MAX_STDERR_ON_SUCCESS);
+                        result.push_str("\n\n--- stderr ---\n");
+                        result.push_str(&stderr_truncated);
+                    }
+                    (result, false)
                 } else {
-                    let msg = if stderr.is_empty() { stdout } else { stderr };
+                    let msg = if stderr.is_empty() {
+                        truncate_output(&stdout, max_out)
+                    } else {
+                        truncate_output(&stderr, max_out)
+                    };
                     (msg, true)
                 }
             }
@@ -266,5 +324,68 @@ impl Transport for CliTransport {
     async fn close(&mut self) -> Result<()> {
         // Nothing to clean up — each command is a separate process
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_output_within_limit() {
+        let s = "hello world";
+        assert_eq!(truncate_output(s, 100), "hello world");
+    }
+
+    #[test]
+    fn test_truncate_output_at_limit() {
+        let s = "abcde";
+        assert_eq!(truncate_output(s, 5), "abcde");
+    }
+
+    #[test]
+    fn test_truncate_output_exceeds_limit() {
+        let s = "abcdefghij";
+        let result = truncate_output(s, 5);
+        assert!(result.starts_with("abcde"));
+        assert!(result.contains("[truncated, 10 bytes total, showing first 5]"));
+    }
+
+    #[test]
+    fn test_truncate_output_utf8_boundary() {
+        // 'é' is 2 bytes in UTF-8: truncating at byte 1 should back up to 0
+        let s = "é";
+        let result = truncate_output(s, 1);
+        // Should not panic and should find valid boundary
+        assert!(result.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_subcommand_map_used_for_hyphenated_names() {
+        let transport = CliTransport {
+            command: "kubectl".to_string(),
+            base_args: vec![],
+            env: HashMap::new(),
+            help_flag: "--help".to_string(),
+            depth: 2,
+            only: vec![],
+            tools: vec![Tool {
+                name: "kubectl_api_versions".to_string(),
+                description: Some("Print API versions".to_string()),
+                input_schema: None,
+            }],
+            tool_args: HashMap::new(),
+            subcommand_map: HashMap::from([
+                ("kubectl_api_versions".to_string(), "api-versions".to_string()),
+            ]),
+            discovered: true,
+            timeout_secs: 5,
+        };
+
+        // Verify the subcommand map has the correct entry
+        assert_eq!(
+            transport.subcommand_map.get("kubectl_api_versions"),
+            Some(&"api-versions".to_string())
+        );
     }
 }
