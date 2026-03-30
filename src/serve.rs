@@ -758,6 +758,7 @@ struct AppState {
     auth_provider: Arc<dyn AuthProvider>,
     acl: Option<AclConfig>,
     sessions: SessionMap,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Extract credentials from HTTP headers (only transport-aware code).
@@ -822,11 +823,14 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let has_cached_tools = !server.tools.is_empty();
     let shared: SharedProxy = Arc::new(Mutex::new(server));
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     let state = AppState {
         proxy: shared.clone(),
         auth_provider,
         acl,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        shutdown: shutdown_rx,
     };
 
     // Background reaper: shuts down idle backends periodically.
@@ -917,7 +921,7 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let listener = tokio::net::TcpListener::bind(sock_addr).await?;
 
     // Graceful shutdown on SIGTERM/SIGINT
-    let shutdown_signal = async {
+    let shutdown_signal = async move {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
@@ -934,6 +938,7 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
             ctrl_c.await.ok();
         }
         eprintln!("\n[serve] shutdown signal received");
+        let _ = shutdown_tx.send(true);
     };
 
     axum::serve(listener, app)
@@ -1074,19 +1079,26 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
 
     let sessions_clone = state.sessions.clone();
     let session_id_clone = session_id.clone();
+    let mut shutdown_rx = state.shutdown.clone();
     tokio::spawn(async move {
         // Send endpoint URI
         if tx.send(Ok(endpoint_event)).await.is_err() {
             return;
         }
 
-        // Keep connection alive with periodic pings
+        // Keep connection alive with periodic pings until shutdown or client disconnect
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
-            interval.tick().await;
-            let ping = Event::default().comment("ping");
-            if tx.send(Ok(ping)).await.is_err() {
-                break; // Client disconnected
+            tokio::select! {
+                _ = interval.tick() => {
+                    let ping = Event::default().comment("ping");
+                    if tx.send(Ok(ping)).await.is_err() {
+                        break; // Client disconnected
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    break; // Server shutting down
+                }
             }
         }
 
