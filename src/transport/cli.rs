@@ -143,7 +143,11 @@ impl CliTransport {
         Ok(JsonRpcResponse::success(id, json!({ "tools": tools_json })))
     }
 
-    async fn handle_tools_call(&mut self, id: Value, params: Option<Value>) -> Result<JsonRpcResponse> {
+    async fn handle_tools_call(
+        &mut self,
+        id: Value,
+        params: Option<Value>,
+    ) -> Result<JsonRpcResponse> {
         self.ensure_discovered().await?;
 
         // Validate params is an object with a non-empty "name"
@@ -270,8 +274,7 @@ impl CliTransport {
                 if out.status.success() {
                     let mut result = truncate_output(&stdout, max_out);
                     if !stderr.trim().is_empty() {
-                        let stderr_truncated =
-                            truncate_output(&stderr, MAX_STDERR_ON_SUCCESS);
+                        let stderr_truncated = truncate_output(&stderr, MAX_STDERR_ON_SUCCESS);
                         result.push_str("\n\n--- stderr ---\n");
                         result.push_str(&stderr_truncated);
                     }
@@ -375,9 +378,10 @@ mod tests {
                 input_schema: None,
             }],
             tool_args: HashMap::new(),
-            subcommand_map: HashMap::from([
-                ("kubectl_api_versions".to_string(), "api-versions".to_string()),
-            ]),
+            subcommand_map: HashMap::from([(
+                "kubectl_api_versions".to_string(),
+                "api-versions".to_string(),
+            )]),
             discovered: true,
             timeout_secs: 5,
         };
