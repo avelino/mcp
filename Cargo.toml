@@ -1,6 +1,6 @@
 [package]
 name = "mcp"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "CLI that turns MCP servers into terminal commands"
 authors = ["Thiago Avelino <avelinorun@gmail.com>"]
