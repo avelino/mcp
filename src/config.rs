@@ -160,11 +160,43 @@ pub struct Config {
     pub server_auth: ServerAuthConfig,
     pub audit: AuditConfig,
     pub path: PathBuf,
+    /// SHA-256 hex digest of each backend's raw config JSON, for cache invalidation.
+    pub config_hashes: HashMap<String, String>,
 }
 
 pub fn config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not determine home directory")?;
     Ok(home.join(".config").join("mcp"))
+}
+
+/// Returns the data path for the shared ChronDB database.
+/// Falls back to legacy `audit/data` path for backward compatibility.
+pub fn db_data_path() -> Result<String> {
+    let dir = config_dir()?;
+    let new_path = dir.join("db").join("data");
+    if new_path.exists() {
+        return Ok(new_path.to_string_lossy().to_string());
+    }
+    let legacy_path = dir.join("audit").join("data");
+    if legacy_path.exists() {
+        return Ok(legacy_path.to_string_lossy().to_string());
+    }
+    Ok(new_path.to_string_lossy().to_string())
+}
+
+/// Returns the index path for the shared ChronDB database.
+/// Falls back to legacy `audit/index` path for backward compatibility.
+pub fn db_index_path() -> Result<String> {
+    let dir = config_dir()?;
+    let new_path = dir.join("db").join("index");
+    if new_path.exists() {
+        return Ok(new_path.to_string_lossy().to_string());
+    }
+    let legacy_path = dir.join("audit").join("index");
+    if legacy_path.exists() {
+        return Ok(legacy_path.to_string_lossy().to_string());
+    }
+    Ok(new_path.to_string_lossy().to_string())
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -241,6 +273,7 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
             server_auth: ServerAuthConfig::default(),
             audit: AuditConfig::default(),
             path: path.clone(),
+            config_hashes: HashMap::new(),
         });
     }
 
@@ -257,6 +290,21 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         .get("mcpServers")
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
+
+    // Compute per-backend config hashes for cache invalidation
+    let config_hashes: HashMap<String, String> = match servers_value.as_object() {
+        Some(map) => {
+            use sha2::{Digest, Sha256};
+            map.iter()
+                .map(|(name, val)| {
+                    let json = serde_json::to_string(val).unwrap_or_default();
+                    let hash = format!("{:x}", Sha256::digest(json.as_bytes()));
+                    (name.clone(), hash)
+                })
+                .collect()
+        }
+        None => HashMap::new(),
+    };
 
     let servers: HashMap<String, ServerConfig> =
         serde_json::from_value(servers_value).context("failed to parse mcpServers from config")?;
@@ -290,6 +338,7 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         server_auth,
         audit,
         path: path.clone(),
+        config_hashes,
     })
 }
 

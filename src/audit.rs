@@ -1,11 +1,10 @@
 use anyhow::{bail, Context, Result};
-use chrondb::ChronDB;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::config;
+use crate::db::DbPool;
 
 fn default_true() -> bool {
     true
@@ -33,24 +32,14 @@ impl Default for AuditConfig {
 }
 
 impl AuditConfig {
-    fn data_path(&self) -> Result<String> {
-        if let Some(ref p) = self.path {
-            return Ok(p.clone());
-        }
-        let dir = config::config_dir()?;
-        Ok(dir.join("audit").join("data").to_string_lossy().to_string())
+    /// Returns the data path override, if configured.
+    pub fn data_path_override(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 
-    fn index_path(&self) -> Result<String> {
-        if let Some(ref p) = self.index_path {
-            return Ok(p.clone());
-        }
-        let dir = config::config_dir()?;
-        Ok(dir
-            .join("audit")
-            .join("index")
-            .to_string_lossy()
-            .to_string())
+    /// Returns the index path override, if configured.
+    pub fn index_path_override(&self) -> Option<&str> {
+        self.index_path.as_deref()
     }
 }
 
@@ -176,73 +165,6 @@ impl AuditFilter {
     }
 }
 
-/// How long the ChronDB connection can be idle before the GC closes it.
-const AUDIT_DB_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// How often the GC thread checks for idle connections.
-const AUDIT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Manages the ChronDB connection lifecycle: open on first use, close when idle.
-///
-/// ChronDB loads a GraalVM native-image shared library whose internal threads
-/// consume CPU even when no operations are in flight. This struct ensures the
-/// isolate only exists while the database is actively being used.
-///
-/// A background GC thread monitors `last_used` and drops the connection after
-/// [`AUDIT_DB_IDLE_TIMEOUT`] of inactivity, tearing down the GraalVM isolate.
-/// The next operation transparently reopens it (like Go's `defer` on each use
-/// cycle).
-pub(crate) struct DbPool {
-    data_path: String,
-    index_path: String,
-    inner: std::sync::Mutex<DbPoolInner>,
-}
-
-struct DbPoolInner {
-    db: Option<Arc<ChronDB>>,
-    last_used: std::time::Instant,
-}
-
-impl DbPool {
-    fn new(data_path: String, index_path: String) -> Self {
-        Self {
-            data_path,
-            index_path,
-            inner: std::sync::Mutex::new(DbPoolInner {
-                db: None,
-                last_used: std::time::Instant::now(),
-            }),
-        }
-    }
-
-    /// Acquire a handle to ChronDB — opens if not connected.
-    fn acquire(&self) -> Result<Arc<ChronDB>> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.last_used = std::time::Instant::now();
-        if let Some(ref db) = inner.db {
-            return Ok(db.clone());
-        }
-        let db = ChronDB::open(&self.data_path, &self.index_path)
-            .map_err(|e| anyhow::anyhow!("failed to open audit db: {e:?}"))?;
-        let db = Arc::new(db);
-        inner.db = Some(db.clone());
-        eprintln!("[audit] database opened");
-        Ok(db)
-    }
-
-    /// GC tick: close if idle longer than `max_idle`.
-    /// Returns true if the connection was closed.
-    fn gc(&self, max_idle: std::time::Duration) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.db.is_some() && inner.last_used.elapsed() >= max_idle {
-            inner.db = None; // Drop → SharedWorker::drop → graal_tear_down_isolate
-            eprintln!("[audit] database closed (idle {:?})", max_idle);
-            return true;
-        }
-        false
-    }
-}
-
 pub enum AuditLogger {
     Active {
         sender: tokio::sync::mpsc::UnboundedSender<AuditEntry>,
@@ -252,21 +174,10 @@ pub enum AuditLogger {
 }
 
 impl AuditLogger {
-    pub fn open(config: &AuditConfig) -> Result<Self> {
+    pub fn open(config: &AuditConfig, pool: Arc<DbPool>) -> Result<Self> {
         if !config.enabled {
             return Ok(AuditLogger::Disabled);
         }
-
-        let data_path = config.data_path()?;
-        let index_path = config.index_path()?;
-
-        // Ensure directories exist
-        std::fs::create_dir_all(&data_path)
-            .with_context(|| format!("failed to create audit data dir: {data_path}"))?;
-        std::fs::create_dir_all(&index_path)
-            .with_context(|| format!("failed to create audit index dir: {index_path}"))?;
-
-        let pool = Arc::new(DbPool::new(data_path, index_path));
 
         // Writer thread: receives entries via channel, writes to ChronDB on demand.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
@@ -285,16 +196,6 @@ impl AuditLogger {
                 }
             }
         });
-
-        // GC thread: monitors idle time, closes ChronDB when not in use.
-        let gc_pool = pool.clone();
-        std::thread::Builder::new()
-            .name("audit-gc".to_string())
-            .spawn(move || loop {
-                std::thread::sleep(AUDIT_GC_INTERVAL);
-                gc_pool.gc(AUDIT_DB_IDLE_TIMEOUT);
-            })
-            .ok();
 
         Ok(AuditLogger::Active { sender: tx, pool })
     }
