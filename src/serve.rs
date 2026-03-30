@@ -191,45 +191,87 @@ impl ProxyServer {
         })
     }
 
-    /// Discover tools from all backends. Connects, fetches tool list, then keeps connection alive.
+    /// Discover tools from all backends in parallel.
+    /// Each backend connects and fetches its tool list concurrently, so a slow
+    /// backend no longer blocks the others.
     async fn discover_tools(&mut self) {
-        for (name, server_config) in &self.configs.clone() {
-            if self.discovered_backends.contains(name) {
-                continue; // already discovered successfully
-            }
-            // Respect backoff for previously failed backends
-            if let Some(failure) = self.discovery_failures.get(name) {
-                if !failure.should_retry() {
+        let discovery_timeout = std::time::Duration::from_secs(30);
+
+        // Collect backends that need discovery
+        let pending: Vec<(String, ServerConfig)> = self
+            .configs
+            .iter()
+            .filter(|(name, _)| {
+                if self.discovered_backends.contains(*name) {
+                    return false;
+                }
+                match self.discovery_failures.get(*name) {
+                    Some(failure) => failure.should_retry(),
+                    None => true,
+                }
+            })
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+
+        if pending.is_empty() {
+            return;
+        }
+
+        for name in pending.iter().map(|(n, _)| n) {
+            eprintln!("[serve] discovering tools from {name}...");
+        }
+
+        // Fire all discoveries in parallel
+        let handles: Vec<_> = pending
+            .into_iter()
+            .map(|(name, server_config)| {
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(discovery_timeout, async {
+                        let mut client = McpClient::connect(&server_config).await?;
+                        let tools = client.list_tools().await?;
+                        Ok::<_, anyhow::Error>((client, tools))
+                    })
+                    .await;
+                    (name, result)
+                })
+            })
+            .collect();
+
+        // Collect results and apply to self
+        for handle in handles {
+            let (name, result) = match handle.await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[serve] discovery task panicked: {e}");
                     continue;
                 }
-            }
-            eprintln!("[serve] discovering tools from {name}...");
-            match McpClient::connect(server_config).await {
-                Ok(mut client) => match client.list_tools().await {
-                    Ok(tools) => {
-                        eprintln!("[serve] {name}: {} tool(s)", tools.len());
-                        self.register_tools(name, &tools);
-                        self.backends.insert(
-                            name.clone(),
-                            BackendState::Connected {
-                                client,
-                                usage_stats: UsageStats::new(),
-                            },
-                        );
-                        self.discovered_backends.insert(name.clone());
-                        self.discovery_failures.remove(name);
-                    }
-                    Err(e) => {
-                        eprintln!("[serve] {name}: failed to list tools: {e:#}");
-                        let _ = client.shutdown().await;
-                        self.discovery_failures
-                            .entry(name.clone())
-                            .or_insert_with(DiscoveryFailure::new)
-                            .record_failure();
-                    }
-                },
-                Err(e) => {
-                    eprintln!("[serve] {name}: failed to connect: {e:#}");
+            };
+            match result {
+                Ok(Ok((client, tools))) => {
+                    eprintln!("[serve] {name}: {} tool(s)", tools.len());
+                    self.register_tools(&name, &tools);
+                    self.backends.insert(
+                        name.clone(),
+                        BackendState::Connected {
+                            client,
+                            usage_stats: UsageStats::new(),
+                        },
+                    );
+                    self.discovered_backends.insert(name.clone());
+                    self.discovery_failures.remove(&name);
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[serve] {name}: failed to discover: {e:#}");
+                    self.discovery_failures
+                        .entry(name.clone())
+                        .or_insert_with(DiscoveryFailure::new)
+                        .record_failure();
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[serve] {name}: discovery timed out ({}s)",
+                        discovery_timeout.as_secs()
+                    );
                     self.discovery_failures
                         .entry(name.clone())
                         .or_insert_with(DiscoveryFailure::new)
@@ -519,12 +561,25 @@ impl ProxyServer {
     }
 
     async fn shutdown_all(&mut self) {
-        for (name, state) in self.backends.drain() {
-            if let BackendState::Connected { mut client, .. } = state {
-                if let Err(e) = client.shutdown().await {
-                    eprintln!("[serve] {name}: shutdown error: {e:#}");
-                }
-            }
+        let shutdown_timeout = Duration::from_secs(5);
+        let handles: Vec<_> = self
+            .backends
+            .drain()
+            .filter_map(|(name, state)| match state {
+                BackendState::Connected { client, .. } => Some((name, client)),
+                _ => None,
+            })
+            .map(|(name, mut client)| {
+                tokio::spawn(async move {
+                    if let Err(e) = tokio::time::timeout(shutdown_timeout, client.shutdown()).await
+                    {
+                        eprintln!("[serve] {name}: shutdown timed out: {e}");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            let _ = handle.await;
         }
     }
 }
@@ -767,9 +822,17 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         .with_graceful_shutdown(shutdown_signal)
         .await?;
 
-    // Cleanup backends
-    let mut proxy = state.proxy.lock().await;
-    proxy.shutdown_all().await;
+    // Cleanup backends — bounded so a stuck handler doesn't block exit
+    let cleanup = async {
+        let mut proxy = state.proxy.lock().await;
+        proxy.shutdown_all().await;
+    };
+    if tokio::time::timeout(Duration::from_secs(10), cleanup)
+        .await
+        .is_err()
+    {
+        eprintln!("[serve] shutdown timed out — forcing exit");
+    }
     eprintln!("[serve] shutting down");
 
     Ok(())
