@@ -1,8 +1,10 @@
 mod audit;
 mod auth;
+mod cache;
 mod cli_discovery;
 mod client;
 mod config;
+mod db;
 mod manager;
 mod output;
 mod protocol;
@@ -78,9 +80,17 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Shared database pool for audit logging and tool cache
+    let db_pool = db::create_pool(&cfg.audit).unwrap_or_else(|e| {
+        eprintln!("warning: failed to create db pool: {e:#}");
+        Arc::new(db::DbPool::new(String::new(), String::new()))
+    });
+
     // Audit logger shared across all commands
-    let audit =
-        Arc::new(audit::AuditLogger::open(&cfg.audit).unwrap_or(audit::AuditLogger::Disabled));
+    let audit = Arc::new(
+        audit::AuditLogger::open(&cfg.audit, db_pool.clone())
+            .unwrap_or(audit::AuditLogger::Disabled),
+    );
 
     if args[0] == "--list" {
         let start = std::time::Instant::now();
@@ -175,7 +185,7 @@ async fn run() -> Result<()> {
             return result;
         }
         "logs" => {
-            return handle_logs_command(&args[1..], &cfg, fmt).await;
+            return handle_logs_command(&args[1..], &cfg, fmt, db_pool.clone()).await;
         }
         _ => {}
     }
@@ -187,14 +197,15 @@ async fn handle_logs_command(
     args: &[String],
     cfg: &config::Config,
     fmt: OutputFormat,
+    pool: Arc<db::DbPool>,
 ) -> Result<()> {
     let filter = audit::parse_filter_args(args)?;
 
     if filter.follow {
-        return handle_logs_follow(cfg, fmt, &filter).await;
+        return handle_logs_follow(cfg, fmt, &filter, pool).await;
     }
 
-    let audit_logger = audit::AuditLogger::open(&cfg.audit)?;
+    let audit_logger = audit::AuditLogger::open(&cfg.audit, pool)?;
     let entries = audit_logger.query_filtered(&filter)?;
 
     if entries.is_empty() {
@@ -209,8 +220,9 @@ async fn handle_logs_follow(
     cfg: &config::Config,
     fmt: OutputFormat,
     filter: &audit::AuditFilter,
+    pool: Arc<db::DbPool>,
 ) -> Result<()> {
-    let audit_logger = audit::AuditLogger::open(&cfg.audit)?;
+    let audit_logger = audit::AuditLogger::open(&cfg.audit, pool)?;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     eprintln!("[logs] following audit log (ctrl+c to stop)...");

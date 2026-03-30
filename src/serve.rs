@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::audit::{AuditEntry, AuditLogger};
+use crate::cache::{BackendToolCache, ToolCacheStore};
 use crate::client::McpClient;
 use crate::config::{parse_duration_str, Config, IdleTimeoutPolicy, ServerConfig};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, Tool, PROTOCOL_VERSION};
@@ -126,10 +127,19 @@ struct ProxyServer {
     discovered_backends: std::collections::HashSet<String>,
     /// Tracks backends that failed discovery for exponential backoff.
     discovery_failures: HashMap<String, DiscoveryFailure>,
+    /// SHA-256 hashes of backend configs for cache invalidation.
+    config_hashes: HashMap<String, String>,
+    /// Persistent tool cache backed by shared ChronDB.
+    cache_store: ToolCacheStore,
 }
 
 impl ProxyServer {
-    fn new(audit: Arc<AuditLogger>, configs: HashMap<String, ServerConfig>) -> Self {
+    fn new(
+        audit: Arc<AuditLogger>,
+        configs: HashMap<String, ServerConfig>,
+        config_hashes: HashMap<String, String>,
+        cache_store: ToolCacheStore,
+    ) -> Self {
         Self {
             configs,
             backends: HashMap::new(),
@@ -138,6 +148,8 @@ impl ProxyServer {
             audit,
             discovered_backends: std::collections::HashSet::new(),
             discovery_failures: HashMap::new(),
+            config_hashes,
+            cache_store,
         }
     }
 
@@ -174,6 +186,69 @@ impl ProxyServer {
             .filter(|t| t.name.starts_with(&prefix))
             .cloned()
             .collect()
+    }
+
+    /// Load tools from persistent cache. Only loads entries whose config hash matches.
+    fn load_from_cache(&mut self) {
+        let cached = self.cache_store.load_valid_backends(&self.config_hashes);
+        for (name, entry) in cached {
+            if !self.configs.contains_key(&name) {
+                continue;
+            }
+            self.register_tools(&name, &entry.tools);
+            self.discovered_backends.insert(name.clone());
+            self.backends.insert(
+                name.clone(),
+                BackendState::Disconnected {
+                    cached_tools: entry.tools,
+                    usage_stats: UsageStats::new(),
+                },
+            );
+            let tool_count = self
+                .tools
+                .iter()
+                .filter(|t| t.name.starts_with(&format!("{name}{SEPARATOR}")))
+                .count();
+            eprintln!("[serve] {name}: {tool_count} tool(s) (cached)");
+        }
+    }
+
+    /// Persist current discovered tools to cache.
+    fn save_to_cache(&self) {
+        for name in &self.discovered_backends {
+            let prefix = format!("{name}{SEPARATOR}");
+            let tools: Vec<Tool> = self
+                .tools
+                .iter()
+                .filter(|t| t.name.starts_with(&prefix))
+                .map(|t| {
+                    // Strip namespace to store original tool names
+                    let original_name = t.name.strip_prefix(&prefix).unwrap_or(&t.name).to_string();
+                    let original_desc = t.description.as_ref().map(|d| {
+                        let tag = format!("[{name}] ");
+                        d.strip_prefix(&tag).unwrap_or(d).to_string()
+                    });
+                    Tool {
+                        name: original_name,
+                        description: original_desc,
+                        input_schema: t.input_schema.clone(),
+                    }
+                })
+                .collect();
+
+            if tools.is_empty() {
+                continue;
+            }
+
+            if let Some(hash) = self.config_hashes.get(name) {
+                let entry = BackendToolCache {
+                    config_hash: hash.clone(),
+                    tools,
+                    cached_at: chrono::Utc::now().to_rfc3339(),
+                };
+                self.cache_store.save_backend(name, &entry);
+            }
+        }
     }
 
     /// Returns true if any configured backend needs discovery (not yet discovered,
@@ -284,6 +359,7 @@ impl ProxyServer {
             self.backends.len(),
             self.tools.len()
         );
+        self.save_to_cache();
     }
 
     /// Lazily connect (or reconnect) a specific backend, returning a mutable reference to its client.
@@ -434,7 +510,8 @@ impl ProxyServer {
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
     ) -> JsonRpcResponse {
-        if self.has_undiscovered_backends() {
+        // Only block on discovery if no tools are available (first run, no cache)
+        if self.tools.is_empty() && self.has_undiscovered_backends() {
             self.discover_tools().await;
         }
         let tools: Vec<Value> = self
@@ -453,9 +530,6 @@ impl ProxyServer {
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
     ) -> JsonRpcResponse {
-        if self.has_undiscovered_backends() {
-            self.discover_tools().await;
-        }
         let params = match params {
             Some(p) => p,
             None => {
@@ -469,6 +543,11 @@ impl ProxyServer {
                 return JsonRpcResponse::error(id, -32602, "missing 'name' in tools/call params");
             }
         };
+
+        // Only block on discovery if the requested tool is unknown
+        if !self.tool_map.contains_key(&tool_name) && self.has_undiscovered_backends() {
+            self.discover_tools().await;
+        }
 
         if !server_auth::is_tool_allowed(identity, &tool_name, acl) {
             return JsonRpcResponse::error(
@@ -587,8 +666,17 @@ impl ProxyServer {
 // --- Stdio mode ---
 
 pub async fn run_stdio(config: Config) -> Result<()> {
-    let audit = AuditLogger::open(&config.audit).unwrap_or(AuditLogger::Disabled);
-    let mut server = ProxyServer::new(Arc::new(audit), config.servers.clone());
+    let pool = crate::db::create_pool(&config.audit)?;
+    let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
+    let cache_store = ToolCacheStore::new(pool);
+    let mut server = ProxyServer::new(
+        Arc::new(audit),
+        config.servers.clone(),
+        config.config_hashes.clone(),
+        cache_store,
+    );
+    server.load_from_cache();
+    let mut needs_refresh = !server.tools.is_empty();
     let identity = AuthIdentity::anonymous();
     let acl = config.server_auth.acl.clone();
 
@@ -629,6 +717,13 @@ pub async fn run_stdio(config: Config) -> Result<()> {
                 // Notifications (no id) — just acknowledge silently
             }
             _ = reap_interval.tick() => {
+                // On first tick after cache load, refresh tools from real backends
+                if needs_refresh {
+                    needs_refresh = false;
+                    server.discovered_backends.clear();
+                    server.discover_tools().await;
+                }
+
                 let idle_clients = server.collect_idle_backends();
                 for (name, mut client) in idle_clients {
                     eprintln!("[serve] finalizing shutdown for {name}");
@@ -714,8 +809,17 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let auth_provider = server_auth::build_auth_provider(&config.server_auth)?;
     let acl = config.server_auth.acl.clone();
 
-    let audit = AuditLogger::open(&config.audit).unwrap_or(AuditLogger::Disabled);
-    let server = ProxyServer::new(Arc::new(audit), config.servers.clone());
+    let pool = crate::db::create_pool(&config.audit)?;
+    let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
+    let cache_store = ToolCacheStore::new(pool);
+    let mut server = ProxyServer::new(
+        Arc::new(audit),
+        config.servers.clone(),
+        config.config_hashes.clone(),
+        cache_store,
+    );
+    server.load_from_cache();
+    let has_cached_tools = !server.tools.is_empty();
     let shared: SharedProxy = Arc::new(Mutex::new(server));
 
     let state = AppState {
@@ -743,6 +847,20 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
             }
         }
     });
+
+    // Background refresh: re-discover tools from real backends after serving cached tools.
+    if has_cached_tools {
+        let refresh_proxy = shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut proxy = refresh_proxy.lock().await;
+            let cached: Vec<String> = proxy.discovered_backends.iter().cloned().collect();
+            for name in &cached {
+                proxy.discovered_backends.remove(name);
+            }
+            proxy.discover_tools().await;
+        });
+    }
 
     // Log all incoming requests for debugging
     let request_logger = axum::middleware::from_fn(
@@ -994,6 +1112,17 @@ mod tests {
     use super::*;
     use crate::protocol::Tool;
 
+    fn test_server() -> ProxyServer {
+        let pool = Arc::new(crate::db::DbPool::new(String::new(), String::new()));
+        let cache_store = ToolCacheStore::new(pool);
+        ProxyServer::new(
+            Arc::new(AuditLogger::Disabled),
+            HashMap::new(),
+            HashMap::new(),
+            cache_store,
+        )
+    }
+
     #[test]
     fn test_split_tool_name_via_separator() {
         assert_eq!(
@@ -1026,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_proxy_server_initialize_response() {
-        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let server = test_server();
         let resp = server.handle_initialize(Value::from(1));
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -1037,7 +1166,7 @@ mod tests {
 
     #[test]
     fn test_proxy_server_initialize_with_string_id() {
-        let server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let server = test_server();
         let resp = server.handle_initialize(Value::String("req-1".to_string()));
         assert!(resp.error.is_none());
         assert_eq!(resp.id, Some(Value::String("req-1".to_string())));
@@ -1045,7 +1174,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_empty_tools_list() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         // No configs → has_undiscovered_backends() is false, discovery is skipped
         let identity = AuthIdentity::anonymous();
         let resp = server
@@ -1059,7 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_tools_list_with_tools() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         // No configs → has_undiscovered_backends() is false, discovery is skipped
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
@@ -1084,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_unknown_tool() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
         let resp = server
@@ -1098,7 +1227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_params() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let identity = AuthIdentity::anonymous();
         let resp = server
             .handle_tools_call(Value::from(5), None, &identity, &None)
@@ -1110,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_name_in_params() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"arguments": {}}));
         let resp = server
@@ -1124,7 +1253,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_backend_not_connected() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let identity = AuthIdentity::anonymous();
         server.tool_map.insert(
             "ghost__tool".to_string(),
@@ -1143,7 +1272,7 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_triggers_discovery() {
         // tools/call before tools/list should trigger discovery
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         assert!(server.discovered_backends.is_empty());
         let identity = AuthIdentity::anonymous();
         let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
@@ -1180,7 +1309,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_unknown_method() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "unknown/method", None);
         let resp = server.handle_request(req, &identity, &None, "test").await;
@@ -1192,7 +1321,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_initialize() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "initialize", None);
         let resp = server.handle_request(req, &identity, &None, "test").await;
@@ -1278,7 +1407,7 @@ mod tests {
     async fn test_tools_list_filtered_by_acl() {
         use crate::server_auth::{AclConfig, AclPolicy, AclRule};
 
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         // No configs → has_undiscovered_backends() is false, discovery is skipped
         server.tools.push(Tool {
             name: "sentry__search_issues".to_string(),
@@ -1313,7 +1442,7 @@ mod tests {
     async fn test_tools_call_denied_by_acl() {
         use crate::server_auth::{AclConfig, AclPolicy, AclRule};
 
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         server.tool_map.insert(
             "sentry__search".to_string(),
             ("sentry".to_string(), "search".to_string()),
@@ -1468,7 +1597,7 @@ mod tests {
 
     #[test]
     fn test_discovery_failure_clears_on_success() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let mut failure = DiscoveryFailure::new();
         failure.record_failure();
         server
@@ -1484,7 +1613,7 @@ mod tests {
 
     #[test]
     fn test_register_and_unregister_tools() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         let tools = vec![
             Tool {
                 name: "search".to_string(),
@@ -1524,7 +1653,7 @@ mod tests {
 
     #[test]
     fn test_collect_cached_tools() {
-        let mut server = ProxyServer::new(Arc::new(AuditLogger::Disabled), HashMap::new());
+        let mut server = test_server();
         server.register_tools(
             "sentry",
             &[Tool {
