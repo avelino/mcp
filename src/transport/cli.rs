@@ -237,6 +237,12 @@ impl CliTransport {
                         cmd_args.push(format!("--{flag_name}=false"));
                     }
                     Value::Null => {}
+                    Value::Array(arr) => {
+                        for item in arr {
+                            cmd_args.push(format!("--{flag_name}"));
+                            cmd_args.push(item.as_str().unwrap_or(&item.to_string()).to_string());
+                        }
+                    }
                     _ => {
                         cmd_args.push(format!("--{flag_name}"));
                         cmd_args.push(value.as_str().unwrap_or(&value.to_string()).to_string());
@@ -291,13 +297,17 @@ impl CliTransport {
             Err(e) => (format!("failed to execute {}: {e}", self.command), true),
         };
 
-        Ok(JsonRpcResponse::success(
-            id,
-            json!({
-                "content": [{ "type": "text", "text": text }],
-                "isError": is_error
-            }),
-        ))
+        if is_error {
+            Ok(JsonRpcResponse::error(id, -32603, &text))
+        } else {
+            Ok(JsonRpcResponse::success(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": false
+                }),
+            ))
+        }
     }
 }
 
@@ -361,6 +371,125 @@ mod tests {
         let result = truncate_output(s, 1);
         // Should not panic and should find valid boundary
         assert!(result.contains("[truncated"));
+    }
+
+    fn test_transport(command: &str) -> CliTransport {
+        CliTransport {
+            command: command.to_string(),
+            base_args: vec![],
+            env: HashMap::new(),
+            help_flag: "--help".to_string(),
+            depth: 1,
+            only: vec![],
+            tools: vec![Tool {
+                name: format!("{command}_test"),
+                description: Some("test tool".to_string()),
+                input_schema: None,
+            }],
+            tool_args: HashMap::new(),
+            subcommand_map: HashMap::from([(format!("{command}_test"), "test".to_string())]),
+            discovered: true,
+            timeout_secs: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_array_flags_expand_to_repeated_args() {
+        // "echo" will print all received args, so we can verify the expansion
+        let mut transport = test_transport("echo");
+        transport
+            .subcommand_map
+            .insert("echo_test".to_string(), "".to_string());
+
+        let resp = transport
+            .handle_tools_call(
+                json!(1),
+                Some(json!({
+                    "name": "echo_test",
+                    "arguments": {
+                        "label": [":lib :rust", ":lib :python", ":enhancement"]
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // echo should print the expanded flags
+        assert!(
+            text.contains("--label"),
+            "should contain --label flag, got: {text}"
+        );
+        assert!(
+            text.contains(":lib :rust"),
+            "should contain first label, got: {text}"
+        );
+        assert!(
+            text.contains(":lib :python"),
+            "should contain second label, got: {text}"
+        );
+        assert!(
+            text.contains(":enhancement"),
+            "should contain third label, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_command_returns_jsonrpc_error() {
+        // Use a command guaranteed to fail
+        let mut transport = test_transport("false");
+        transport
+            .subcommand_map
+            .insert("false_test".to_string(), "".to_string());
+
+        let resp = transport
+            .handle_tools_call(
+                json!(1),
+                Some(json!({
+                    "name": "false_test",
+                    "arguments": {}
+                })),
+            )
+            .await
+            .unwrap();
+
+        // Should be a JSON-RPC error, not success with isError
+        assert!(
+            resp.error.is_some(),
+            "failed command should return JSON-RPC error"
+        );
+        assert!(
+            resp.result.is_none(),
+            "failed command should not have result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_command_returns_success() {
+        let mut transport = test_transport("echo");
+        transport
+            .subcommand_map
+            .insert("echo_test".to_string(), "".to_string());
+
+        let resp = transport
+            .handle_tools_call(
+                json!(1),
+                Some(json!({
+                    "name": "echo_test",
+                    "arguments": { "args": "hello" }
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(resp.result.is_some(), "success should have result");
+        assert!(resp.error.is_none(), "success should not have error");
+        let is_error = resp.result.unwrap()["isError"].as_bool().unwrap();
+        assert!(!is_error, "isError should be false");
     }
 
     #[test]
