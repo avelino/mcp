@@ -482,11 +482,7 @@ fn build_dry_run_request(tool_name: &str, arguments: serde_json::Value) -> Resul
         name: tool_name.to_string(),
         arguments,
     };
-    let req = protocol::JsonRpcRequest::new(
-        1,
-        "tools/call",
-        Some(serde_json::to_value(&params)?),
-    );
+    let req = protocol::JsonRpcRequest::new(1, "tools/call", Some(serde_json::to_value(&params)?));
     Ok(serde_json::to_string_pretty(&req)?)
 }
 
