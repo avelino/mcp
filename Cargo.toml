@@ -35,7 +35,7 @@ console = "0.15"
 axum = "0.8"
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
-chrondb = "0.0.0-dev.15"
+chrondb = "0.2.3-dev.12298e3"
 chrono = { version = "0.4", features = ["serde"] }
 shell-words = "1"
 
