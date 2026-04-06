@@ -80,10 +80,27 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    // `serve` manages its own db pool — handle it before creating the shared one.
+    if args[0] == "serve" {
+        let rest = &args[1..];
+        let insecure = rest.iter().any(|a| a == "--insecure");
+        let http_addr = if let Some(pos) = rest.iter().position(|a| a == "--http") {
+            let addr = rest
+                .get(pos + 1)
+                .filter(|a| !a.starts_with("--"))
+                .map(|a| a.as_str())
+                .unwrap_or("127.0.0.1:8080");
+            Some(addr.to_string())
+        } else {
+            None
+        };
+        return serve::run(cfg, http_addr.as_deref(), insecure).await;
+    }
+
     // Shared database pool for audit logging and tool cache
     let db_pool = db::create_pool(&cfg.audit).unwrap_or_else(|e| {
         eprintln!("warning: failed to create db pool: {e:#}");
-        Arc::new(db::DbPool::new(String::new(), String::new()))
+        Arc::new(db::DbPool::disabled())
     });
 
     // Audit logger shared across all commands
@@ -143,21 +160,6 @@ async fn run() -> Result<()> {
 
             output::print_search_results(&result?, fmt)?;
             return Ok(());
-        }
-        "serve" => {
-            let rest = &args[1..];
-            let insecure = rest.iter().any(|a| a == "--insecure");
-            let http_addr = if let Some(pos) = rest.iter().position(|a| a == "--http") {
-                let addr = rest
-                    .get(pos + 1)
-                    .filter(|a| !a.starts_with("--"))
-                    .map(|a| a.as_str())
-                    .unwrap_or("127.0.0.1:8080");
-                Some(addr.to_string())
-            } else {
-                None
-            };
-            return serve::run(cfg, http_addr.as_deref(), insecure).await;
         }
         "add" => {
             return handle_add(&args[1..], &audit).await;

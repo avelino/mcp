@@ -11,7 +11,7 @@ use super::Transport;
 
 pub struct StdioTransport {
     child: Child,
-    stdin: tokio::process::ChildStdin,
+    stdin: Option<tokio::process::ChildStdin>,
     reader: BufReader<tokio::process::ChildStdout>,
     timeout_secs: u64,
     stderr_buffer: Arc<Mutex<Vec<String>>>,
@@ -69,7 +69,7 @@ impl StdioTransport {
 
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             reader,
             timeout_secs,
             stderr_buffer,
@@ -77,13 +77,14 @@ impl StdioTransport {
     }
 
     async fn send(&mut self, msg: &JsonRpcRequest) -> Result<()> {
+        let stdin = self.stdin.as_mut().context("stdin already closed")?;
         let mut data = serde_json::to_string(msg)?;
         data.push('\n');
-        self.stdin
+        stdin
             .write_all(data.as_bytes())
             .await
             .context("failed to write to stdin")?;
-        self.stdin.flush().await?;
+        stdin.flush().await?;
         Ok(())
     }
 
@@ -135,20 +136,28 @@ impl Transport for StdioTransport {
     }
 
     async fn notify(&mut self, msg: &JsonRpcNotification) -> Result<()> {
+        let stdin = self.stdin.as_mut().context("stdin already closed")?;
         let mut data = serde_json::to_string(msg)?;
         data.push('\n');
-        self.stdin
+        stdin
             .write_all(data.as_bytes())
             .await
             .context("failed to write notification to stdin")?;
-        self.stdin.flush().await?;
+        stdin.flush().await?;
         Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
-        // Dropping stdin signals EOF to the child process
-        let _ = timeout(Duration::from_secs(5), self.child.wait()).await;
-        let _ = self.child.kill().await;
+        // Drop stdin to close the pipe — child receives EOF and can exit gracefully
+        drop(self.stdin.take());
+
+        // Give the child time to exit gracefully before killing
+        match timeout(Duration::from_secs(5), self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            _ => {
+                let _ = self.child.kill().await;
+            }
+        }
         Ok(())
     }
 }

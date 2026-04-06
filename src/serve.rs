@@ -666,7 +666,10 @@ impl ProxyServer {
 // --- Stdio mode ---
 
 pub async fn run_stdio(config: Config) -> Result<()> {
-    let pool = crate::db::create_pool(&config.audit)?;
+    let pool = crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
+        eprintln!("warning: failed to create db pool: {e:#}");
+        Arc::new(crate::db::DbPool::disabled())
+    });
     let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
     let cache_store = ToolCacheStore::new(pool);
     let mut server = ProxyServer::new(
@@ -810,7 +813,10 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let auth_provider = server_auth::build_auth_provider(&config.server_auth)?;
     let acl = config.server_auth.acl.clone();
 
-    let pool = crate::db::create_pool(&config.audit)?;
+    let pool = crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
+        eprintln!("warning: failed to create db pool: {e:#}");
+        Arc::new(crate::db::DbPool::disabled())
+    });
     let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
     let cache_store = ToolCacheStore::new(pool);
     let mut server = ProxyServer::new(
@@ -1125,7 +1131,7 @@ mod tests {
     use crate::protocol::Tool;
 
     fn test_server() -> ProxyServer {
-        let pool = Arc::new(crate::db::DbPool::new(String::new(), String::new()));
+        let pool = Arc::new(crate::db::DbPool::disabled());
         let cache_store = ToolCacheStore::new(pool);
         ProxyServer::new(
             Arc::new(AuditLogger::Disabled),
