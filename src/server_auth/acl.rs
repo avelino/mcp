@@ -104,7 +104,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 }
 
 fn match_middle(segments: &[&str], mut value: &str) -> bool {
-    for (i, seg) in segments.iter().enumerate() {
+    for seg in segments.iter() {
         if seg.is_empty() {
             continue;
         }
