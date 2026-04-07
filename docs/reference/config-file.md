@@ -269,10 +269,23 @@ Optional. Controls which users can access which tools.
 |-------|------|---------|-------------|
 | `subjects` | string[] | `[]` (match all) | User subjects to match (`*` = any) |
 | `roles` | string[] | `[]` (match all) | Roles to match (`*` = any) |
-| `tools` | string[] | *required* | Tool name patterns (supports `*` prefix/suffix globs) |
+| `tools` | string[] | *required* | Tool name patterns (supports `*` wildcards — prefix, suffix, middle, multiple) |
 | `policy` | `"allow"` \| `"deny"` | *required* | Action when rule matches |
 
 Both `subjects` and `roles` must match for a rule to apply. Empty means "match all".
+
+#### Tool pattern glob syntax
+
+The `tools` field supports glob patterns with `*` wildcards:
+
+| Pattern | Matches | Example |
+|---------|---------|---------|
+| `sentry__*` | Anything starting with `sentry__` | `sentry__search_issues` |
+| `*_issues` | Anything ending with `_issues` | `search_issues`, `sentry__list_issues` |
+| `*admin*` | Anything containing `admin` | `admin_panel`, `user_admin_tools` |
+| `sentry__*_admin__*` | Multiple wildcards | `sentry__team_admin__delete` |
+| `my_tool` | Exact match (no wildcards) | `my_tool` |
+| `*` | Everything | any tool |
 
 ## Auth store
 

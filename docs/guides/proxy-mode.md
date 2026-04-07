@@ -456,6 +456,7 @@ Control which users can access which tools using glob patterns:
       "default": "allow",
       "rules": [
         { "subjects": ["bob"], "tools": ["sentry__*"], "policy": "deny" },
+        { "subjects": ["bob"], "tools": ["*admin*"], "policy": "deny" },
         { "roles": ["admin"], "tools": ["*"], "policy": "allow" }
       ]
     }
@@ -468,7 +469,7 @@ Rules are evaluated in order — first match wins. If no rule matches, the defau
 ACL fields:
 - `subjects` — list of user subjects to match (supports `*` wildcard)
 - `roles` — list of roles to match (supports `*` wildcard)
-- `tools` — list of tool name patterns (supports `*` prefix/suffix globs)
+- `tools` — list of tool name patterns (supports `*` wildcards: prefix `sentry__*`, suffix `*_issues`, contains `*admin*`, multiple `sentry__*_admin__*`, exact match, or `*` for all)
 - `policy` — `allow` or `deny`
 
 Both `subjects` and `roles` must match for a rule to apply. Empty `subjects` or `roles` means "match all".

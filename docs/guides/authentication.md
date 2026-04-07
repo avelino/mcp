@@ -190,4 +190,4 @@ This is configured via the `serverAuth` key in `servers.json`. See the [proxy mo
 
 ### Access control (ACL)
 
-Rules control which authenticated users can access which tools. Rules are evaluated in order — first match wins. See [proxy mode ACL docs](proxy-mode.md#access-control-acl) for the full rule syntax.
+Rules control which authenticated users can access which tools. Rules are evaluated in order — first match wins. Tool patterns support full glob matching with `*` wildcards (prefix, suffix, contains, and multiple). See [proxy mode ACL docs](proxy-mode.md#access-control-acl) for the full rule syntax.
