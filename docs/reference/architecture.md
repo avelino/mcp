@@ -100,11 +100,17 @@ The registry integration is straightforward:
 
 When adding from registry, packages (stdio) take priority over remotes (HTTP). Environment variables get `${VAR}` placeholders so the user sets them in their shell.
 
-## Output: JSON everywhere
+## Output: dual format (Text + JSON)
 
-All output functions return `Result` and write to stdout. Errors and status messages go to stderr. This separation is critical for scripting — `stdout` is always valid JSON, `stderr` is for humans.
+Output adapts to the context automatically via `OutputFormat::detect()`:
 
-The output module doesn't do any filtering or transformation. It formats the raw protocol data as pretty-printed JSON. Users can pipe to `jq` for whatever processing they need.
+- **Interactive terminal** — colored tables with `comfy-table`, styled text with `console` crate
+- **Piped or redirected** — JSON for composability with `jq`
+- **`--json` flag** — forces JSON output regardless of context
+
+All output functions return `Result` and write to stdout. Errors and status messages go to stderr. This separation is critical for scripting — `stdout` is always valid structured data, `stderr` is for humans.
+
+For tool call results, text content prints directly in interactive mode. Images show a `[image: mime/type]` placeholder. Validation errors from MCP servers (e.g. Sentry-style structured errors) are parsed and reformatted into readable per-field messages with colored highlighting. JSON mode wraps everything in the MCP protocol format (`content` array + `isError` flag).
 
 ## Proxy mode: `mcp serve`
 
