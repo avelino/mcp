@@ -110,11 +110,7 @@ fn match_middle(segments: &[&str], mut value: &str) -> bool {
         }
         match value.find(seg) {
             Some(pos) => {
-                if i == 0 {
-                    value = &value[pos + seg.len()..];
-                } else {
-                    value = &value[pos + seg.len()..];
-                }
+                value = &value[pos + seg.len()..];
             }
             None => return false,
         }
