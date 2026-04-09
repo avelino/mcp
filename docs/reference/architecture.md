@@ -29,20 +29,24 @@ The whole thing is a single async pipeline. No daemon, no background process, no
 The most important design decision is the `Transport` trait:
 
 ```rust
-trait Transport: Send {
-    async fn request(&mut self, msg: &JsonRpcRequest) -> Result<JsonRpcResponse>;
-    async fn notify(&mut self, msg: &JsonRpcNotification) -> Result<()>;
-    async fn close(&mut self) -> Result<()>;
+trait Transport: Send + Sync {
+    async fn request(&self, msg: &JsonRpcRequest) -> Result<JsonRpcResponse>;
+    async fn notify(&self, msg: &JsonRpcNotification) -> Result<()>;
+    async fn close(&self) -> Result<()>;
 }
 ```
 
-Everything in the client uses this interface. It doesn't know if it's talking to a subprocess or a remote server. Two implementations:
+Note the `&self` (not `&mut self`) and the `Sync` bound. This is what makes the proxy non-blocking under load: a single transport instance can be shared across many concurrent tasks via `Arc<dyn Transport>`, and each implementation uses interior mutability (channels, atomics, mutexes) for the small amount of state it needs to mutate. There is no global lock around the client.
 
-**StdioTransport** — Spawns a child process, sends JSON-RPC messages to its stdin, reads responses from stdout. Handles line-by-line parsing, skips server notifications (messages without `id`), and applies a configurable timeout.
+Three implementations:
 
-**HttpTransport** — Sends HTTP POST requests with JSON-RPC bodies. Handles SSE (Server-Sent Events) responses by extracting the last `data:` line. Manages session IDs via `Mcp-Session-Id` headers. On 401 responses, triggers the authentication flow and retries once.
+**StdioTransport** — Spawns a child process and runs it as a multiplexed pipe. A dedicated **writer task** owns the child's stdin and serializes outbound writes. A dedicated **reader task** consumes the child's stdout line-by-line and dispatches each response to its caller via a `oneshot` channel keyed by JSON-RPC `id`. The result: **multiple in-flight requests can run concurrently on the same backend process** — callers only block waiting for their own response. The child is spawned with `kill_on_drop(true)` so it is reaped on any cleanup path (graceful shutdown, panic, task abort, error). On `close()` the child gets a brief grace period and is then force-killed.
 
-The client wraps the transport in a `Box<dyn Transport>`, so adding a new transport (WebSocket, for example) means implementing three methods — nothing else changes.
+**HttpTransport** — Sends HTTP POST requests with JSON-RPC bodies. Handles SSE (Server-Sent Events) responses by extracting the last `data:` line. Manages session IDs via `Mcp-Session-Id` headers. On 401 responses, triggers the authentication flow and retries once. Mutable state (`session_id`, `bearer_token`, `headers` after a 401) lives behind small `Mutex`es; `reqwest::Client` is already `Send + Sync`, so concurrent requests fan out at the HTTP layer.
+
+**CliTransport** — Wraps any command-line tool as an MCP server (see [CLI as MCP](../guides/cli-as-mcp.md)). Discovery state lives behind an `RwLock` with double-checked locking, and each tool invocation spawns a fresh `Command` with `kill_on_drop(true)` so cancellation reaps the child instead of leaking it.
+
+`McpClient` wraps the transport in `Arc<dyn Transport>` and uses an `AtomicU64` for request id generation, so a single `Arc<McpClient>` is safe to share across any number of tasks. Adding a new transport (WebSocket, for example) means implementing the three trait methods — nothing else changes.
 
 ## Authentication: layered fallbacks
 
@@ -128,11 +132,38 @@ Cache invalidation is per-backend via SHA-256 hash of the raw config JSON. If a 
 
 Each backend tracks usage statistics: request count, first/last use timestamps, and an exponential moving average (EMA) of inter-request intervals. A background reaper task runs every 30 seconds and shuts down backends that exceed their idle timeout. The timeout is adaptive by default — frequently used backends (>20 req/h) get 5 minutes, moderately used (5-20 req/h) get 3 minutes, and rarely used (<5 req/h) get 1 minute. Users can override this per backend with fixed timeouts or `"never"`.
 
+A **warm-up grace period** protects freshly-connected backends: a backend with `request_count == 0` is never reaped before its `max_idle_timeout` elapses, so the proxy doesn't kill a backend you haven't gotten around to using yet. Without this, the proxy would reap idle backends ~60 seconds after start and the very first real `tools/call` would always pay a full reconnect.
+
+When the reaper does fire, it shuts down all eligible backends **in parallel** via a `tokio::task::JoinSet`. If a backend's graceful `shutdown()` doesn't finish within 5 seconds, the reaper drops the `Arc<McpClient>` and `kill_on_drop(true)` force-reaps the child — orphaned backend processes are not possible by construction.
+
 When a backend is shut down, its tools remain in the tool list (cached in memory and on disk). On the next `tools/call` targeting that backend, the proxy transparently reconnects, refreshes the tool cache, and forwards the request. Usage stats are preserved across reconnections for adaptive timeout continuity.
 
 The proxy reuses the same `McpClient` and `Transport` abstractions — no new protocol code was needed. It just listens on stdin instead of connecting to a server's stdin.
 
 Error handling is partial-availability: if one backend fails to connect, the others still work. If a backend dies mid-session, the proxy returns an MCP-level error for that tool call without crashing.
+
+### Concurrency model
+
+The proxy is the orchestrator for **N concurrent clients sharing the same set of backends**. The whole pipeline is built so that no single client, request, or backend can wedge any of the others.
+
+Backends are pooled by name in a `HashMap<String, BackendState>` inside `ProxyServer`, and each connected backend is held as `Arc<McpClient>`. A request flows through `dispatch_request` in three carefully scoped phases:
+
+1. **Resolve (under a brief proxy lock)** — look up the namespaced tool in `tool_map`, run the ACL check, and clone the `Arc<McpClient>` out of `BackendState::Connected`. The lock is released before any I/O.
+2. **Connect (without the proxy lock)** — if no client exists yet, `connect_backend()` spawns the child, runs the MCP handshake and `tools/list`, and only then briefly re-acquires the lock to install the new client (deduplicating against any concurrent connector).
+3. **Invoke (without the proxy lock)** — `client.call_tool().await` runs entirely outside the proxy lock. Because `McpClient` and `Transport` are `&self`, the same `Arc<McpClient>` is invoked in parallel by every concurrent caller; the stdio multiplexer described above handles fan-in/fan-out by id.
+
+Discovery — the act of connecting to a previously-unseen backend and listing its tools — used to run **under** the proxy lock, which meant a single slow backend (e.g. a 30-second OAuth handshake) could wedge every other client until it returned. That is fixed by a separate `discovery_lock: Arc<Mutex<()>>` on `ProxyServer`. Discovery batches now snapshot the pending set under a brief lock, drop the proxy lock, run all the connect attempts in parallel **without** holding the proxy mutex, and only re-acquire the lock briefly to commit each result. Two callers that both want to discover are serialized on the discovery lock (so they don't double-spawn), but request handlers targeting already-discovered backends fly through with zero contention while a discovery batch is in progress.
+
+The HTTP+SSE legacy transport has its own backpressure trap: each client session is fed by a bounded `mpsc` channel, and a slow consumer can fill the buffer. The POST handler bounds its `tx.send(...)` with a 5s timeout — on failure or timeout, the session is **evicted** from the session map and the client is expected to reconnect. The SSE keepalive ping background task uses `try_send` instead of `send().await` so a momentarily-full buffer never blocks it; after ~1 minute of consecutive full-buffer pings the session is also evicted as wedged.
+
+Practical consequences:
+
+- Calls to **different** backends are fully parallel.
+- Calls to the **same** backend are also parallel — they fan out through one shared process via the stdio multiplexer (or through `reqwest`'s native concurrency for HTTP backends). One backend = one OS process, regardless of how many clients are connected.
+- A slow or hung backend only delays the requests targeting it. Other clients keep moving.
+- A slow discovery (e.g. an unreachable backend hitting its 30s timeout) blocks only other callers that also need discovery. Already-discovered backends keep serving requests normally.
+- A dead client only loses its own request. The HTTP listener is bound with TCP keepalive (30s idle / 10s interval) so half-open sockets from crashed clients are detected within ~60s, and `MCP_PROXY_REQUEST_TIMEOUT` (default 120s) is a final hard bound at the proxy boundary.
+- A client request that is cancelled mid-flight cleans up after itself: the future is dropped, any spawned child process is reaped via `kill_on_drop`, and the backend's pending-request map is cleared by the reader task on EOF.
 
 ### Server-side authentication
 

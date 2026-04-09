@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -10,14 +12,18 @@ use crate::transport::http::HttpTransport;
 use crate::transport::stdio::StdioTransport;
 use crate::transport::Transport;
 
+/// `McpClient` wraps a transport with interior mutability so it can be shared
+/// across many concurrent requests via `Arc<McpClient>`. The transport itself
+/// is responsible for serializing access where needed (e.g. stdio uses a
+/// writer task + per-request id multiplexing).
 pub struct McpClient {
-    transport: Box<dyn Transport>,
-    next_id: u64,
+    transport: Arc<dyn Transport>,
+    next_id: AtomicU64,
 }
 
 impl McpClient {
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
-        let transport: Box<dyn Transport> = match config {
+        let transport: Arc<dyn Transport> = match config {
             ServerConfig::Cli {
                 command,
                 args,
@@ -42,7 +48,7 @@ impl McpClient {
                         }
                     })
                     .collect();
-                Box::new(CliTransport::new(CliTransportConfig {
+                Arc::new(CliTransport::new(CliTransportConfig {
                     command: command.clone(),
                     base_args: args.clone(),
                     env: env.clone(),
@@ -55,24 +61,24 @@ impl McpClient {
             }
             ServerConfig::Stdio {
                 command, args, env, ..
-            } => Box::new(StdioTransport::new(command, args, env)?),
+            } => Arc::new(StdioTransport::new(command, args, env)?),
             ServerConfig::Http { url, headers, .. } => {
-                let mut t = HttpTransport::new(url, headers)?;
+                let t = HttpTransport::new(url, headers)?;
                 t.load_saved_token();
-                Box::new(t)
+                Arc::new(t)
             }
         };
 
-        let mut client = McpClient {
+        let client = McpClient {
             transport,
-            next_id: 1,
+            next_id: AtomicU64::new(1),
         };
 
         client.initialize().await?;
         Ok(client)
     }
 
-    async fn initialize(&mut self) -> Result<()> {
+    async fn initialize(&self) -> Result<()> {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION.to_string(),
             capabilities: ClientCapabilities {},
@@ -100,7 +106,7 @@ impl McpClient {
         Ok(())
     }
 
-    pub async fn list_tools(&mut self) -> Result<Vec<Tool>> {
+    pub async fn list_tools(&self) -> Result<Vec<Tool>> {
         let mut all_tools = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -129,7 +135,7 @@ impl McpClient {
     }
 
     pub async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<ToolCallResult> {
@@ -157,13 +163,11 @@ impl McpClient {
         Ok(result)
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         self.transport.close().await
     }
 
-    fn next_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 }

@@ -273,7 +273,7 @@ async fn handle_server_command(
         .ok_or_else(|| anyhow::anyhow!("server \"{server_name}\" not found in config"))?;
 
     let sp = spinner::Spinner::start(&format!("connecting to {server_name}..."));
-    let mut client = client::McpClient::connect(server_config).await?;
+    let client = client::McpClient::connect(server_config).await?;
     sp.stop();
 
     if args.len() == 1 || (args.len() >= 2 && args[1] == "--list") {

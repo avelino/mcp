@@ -219,13 +219,15 @@ This works with Claude Code, Cursor, Windsurf, or any MCP-compatible client. Too
 
 Every MCP client (Claude Code, Cursor, Windsurf) spawns all backend servers at startup and keeps them alive forever. With 10 servers and 3 sessions open, that's 30 idle processes eating ~3 GB of RAM.
 
-The `mcp` proxy fixes this with **persistent tool cache**, **lazy initialization**, and **adaptive idle shutdown**:
+The `mcp` proxy fixes this with **persistent tool cache**, **lazy initialization**, **shared backends across clients**, and **adaptive idle shutdown**:
 
 - **Instant startup** — tools are cached to disk and served immediately, even before backends connect
+- **One backend = one process, no matter how many clients** — 5 editor sessions hitting `slack` share a single `slack-mcp-server` child. Calls run in parallel via JSON-RPC id multiplexing on stdio.
 - Backends only connect when you actually use them (background refresh keeps the cache fresh)
-- Idle backends are shut down automatically (1-5 min based on usage frequency)
+- Idle backends are shut down automatically (1-5 min based on usage frequency), with a warm-up grace period so a brand-new backend isn't reaped before its first use
 - Tools stay visible — reconnection is transparent on next call
 - Cache invalidates automatically when backend config changes
+- Zero orphans: every spawned child is reaped on shutdown, panic, cancel, or stalled close (`kill_on_drop` everywhere)
 
 ```json
 {

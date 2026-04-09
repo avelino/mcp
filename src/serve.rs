@@ -81,7 +81,7 @@ enum BackendState {
         usage_stats: UsageStats,
     },
     Connected {
-        client: McpClient,
+        client: Arc<McpClient>,
         usage_stats: UsageStats,
     },
 }
@@ -107,15 +107,24 @@ impl DiscoveryFailure {
     }
 
     /// Returns true if enough time has passed to retry, using exponential backoff.
-    /// Backoff after first failure: 5s, then 10s, 20s, 40s (capped at 60s).
+    /// Backoff after first failure: 30s, 60s, 120s, 240s (capped at 300s).
+    /// Bumped from the previous 5/10/20/40 because a 30s discovery timeout
+    /// for a flaky backend (e.g. slack auth) used to retry every few seconds
+    /// and steal the discovery_lock from healthy backends repeatedly.
     fn should_retry(&self) -> bool {
         if self.attempts == 0 {
             return true;
         }
-        let backoff_secs = (5u64 << (self.attempts - 1).min(3)).min(60);
+        let backoff_secs = (30u64 << (self.attempts - 1).min(3)).min(300);
         self.last_attempt.elapsed() >= Duration::from_secs(backoff_secs)
     }
 }
+
+type SharedProxy = Arc<Mutex<ProxyServer>>;
+
+/// Result of resolving a `tools/call` request: server name, original tool
+/// name, arguments, and (optionally) an already-connected client.
+type ResolvedCall = (String, String, Value, Option<Arc<McpClient>>);
 
 struct ProxyServer {
     configs: HashMap<String, ServerConfig>,
@@ -131,6 +140,12 @@ struct ProxyServer {
     config_hashes: HashMap<String, String>,
     /// Persistent tool cache backed by shared ChronDB.
     cache_store: ToolCacheStore,
+    /// Serializes concurrent discovery batches so two callers don't both
+    /// spawn duplicate connect attempts for the same set of backends.
+    /// This is intentionally **separate** from the proxy mutex — discovery
+    /// I/O happens with the proxy mutex released, so request handlers
+    /// targeting already-discovered backends are never blocked by it.
+    discovery_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ProxyServer {
@@ -150,6 +165,7 @@ impl ProxyServer {
             discovery_failures: HashMap::new(),
             config_hashes,
             cache_store,
+            discovery_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -266,15 +282,12 @@ impl ProxyServer {
         })
     }
 
-    /// Discover tools from all backends in parallel.
-    /// Each backend connects and fetches its tool list concurrently, so a slow
-    /// backend no longer blocks the others.
-    async fn discover_tools(&mut self) {
-        let discovery_timeout = std::time::Duration::from_secs(30);
-
-        // Collect backends that need discovery
-        let pending: Vec<(String, ServerConfig)> = self
-            .configs
+    /// Snapshot the list of backends that still need discovery, respecting
+    /// the failure backoff. This is the only piece of discovery that touches
+    /// `&mut self` — the actual I/O happens in `discover_pending_backends`
+    /// outside the proxy lock.
+    fn snapshot_pending_discovery(&self) -> Vec<(String, ServerConfig)> {
+        self.configs
             .iter()
             .filter(|(name, _)| {
                 if self.discovered_backends.contains(*name) {
@@ -286,150 +299,65 @@ impl ProxyServer {
                 }
             })
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
-
-        if pending.is_empty() {
-            return;
-        }
-
-        for name in pending.iter().map(|(n, _)| n) {
-            eprintln!("[serve] discovering tools from {name}...");
-        }
-
-        // Fire all discoveries in parallel
-        let handles: Vec<_> = pending
-            .into_iter()
-            .map(|(name, server_config)| {
-                tokio::spawn(async move {
-                    let result = tokio::time::timeout(discovery_timeout, async {
-                        let mut client = McpClient::connect(&server_config).await?;
-                        let tools = client.list_tools().await?;
-                        Ok::<_, anyhow::Error>((client, tools))
-                    })
-                    .await;
-                    (name, result)
-                })
-            })
-            .collect();
-
-        // Collect results and apply to self
-        for handle in handles {
-            let (name, result) = match handle.await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[serve] discovery task panicked: {e}");
-                    continue;
-                }
-            };
-            match result {
-                Ok(Ok((client, tools))) => {
-                    eprintln!("[serve] {name}: {} tool(s)", tools.len());
-                    self.register_tools(&name, &tools);
-                    self.backends.insert(
-                        name.clone(),
-                        BackendState::Connected {
-                            client,
-                            usage_stats: UsageStats::new(),
-                        },
-                    );
-                    self.discovered_backends.insert(name.clone());
-                    self.discovery_failures.remove(&name);
-                }
-                Ok(Err(e)) => {
-                    eprintln!("[serve] {name}: failed to discover: {e:#}");
-                    self.discovery_failures
-                        .entry(name.clone())
-                        .or_insert_with(DiscoveryFailure::new)
-                        .record_failure();
-                }
-                Err(_) => {
-                    eprintln!(
-                        "[serve] {name}: discovery timed out ({}s)",
-                        discovery_timeout.as_secs()
-                    );
-                    self.discovery_failures
-                        .entry(name.clone())
-                        .or_insert_with(DiscoveryFailure::new)
-                        .record_failure();
-                }
-            }
-        }
-        eprintln!(
-            "[serve] ready — {} backend(s), {} tool(s)",
-            self.backends.len(),
-            self.tools.len()
-        );
-        self.save_to_cache();
+            .collect()
     }
 
-    /// Lazily connect (or reconnect) a specific backend, returning a mutable reference to its client.
-    async fn ensure_connected(&mut self, server_name: &str) -> Result<&mut McpClient> {
-        // Check if already connected — use a bool to avoid holding borrow across branches
-        let is_connected = matches!(
-            self.backends.get(server_name),
-            Some(BackendState::Connected { .. })
+    /// Try to grab an already-connected client without doing any I/O.
+    /// Records the request in usage stats. Returns `None` if not connected.
+    fn try_get_client(&mut self, server_name: &str) -> Option<Arc<McpClient>> {
+        match self.backends.get_mut(server_name) {
+            Some(BackendState::Connected {
+                client,
+                usage_stats,
+            }) => {
+                usage_stats.record_request();
+                Some(Arc::clone(client))
+            }
+            _ => None,
+        }
+    }
+
+    /// Install a freshly-connected client for `server_name`, replacing any
+    /// previous state. Carries over usage stats from the previous entry.
+    /// The previous client (if any) is returned so the caller can shut it
+    /// down **outside** the proxy lock.
+    fn install_client(
+        &mut self,
+        server_name: &str,
+        client: Arc<McpClient>,
+        tools: &[Tool],
+    ) -> Option<Arc<McpClient>> {
+        let (mut stats, prev) = match self.backends.remove(server_name) {
+            Some(BackendState::Disconnected { usage_stats, .. }) => (usage_stats, None),
+            Some(BackendState::Connected {
+                usage_stats,
+                client: prev,
+            }) => (usage_stats, Some(prev)),
+            None => (UsageStats::new(), None),
+        };
+        stats.record_request();
+
+        self.unregister_tools(server_name);
+        self.register_tools(server_name, tools);
+        eprintln!(
+            "[serve] {server_name}: {} tool(s) (reconnected)",
+            tools.len()
         );
 
-        if !is_connected {
-            // Need to connect or reconnect
-            let config = self
-                .configs
-                .get(server_name)
-                .ok_or_else(|| anyhow::anyhow!("unknown backend: {server_name}"))?
-                .clone();
-
-            eprintln!("[serve] connecting to {server_name}...");
-            let mut client = McpClient::connect(&config).await?;
-            let tools = client.list_tools().await?;
-
-            // Carry over usage stats from previous connection
-            let mut stats = match self.backends.remove(server_name) {
-                Some(BackendState::Disconnected { usage_stats, .. }) => usage_stats,
-                Some(BackendState::Connected {
-                    usage_stats,
-                    mut client,
-                }) => {
-                    let _ = client.shutdown().await;
-                    usage_stats
-                }
-                None => UsageStats::new(),
-            };
-            stats.record_request();
-
-            // Refresh tool cache
-            self.unregister_tools(server_name);
-            self.register_tools(server_name, &tools);
-            eprintln!(
-                "[serve] {server_name}: {} tool(s) (reconnected)",
-                tools.len()
-            );
-
-            self.discovered_backends.insert(server_name.to_string());
-            self.backends.insert(
-                server_name.to_string(),
-                BackendState::Connected {
-                    client,
-                    usage_stats: stats,
-                },
-            );
-        } else {
-            // Update usage stats for already-connected backend
-            if let Some(BackendState::Connected { usage_stats, .. }) =
-                self.backends.get_mut(server_name)
-            {
-                usage_stats.record_request();
-            }
-        }
-
-        match self.backends.get_mut(server_name) {
-            Some(BackendState::Connected { client, .. }) => Ok(client),
-            _ => unreachable!(),
-        }
+        self.discovered_backends.insert(server_name.to_string());
+        self.backends.insert(
+            server_name.to_string(),
+            BackendState::Connected {
+                client,
+                usage_stats: stats,
+            },
+        );
+        prev
     }
 
     /// Identify idle backends, move them to Disconnected state, and return
     /// the extracted clients for shutdown **outside** the lock.
-    fn collect_idle_backends(&mut self) -> Vec<(String, McpClient)> {
+    fn collect_idle_backends(&mut self) -> Vec<(String, Arc<McpClient>)> {
         let mut to_shutdown = Vec::new();
 
         for (name, state) in &self.backends {
@@ -455,6 +383,15 @@ impl ProxyServer {
                     }
                     IdleTimeoutPolicy::Adaptive => usage_stats.compute_adaptive_timeout(min, max),
                 };
+
+                // Warm-up grace: a freshly-connected backend that has never
+                // served a request stays alive for at least `max_idle_timeout`.
+                // Without this, the proxy reaps every backend ~60s after start
+                // and the first real `tools/call` pays a full reconnect — which
+                // is exactly the "everything froze on first use" symptom.
+                if usage_stats.request_count == 0 && usage_stats.first_used.elapsed() < max {
+                    continue;
+                }
 
                 if usage_stats.idle_duration() > timeout {
                     to_shutdown.push(name.clone());
@@ -504,60 +441,47 @@ impl ProxyServer {
         )
     }
 
-    async fn handle_tools_list(
-        &mut self,
-        id: Value,
-        identity: &AuthIdentity,
-        acl: &Option<AclConfig>,
-    ) -> JsonRpcResponse {
-        // Only block on discovery if no tools are available (first run, no cache)
-        if self.tools.is_empty() && self.has_undiscovered_backends() {
-            self.discover_tools().await;
-        }
-        let tools: Vec<Value> = self
-            .tools
-            .iter()
-            .filter(|t| server_auth::is_tool_allowed(identity, &t.name, acl))
-            .map(|t| serde_json::to_value(t).unwrap())
-            .collect();
-        JsonRpcResponse::success(id, json!({ "tools": tools }))
-    }
-
-    async fn handle_tools_call(
-        &mut self,
-        id: Value,
+    /// Resolve a tool name to (server, original_name, args, ACL decision).
+    /// Returns Err(JsonRpcResponse) if the call should be rejected immediately.
+    #[allow(clippy::result_large_err)]
+    fn resolve_tool_call(
+        &self,
+        id: &Value,
         params: Option<Value>,
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
-    ) -> JsonRpcResponse {
+    ) -> std::result::Result<(String, String, Value), JsonRpcResponse> {
         let params = match params {
             Some(p) => p,
             None => {
-                return JsonRpcResponse::error(id, -32602, "missing params for tools/call");
+                return Err(JsonRpcResponse::error(
+                    id.clone(),
+                    -32602,
+                    "missing params for tools/call",
+                ));
             }
         };
 
         let tool_name = match params.get("name").and_then(|n| n.as_str()) {
             Some(n) => n.to_string(),
             None => {
-                return JsonRpcResponse::error(id, -32602, "missing 'name' in tools/call params");
+                return Err(JsonRpcResponse::error(
+                    id.clone(),
+                    -32602,
+                    "missing 'name' in tools/call params",
+                ));
             }
         };
 
-        // Only block on discovery if the requested tool is unknown
-        if !self.tool_map.contains_key(&tool_name) && self.has_undiscovered_backends() {
-            self.discover_tools().await;
-        }
-
         if !server_auth::is_tool_allowed(identity, &tool_name, acl) {
-            return JsonRpcResponse::error(
-                id,
+            return Err(JsonRpcResponse::error(
+                id.clone(),
                 -32603,
                 &format!(
                     "access denied: '{}' cannot use tool '{tool_name}'",
                     identity.subject
                 ),
-            );
+            ));
         }
 
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -565,102 +489,377 @@ impl ProxyServer {
         let (server_name, original_name) = match self.tool_map.get(&tool_name) {
             Some(mapping) => mapping.clone(),
             None => {
-                return JsonRpcResponse::error(id, -32602, &format!("unknown tool: {tool_name}"));
+                return Err(JsonRpcResponse::error(
+                    id.clone(),
+                    -32602,
+                    &format!("unknown tool: {tool_name}"),
+                ));
             }
         };
 
-        let client = match self.ensure_connected(&server_name).await {
-            Ok(c) => c,
-            Err(e) => {
-                return JsonRpcResponse::error(
-                    id,
-                    -32603,
-                    &format!("failed to connect to backend '{server_name}': {e:#}"),
-                );
-            }
-        };
-
-        match client.call_tool(&original_name, arguments).await {
-            Ok(result) => JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap()),
-            Err(e) => JsonRpcResponse::error(id, -32603, &format!("[{server_name}] {e:#}")),
-        }
+        Ok((server_name, original_name, arguments))
     }
 
-    fn extract_tool_info(
-        req: &JsonRpcRequest,
-        tool_map: &HashMap<String, (String, String)>,
-    ) -> Option<(String, String)> {
-        if req.method != "tools/call" {
-            return None;
-        }
-        let params = req.params.as_ref()?;
-        let tool_name = params.get("name")?.as_str()?;
-        tool_map
-            .get(tool_name)
-            .map(|(server, _original)| (tool_name.to_string(), server.clone()))
-    }
-
-    async fn handle_request(
-        &mut self,
-        req: JsonRpcRequest,
-        identity: &AuthIdentity,
-        acl: &Option<AclConfig>,
-        source: &str,
-    ) -> JsonRpcResponse {
-        let start = std::time::Instant::now();
-        let method = req.method.clone();
-        let tool_info = Self::extract_tool_info(&req, &self.tool_map);
-
-        let response = match req.method.as_str() {
-            "initialize" => self.handle_initialize(req.id),
-            "tools/list" => self.handle_tools_list(req.id, identity, acl).await,
-            "tools/call" => {
-                self.handle_tools_call(req.id, req.params, identity, acl)
-                    .await
-            }
-            _ => {
-                JsonRpcResponse::error(req.id, -32601, &format!("method not found: {}", req.method))
-            }
-        };
-
-        self.audit.log(AuditEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            source: source.to_string(),
-            method,
-            tool_name: tool_info.as_ref().map(|(t, _)| t.clone()),
-            server_name: tool_info.as_ref().map(|(_, s)| s.clone()),
-            identity: identity.subject.clone(),
-            duration_ms: start.elapsed().as_millis() as u64,
-            success: response.error.is_none(),
-            error_message: response.error.as_ref().map(|e| e.message.clone()),
-            arguments: None,
-        });
-
-        response
-    }
-
-    async fn shutdown_all(&mut self) {
-        let shutdown_timeout = Duration::from_secs(5);
-        let handles: Vec<_> = self
-            .backends
+    /// Drain all connected backends and return them so they can be shut down
+    /// in parallel **outside** the proxy lock.
+    fn drain_connected(&mut self) -> Vec<(String, Arc<McpClient>)> {
+        self.backends
             .drain()
             .filter_map(|(name, state)| match state {
                 BackendState::Connected { client, .. } => Some((name, client)),
                 _ => None,
             })
-            .map(|(name, mut client)| {
-                tokio::spawn(async move {
-                    if let Err(e) = tokio::time::timeout(shutdown_timeout, client.shutdown()).await
-                    {
-                        eprintln!("[serve] {name}: shutdown timed out: {e}");
-                    }
-                })
+            .collect()
+    }
+}
+
+/// Shut down a batch of backend clients in parallel. Each client is given up
+/// to 5s to exit gracefully; if it doesn't, the `Arc<McpClient>` is dropped
+/// and `kill_on_drop(true)` reaps the underlying child. Runs all shutdowns
+/// concurrently via a `JoinSet` so 8 backends don't take 8 × 5s = 40s.
+async fn shutdown_clients_in_parallel(clients: Vec<(String, Arc<McpClient>)>) {
+    if clients.is_empty() {
+        return;
+    }
+    let mut joinset: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    for (name, client) in clients {
+        joinset.spawn(async move {
+            eprintln!("[serve] finalizing shutdown for {name}");
+            if tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+                .await
+                .is_err()
+            {
+                eprintln!("[serve] {name}: shutdown timed out — force-killed via drop");
+            }
+            // Dropping the last Arc<McpClient> drops the transport, which
+            // kills the child via kill_on_drop(true).
+            drop(client);
+        });
+    }
+    while let Some(_res) = joinset.join_next().await {}
+}
+
+/// Discover tools from every backend that hasn't been seen yet, running all
+/// discoveries in parallel and **without** holding the proxy mutex during I/O.
+///
+/// Concurrency safety: a dedicated `discovery_lock` (separate from the proxy
+/// mutex) is acquired so that two callers don't both spawn duplicate connect
+/// attempts. The second caller blocks on `discovery_lock` only — request
+/// handlers targeting already-discovered backends are not affected.
+async fn discover_pending_backends(proxy: &SharedProxy) {
+    // Grab the discovery lock without holding the proxy mutex.
+    let discovery_lock = {
+        let p = proxy.lock().await;
+        Arc::clone(&p.discovery_lock)
+    };
+    let _guard = discovery_lock.lock().await;
+
+    // After acquiring the discovery lock, re-snapshot: another caller may
+    // have raced ahead while we were waiting.
+    let pending = {
+        let p = proxy.lock().await;
+        p.snapshot_pending_discovery()
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    for name in pending.iter().map(|(n, _)| n) {
+        eprintln!("[serve] discovering tools from {name}...");
+    }
+
+    let discovery_timeout = Duration::from_secs(30);
+
+    // Fire all discoveries in parallel WITHOUT the proxy lock held.
+    type DiscoveryOutcome =
+        std::result::Result<Result<(McpClient, Vec<Tool>)>, tokio::time::error::Elapsed>;
+    let mut joinset: tokio::task::JoinSet<(String, DiscoveryOutcome)> = tokio::task::JoinSet::new();
+    for (name, server_config) in pending {
+        joinset.spawn(async move {
+            let result = tokio::time::timeout(discovery_timeout, async {
+                let client = McpClient::connect(&server_config).await?;
+                let tools = client.list_tools().await?;
+                Ok::<_, anyhow::Error>((client, tools))
             })
-            .collect();
-        for handle in handles {
-            let _ = handle.await;
+            .await;
+            (name, result)
+        });
+    }
+
+    // Commit each result under a brief proxy lock as it arrives. Backends
+    // already populated by another caller are skipped (their freshly-spawned
+    // child is dropped, and `kill_on_drop` reaps it).
+    while let Some(joined) = joinset.join_next().await {
+        let (name, result) = match joined {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[serve] discovery task panicked: {e}");
+                continue;
+            }
+        };
+        match result {
+            Ok(Ok((client, tools))) => {
+                let mut p = proxy.lock().await;
+                if p.discovered_backends.contains(&name) {
+                    // Lost the race — discard our client; kill_on_drop reaps it.
+                    drop(client);
+                    continue;
+                }
+                eprintln!("[serve] {name}: {} tool(s)", tools.len());
+                p.register_tools(&name, &tools);
+                p.backends.insert(
+                    name.clone(),
+                    BackendState::Connected {
+                        client: Arc::new(client),
+                        usage_stats: UsageStats::new(),
+                    },
+                );
+                p.discovered_backends.insert(name.clone());
+                p.discovery_failures.remove(&name);
+            }
+            Ok(Err(e)) => {
+                let mut p = proxy.lock().await;
+                eprintln!("[serve] {name}: failed to discover: {e:#}");
+                p.discovery_failures
+                    .entry(name)
+                    .or_insert_with(DiscoveryFailure::new)
+                    .record_failure();
+            }
+            Err(_) => {
+                let mut p = proxy.lock().await;
+                eprintln!(
+                    "[serve] {name}: discovery timed out ({}s)",
+                    discovery_timeout.as_secs()
+                );
+                p.discovery_failures
+                    .entry(name)
+                    .or_insert_with(DiscoveryFailure::new)
+                    .record_failure();
+            }
         }
     }
+
+    let p = proxy.lock().await;
+    eprintln!(
+        "[serve] ready — {} backend(s), {} tool(s)",
+        p.backends.len(),
+        p.tools.len()
+    );
+    // Persist tool cache outside of the request hot path. save_to_cache only
+    // touches local state + ChronDB; it does not block on the network.
+    p.save_to_cache();
+}
+
+/// Top-level non-blocking request dispatcher.
+///
+/// This function is the **only** path that should be called from per-request
+/// HTTP handlers. It carefully scopes the proxy lock to short read/write
+/// windows and **never** holds the lock across backend I/O — different
+/// backends run fully in parallel, and many concurrent calls to the same
+/// backend share the same `Arc<McpClient>` (whose transport multiplexes
+/// internally where possible).
+async fn dispatch_request(
+    proxy: &SharedProxy,
+    req: JsonRpcRequest,
+    identity: &AuthIdentity,
+    acl: &Option<AclConfig>,
+    source: &str,
+) -> JsonRpcResponse {
+    let start = std::time::Instant::now();
+    let method = req.method.clone();
+    let id = req.id.clone();
+
+    // Audit metadata captured outside the lock.
+    let audit_logger: Arc<AuditLogger>;
+    let mut tool_name_for_audit: Option<String> = None;
+    let mut server_name_for_audit: Option<String> = None;
+
+    let response = match req.method.as_str() {
+        "initialize" => {
+            let p = proxy.lock().await;
+            audit_logger = Arc::clone(&p.audit);
+            p.handle_initialize(id)
+        }
+        "tools/list" => {
+            // Decide whether to trigger discovery, then drop the proxy lock
+            // before doing any I/O. Discovery is serialized via the separate
+            // discovery_lock inside discover_pending_backends.
+            let needs_discovery = {
+                let p = proxy.lock().await;
+                audit_logger = Arc::clone(&p.audit);
+                p.tools.is_empty() && p.has_undiscovered_backends()
+            };
+            if needs_discovery {
+                discover_pending_backends(proxy).await;
+            }
+            let tools_snapshot: Vec<Value> = {
+                let p = proxy.lock().await;
+                p.tools
+                    .iter()
+                    .filter(|t| server_auth::is_tool_allowed(identity, &t.name, acl))
+                    .map(|t| serde_json::to_value(t).unwrap())
+                    .collect()
+            };
+            JsonRpcResponse::success(id, json!({ "tools": tools_snapshot }))
+        }
+        "tools/call" => {
+            // Decide whether discovery is needed before resolving routing.
+            // Discovery happens **outside** the proxy lock; only its outcome
+            // affects the resolve step.
+            let needs_discovery = {
+                let p = proxy.lock().await;
+                audit_logger = Arc::clone(&p.audit);
+                match req.params.as_ref().and_then(|v| v.get("name")) {
+                    Some(Value::String(name)) => {
+                        !p.tool_map.contains_key(name) && p.has_undiscovered_backends()
+                    }
+                    _ => false,
+                }
+            };
+            if needs_discovery {
+                discover_pending_backends(proxy).await;
+            }
+
+            // Phase 1: resolve routing under a brief lock.
+            let resolved: std::result::Result<ResolvedCall, JsonRpcResponse> = {
+                let mut p = proxy.lock().await;
+                match p.resolve_tool_call(&id, req.params.clone(), identity, acl) {
+                    Ok((server, orig, args)) => {
+                        let client = p.try_get_client(&server);
+                        tool_name_for_audit = Some(format!("{server}{SEPARATOR}{orig}"));
+                        server_name_for_audit = Some(server.clone());
+                        Ok((server, orig, args, client))
+                    }
+                    Err(resp) => Err(resp),
+                }
+            };
+
+            match resolved {
+                Err(resp) => resp,
+                Ok((server, original, args, maybe_client)) => {
+                    // Phase 2: ensure connected (without holding the proxy
+                    // lock during the connect itself).
+                    let client_result: Result<Arc<McpClient>> = match maybe_client {
+                        Some(c) => Ok(c),
+                        None => connect_backend(proxy, &server).await,
+                    };
+
+                    match client_result {
+                        Err(e) => JsonRpcResponse::error(
+                            id,
+                            -32603,
+                            &format!("failed to connect to backend '{server}': {e:#}"),
+                        ),
+                        Ok(client) => {
+                            // Phase 3: invoke the backend with NO proxy lock held.
+                            match client.call_tool(&original, args).await {
+                                Ok(result) => JsonRpcResponse::success(
+                                    id,
+                                    serde_json::to_value(&result).unwrap(),
+                                ),
+                                Err(e) => {
+                                    JsonRpcResponse::error(id, -32603, &format!("[{server}] {e:#}"))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            let p = proxy.lock().await;
+            audit_logger = Arc::clone(&p.audit);
+            JsonRpcResponse::error(id, -32601, &format!("method not found: {}", req.method))
+        }
+    };
+
+    finish_audit(
+        AuditCtx {
+            audit: audit_logger,
+            source,
+            method,
+            tool_name: tool_name_for_audit,
+            server_name: server_name_for_audit,
+            identity,
+            start,
+        },
+        response,
+    )
+}
+
+struct AuditCtx<'a> {
+    audit: Arc<AuditLogger>,
+    source: &'a str,
+    method: String,
+    tool_name: Option<String>,
+    server_name: Option<String>,
+    identity: &'a AuthIdentity,
+    start: std::time::Instant,
+}
+
+fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> JsonRpcResponse {
+    ctx.audit.log(AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        source: ctx.source.to_string(),
+        method: ctx.method,
+        tool_name: ctx.tool_name,
+        server_name: ctx.server_name,
+        identity: ctx.identity.subject.clone(),
+        duration_ms: ctx.start.elapsed().as_millis() as u64,
+        success: response.error.is_none(),
+        error_message: response.error.as_ref().map(|e| e.message.clone()),
+        arguments: None,
+    });
+    response
+}
+
+/// Connect (or reconnect) to a backend, doing the network/spawn I/O **without**
+/// holding the proxy lock. Briefly re-acquires the lock at the end to install
+/// the new client and pick up the previous one (if any) for shutdown outside
+/// the lock.
+async fn connect_backend(proxy: &SharedProxy, server_name: &str) -> Result<Arc<McpClient>> {
+    let config = {
+        let p = proxy.lock().await;
+        p.configs
+            .get(server_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown backend: {server_name}"))?
+    };
+
+    eprintln!("[serve] connecting to {server_name}...");
+    let client = McpClient::connect(&config).await?;
+    let tools = client.list_tools().await?;
+    let client = Arc::new(client);
+
+    let prev = {
+        let mut p = proxy.lock().await;
+        // Re-check: another concurrent caller may have already connected.
+        if let Some(existing) = p.try_get_client(server_name) {
+            // Discard our freshly-connected client; the other one wins.
+            // Drop our client outside the lock so its child is reaped.
+            drop(client);
+            return Ok(existing);
+        }
+        p.install_client(server_name, Arc::clone(&client), &tools)
+    };
+
+    // Shut down any displaced previous client outside the lock.
+    if let Some(prev) = prev {
+        let name = server_name.to_string();
+        tokio::spawn(async move {
+            if tokio::time::timeout(Duration::from_secs(5), prev.shutdown())
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "[serve] {name}: previous client shutdown timed out — force-killed via drop"
+                );
+            }
+            drop(prev);
+        });
+    }
+
+    Ok(client)
 }
 
 // --- Stdio mode ---
@@ -679,64 +878,81 @@ pub async fn run_stdio(config: Config) -> Result<()> {
         cache_store,
     );
     server.load_from_cache();
-    let mut needs_refresh = !server.tools.is_empty();
+    let needs_refresh = Arc::new(std::sync::atomic::AtomicBool::new(!server.tools.is_empty()));
     let identity = AuthIdentity::anonymous();
     let acl = config.server_auth.acl.clone();
 
+    let proxy: SharedProxy = Arc::new(Mutex::new(server));
+
     let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut reader = BufReader::new(stdin);
-    let mut reap_interval = tokio::time::interval(Duration::from_secs(30));
+
+    // Background reaper task: same logic as the HTTP path. Force-kills any
+    // child whose graceful shutdown exceeds the timeout.
+    {
+        let proxy = Arc::clone(&proxy);
+        let needs_refresh = Arc::clone(&needs_refresh);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if needs_refresh.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    {
+                        let mut p = proxy.lock().await;
+                        p.discovered_backends.clear();
+                    }
+                    discover_pending_backends(&proxy).await;
+                }
+                let idle = {
+                    let mut p = proxy.lock().await;
+                    p.collect_idle_backends()
+                };
+                shutdown_clients_in_parallel(idle).await;
+            }
+        });
+    }
 
     eprintln!("[serve] waiting for MCP client...");
 
     loop {
         let mut line = String::new();
-        tokio::select! {
-            result = reader.read_line(&mut line) => {
-                let n = result?;
-                if n == 0 {
-                    break; // EOF
-                }
-
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Try parsing as a request (has "id")
-                if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(line) {
-                    let response = server
-                        .handle_request(req, &identity, &acl, "serve:stdio")
-                        .await;
-
-                    let mut data = serde_json::to_string(&response)?;
-                    data.push('\n');
-                    stdout.write_all(data.as_bytes()).await?;
-                    stdout.flush().await?;
-                    continue;
-                }
-
-                // Notifications (no id) — just acknowledge silently
-            }
-            _ = reap_interval.tick() => {
-                // On first tick after cache load, refresh tools from real backends
-                if needs_refresh {
-                    needs_refresh = false;
-                    server.discovered_backends.clear();
-                    server.discover_tools().await;
-                }
-
-                let idle_clients = server.collect_idle_backends();
-                for (name, mut client) in idle_clients {
-                    eprintln!("[serve] finalizing shutdown for {name}");
-                    let _ = client.shutdown().await;
-                }
-            }
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break; // EOF
         }
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Spawn each request so multiple in-flight requests can run in
+        // parallel even on the stdio control channel.
+        if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&line) {
+            let proxy = Arc::clone(&proxy);
+            let stdout = Arc::clone(&stdout);
+            let identity = identity.clone();
+            let acl = acl.clone();
+            tokio::spawn(async move {
+                let response = dispatch_request(&proxy, req, &identity, &acl, "serve:stdio").await;
+                let mut data = match serde_json::to_string(&response) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                data.push('\n');
+                let mut out = stdout.lock().await;
+                let _ = out.write_all(data.as_bytes()).await;
+                let _ = out.flush().await;
+            });
+        }
+        // Notifications (no id) — silently dropped.
     }
 
-    server.shutdown_all().await;
+    let drained = {
+        let mut p = proxy.lock().await;
+        p.drain_connected()
+    };
+    shutdown_clients_in_parallel(drained).await;
     eprintln!("[serve] shutting down");
     Ok(())
 }
@@ -751,7 +967,6 @@ use axum::routing::{get, post};
 use axum::Router;
 use tokio_stream::wrappers::ReceiverStream;
 
-type SharedProxy = Arc<Mutex<ProxyServer>>;
 type SseSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
 type SessionMap = Arc<Mutex<HashMap<String, SseSender>>>;
 
@@ -786,6 +1001,33 @@ async fn authenticate_request(
             JsonRpcResponse::error(Value::Null, -32000, &format!("authentication failed: {e}"));
         (StatusCode::UNAUTHORIZED, Json(json!(err)))
     })
+}
+
+/// Bind a TCP listener with TCP keepalive enabled. Short keepalive intervals
+/// let us detect dead client sockets (e.g. opencode crashed mid-request) in
+/// ~60s instead of waiting for the OS default (2h on macOS).
+fn bind_listener_with_keepalive(addr: std::net::SocketAddr) -> Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    socket.set_tcp_keepalive(&keepalive)?;
+
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    Ok(tokio::net::TcpListener::from_std(std_listener)?)
 }
 
 /// Validate that a bind address is safe.
@@ -840,7 +1082,9 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     };
 
     // Background reaper: shuts down idle backends periodically.
-    // Lock is released before async shutdown to avoid blocking request handlers.
+    // Lock is released before async shutdown so request handlers are never
+    // blocked. Shutdowns run in parallel via JoinSet, and any backend whose
+    // graceful close stalls is force-killed via Drop.
     let reaper_proxy = shared.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -850,25 +1094,27 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
                 let mut proxy = reaper_proxy.lock().await;
                 proxy.collect_idle_backends()
             };
-            // Shutdown outside the lock so request handlers are not blocked
-            for (name, mut client) in idle_clients {
-                eprintln!("[serve] finalizing shutdown for {name}");
-                let _ = client.shutdown().await;
-            }
+            shutdown_clients_in_parallel(idle_clients).await;
         }
     });
 
-    // Background refresh: re-discover tools from real backends after serving cached tools.
+    // Background refresh: re-discover tools from real backends after serving
+    // cached tools. The lock is only held briefly to clear the discovered set;
+    // the actual discovery I/O runs without the proxy mutex held, so client
+    // requests for cached tools fly through with zero contention while the
+    // refresh is in progress.
     if has_cached_tools {
         let refresh_proxy = shared.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let mut proxy = refresh_proxy.lock().await;
-            let cached: Vec<String> = proxy.discovered_backends.iter().cloned().collect();
-            for name in &cached {
-                proxy.discovered_backends.remove(name);
+            {
+                let mut proxy = refresh_proxy.lock().await;
+                let cached: Vec<String> = proxy.discovered_backends.iter().cloned().collect();
+                for name in &cached {
+                    proxy.discovered_backends.remove(name);
+                }
             }
-            proxy.discover_tools().await;
+            discover_pending_backends(&refresh_proxy).await;
         });
     }
 
@@ -924,7 +1170,7 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         eprintln!("[serve] WARNING: bound to non-loopback address without TLS");
     }
 
-    let listener = tokio::net::TcpListener::bind(sock_addr).await?;
+    let listener = bind_listener_with_keepalive(sock_addr)?;
 
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdown_signal = async move {
@@ -951,10 +1197,14 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         .with_graceful_shutdown(shutdown_signal)
         .await?;
 
-    // Cleanup backends — bounded so a stuck handler doesn't block exit
+    // Cleanup backends — bounded so a stuck handler doesn't block exit.
+    // Drain under the lock (cheap), then run all shutdowns in parallel.
     let cleanup = async {
-        let mut proxy = state.proxy.lock().await;
-        proxy.shutdown_all().await;
+        let drained = {
+            let mut proxy = state.proxy.lock().await;
+            proxy.drain_connected()
+        };
+        shutdown_clients_in_parallel(drained).await;
     };
     if tokio::time::timeout(Duration::from_secs(10), cleanup)
         .await
@@ -975,10 +1225,12 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         .values()
         .filter(|s| matches!(s, BackendState::Connected { .. }))
         .count();
+    let active_clients = state.sessions.lock().await.len();
     let body = json!({
         "status": "ok",
         "backends_configured": proxy.configs.len(),
         "backends_connected": connected,
+        "active_clients": active_clients,
         "tools": proxy.tools.len(),
         "version": env!("CARGO_PKG_VERSION"),
     });
@@ -1031,17 +1283,45 @@ async fn mcp_handler(
         }
     };
 
-    let response_json = {
-        let mut proxy = state.proxy.lock().await;
-        let response = proxy
-            .handle_request(req, &identity, &state.acl, "serve:http")
-            .await;
-        serde_json::to_value(&response).unwrap()
+    // Per-request timeout: a single hung backend or dead client must NEVER
+    // be able to wedge other in-flight requests. The actual backend hang is
+    // already handled inside the transport (stdio has its own timeout) but
+    // this is the belt-and-suspenders bound at the proxy boundary.
+    let request_timeout = std::time::Duration::from_secs(
+        std::env::var("MCP_PROXY_REQUEST_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120),
+    );
+    let req_id = req.id.clone();
+    let response_json = match tokio::time::timeout(
+        request_timeout,
+        dispatch_request(&state.proxy, req, &identity, &state.acl, "serve:http"),
+    )
+    .await
+    {
+        Ok(resp) => serde_json::to_value(&resp).unwrap(),
+        Err(_) => {
+            let err = JsonRpcResponse::error(
+                req_id,
+                -32000,
+                &format!(
+                    "proxy request timed out after {}s",
+                    request_timeout.as_secs()
+                ),
+            );
+            serde_json::to_value(&err).unwrap()
+        }
     };
 
-    // If this POST came from an SSE session, send the response over the SSE stream
-    // and return 202 Accepted (old HTTP+SSE transport).
-    // Clone the sender and drop the lock before awaiting to avoid deadlock.
+    // If this POST came from an SSE session, send the response over the SSE
+    // stream and return 202 Accepted (old HTTP+SSE transport).
+    //
+    // Critical: `tx.send(...).await` would block indefinitely if the SSE
+    // channel buffer is full (slow or dead consumer). That used to wedge the
+    // entire request handler. We bound the send with a 5s timeout and, on
+    // failure, evict the session so future requests fail fast and the client
+    // can reconnect.
     if let Some(session_id) = query.get("session_id") {
         let tx = {
             let sessions = state.sessions.lock().await;
@@ -1051,7 +1331,18 @@ async fn mcp_handler(
             let event = Event::default()
                 .event("message")
                 .data(serde_json::to_string(&response_json).unwrap());
-            let _ = tx.send(Ok(event)).await;
+            let send_result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), tx.send(Ok(event))).await;
+            match send_result {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    // Receiver gone or buffer wedged → evict the session.
+                    state.sessions.lock().await.remove(session_id);
+                    eprintln!(
+                        "[serve] sse session {session_id} evicted: stream send timed out or closed"
+                    );
+                }
+            }
             return (StatusCode::ACCEPTED, Json(json!(null)));
         }
     }
@@ -1069,7 +1360,10 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
         return resp.into_response();
     }
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
+    // Buffer 256 absorbs bursts (e.g. tools/list snapshot of ~200 tools).
+    // Combined with the 5s send timeout in the POST handler, no individual
+    // backpressure event can wedge the proxy.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
 
     // Send the endpoint event so clients know where to POST
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -1087,19 +1381,47 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
     let session_id_clone = session_id.clone();
     let mut shutdown_rx = state.shutdown.clone();
     tokio::spawn(async move {
-        // Send endpoint URI
-        if tx.send(Ok(endpoint_event)).await.is_err() {
+        // Send the endpoint URI with a short bound — if the receiver isn't
+        // ready in 5s the client is effectively dead.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tx.send(Ok(endpoint_event)),
+        )
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true)
+        {
+            sessions_clone.lock().await.remove(&session_id_clone);
             return;
         }
 
-        // Keep connection alive with periodic pings until shutdown or client disconnect
+        // Keep connection alive with periodic pings. We use `try_send` so a
+        // momentarily-full buffer never blocks this background task — if the
+        // buffer is genuinely backed up, the next interval will catch it.
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut consecutive_send_failures: u32 = 0;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let ping = Event::default().comment("ping");
-                    if tx.send(Ok(ping)).await.is_err() {
-                        break; // Client disconnected
+                    match tx.try_send(Ok(ping)) {
+                        Ok(()) => {
+                            consecutive_send_failures = 0;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            break; // Client disconnected
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            consecutive_send_failures += 1;
+                            // After ~1 minute (4 × 15s intervals) of full
+                            // buffer, treat the session as wedged and evict.
+                            if consecutive_send_failures >= 4 {
+                                eprintln!(
+                                    "[serve] sse session {session_id_clone} evicted: ping buffer full"
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
                 _ = shutdown_rx.changed() => {
@@ -1108,7 +1430,7 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
             }
         }
 
-        // Cleanup session on disconnect
+        // Cleanup session on disconnect/eviction
         let mut sessions = sessions_clone.lock().await;
         sessions.remove(&session_id_clone);
     });
@@ -1190,14 +1512,25 @@ mod tests {
         assert_eq!(resp.id, Some(Value::String("req-1".to_string())));
     }
 
+    /// Test helper: wraps `server` in a `SharedProxy` and routes a request
+    /// through the production `dispatch_request` path.
+    async fn dispatch(
+        server: ProxyServer,
+        req: JsonRpcRequest,
+        identity: &AuthIdentity,
+        acl: &Option<AclConfig>,
+    ) -> JsonRpcResponse {
+        let proxy: SharedProxy = Arc::new(Mutex::new(server));
+        dispatch_request(&proxy, req, identity, acl, "test").await
+    }
+
     #[tokio::test]
     async fn test_proxy_server_empty_tools_list() {
-        let mut server = test_server();
+        let server = test_server();
         // No configs → has_undiscovered_backends() is false, discovery is skipped
         let identity = AuthIdentity::anonymous();
-        let resp = server
-            .handle_tools_list(Value::from(2), &identity, &None)
-            .await;
+        let req = JsonRpcRequest::new(2, "tools/list", None);
+        let resp = dispatch(server, req, &identity, &None).await;
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
@@ -1219,9 +1552,8 @@ mod tests {
         );
 
         let identity = AuthIdentity::anonymous();
-        let resp = server
-            .handle_tools_list(Value::from(3), &identity, &None)
-            .await;
+        let req = JsonRpcRequest::new(3, "tools/list", None);
+        let resp = dispatch(server, req, &identity, &None).await;
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -1231,12 +1563,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_unknown_tool() {
-        let mut server = test_server();
+        let server = test_server();
         let identity = AuthIdentity::anonymous();
-        let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
-        let resp = server
-            .handle_tools_call(Value::from(4), params, &identity, &None)
-            .await;
+        let req = JsonRpcRequest::new(
+            4,
+            "tools/call",
+            Some(serde_json::json!({"name": "nonexistent__tool"})),
+        );
+        let resp = dispatch(server, req, &identity, &None).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
@@ -1245,11 +1579,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_params() {
-        let mut server = test_server();
+        let server = test_server();
         let identity = AuthIdentity::anonymous();
-        let resp = server
-            .handle_tools_call(Value::from(5), None, &identity, &None)
-            .await;
+        let req = JsonRpcRequest::new(5, "tools/call", None);
+        let resp = dispatch(server, req, &identity, &None).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
@@ -1257,12 +1590,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_server_missing_name_in_params() {
-        let mut server = test_server();
+        let server = test_server();
         let identity = AuthIdentity::anonymous();
-        let params = Some(serde_json::json!({"arguments": {}}));
-        let resp = server
-            .handle_tools_call(Value::from(6), params, &identity, &None)
-            .await;
+        let req = JsonRpcRequest::new(6, "tools/call", Some(serde_json::json!({"arguments": {}})));
+        let resp = dispatch(server, req, &identity, &None).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32602);
@@ -1277,10 +1608,12 @@ mod tests {
             "ghost__tool".to_string(),
             ("ghost".to_string(), "tool".to_string()),
         );
-        let params = Some(serde_json::json!({"name": "ghost__tool"}));
-        let resp = server
-            .handle_tools_call(Value::from(7), params, &identity, &None)
-            .await;
+        let req = JsonRpcRequest::new(
+            7,
+            "tools/call",
+            Some(serde_json::json!({"name": "ghost__tool"})),
+        );
+        let resp = dispatch(server, req, &identity, &None).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32603);
@@ -1290,13 +1623,15 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_triggers_discovery() {
         // tools/call before tools/list should trigger discovery
-        let mut server = test_server();
+        let server = test_server();
         assert!(server.discovered_backends.is_empty());
         let identity = AuthIdentity::anonymous();
-        let params = Some(serde_json::json!({"name": "nonexistent__tool"}));
-        let resp = server
-            .handle_tools_call(Value::from(20), params, &identity, &None)
-            .await;
+        let req = JsonRpcRequest::new(
+            20,
+            "tools/call",
+            Some(serde_json::json!({"name": "nonexistent__tool"})),
+        );
+        let resp = dispatch(server, req, &identity, &None).await;
         // No backends configured, so tool_map is empty → unknown tool
         assert!(resp.error.is_some());
         assert!(resp.error.unwrap().message.contains("unknown tool"));
@@ -1327,10 +1662,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_unknown_method() {
-        let mut server = test_server();
+        let server = test_server();
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "unknown/method", None);
-        let resp = server.handle_request(req, &identity, &None, "test").await;
+        let resp = dispatch(server, req, &identity, &None).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
@@ -1339,10 +1674,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_request_initialize() {
-        let mut server = test_server();
+        let server = test_server();
         let identity = AuthIdentity::anonymous();
         let req = JsonRpcRequest::new(1, "initialize", None);
-        let resp = server.handle_request(req, &identity, &None, "test").await;
+        let resp = dispatch(server, req, &identity, &None).await;
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
@@ -1449,7 +1784,8 @@ mod tests {
         });
 
         let bob = AuthIdentity::new("bob", vec![]);
-        let resp = server.handle_tools_list(Value::from(10), &bob, &acl).await;
+        let req = JsonRpcRequest::new(10, "tools/list", None);
+        let resp = dispatch(server, req, &bob, &acl).await;
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -1477,46 +1813,15 @@ mod tests {
         });
 
         let bob = AuthIdentity::new("bob", vec![]);
-        let params = Some(serde_json::json!({"name": "sentry__search"}));
-        let resp = server
-            .handle_tools_call(Value::from(11), params, &bob, &acl)
-            .await;
+        let req = JsonRpcRequest::new(
+            11,
+            "tools/call",
+            Some(serde_json::json!({"name": "sentry__search"})),
+        );
+        let resp = dispatch(server, req, &bob, &acl).await;
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert!(err.message.contains("access denied"));
-    }
-
-    #[test]
-    fn test_extract_tool_info() {
-        let mut tool_map = HashMap::new();
-        tool_map.insert(
-            "sentry__search_issues".to_string(),
-            ("sentry".to_string(), "search_issues".to_string()),
-        );
-
-        // tools/call with valid tool
-        let req = JsonRpcRequest::new(
-            1,
-            "tools/call",
-            Some(serde_json::json!({"name": "sentry__search_issues"})),
-        );
-        let info = ProxyServer::extract_tool_info(&req, &tool_map);
-        assert!(info.is_some());
-        let (tool, server) = info.unwrap();
-        assert_eq!(tool, "sentry__search_issues");
-        assert_eq!(server, "sentry");
-
-        // non tools/call method
-        let req2 = JsonRpcRequest::new(1, "tools/list", None);
-        assert!(ProxyServer::extract_tool_info(&req2, &tool_map).is_none());
-
-        // unknown tool
-        let req3 = JsonRpcRequest::new(
-            1,
-            "tools/call",
-            Some(serde_json::json!({"name": "unknown__tool"})),
-        );
-        assert!(ProxyServer::extract_tool_info(&req3, &tool_map).is_none());
     }
 
     #[test]

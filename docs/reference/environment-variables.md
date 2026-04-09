@@ -8,6 +8,7 @@ These variables configure `mcp` behavior:
 |---|---|---|
 | `MCP_CONFIG_PATH` | `~/.config/mcp/servers.json` | Path to the config file |
 | `MCP_TIMEOUT` | `60` | Timeout in seconds for stdio server responses |
+| `MCP_PROXY_REQUEST_TIMEOUT` | `120` | (proxy mode) Hard upper bound, in seconds, that any single client request can spend inside `mcp serve` before the proxy returns a JSON-RPC error. Acts as a belt-and-suspenders boundary on top of the per-transport `MCP_TIMEOUT`. |
 
 ### `MCP_CONFIG_PATH`
 
@@ -26,6 +27,14 @@ MCP_TIMEOUT=120 mcp slack --list
 ```
 
 Does not affect HTTP servers (they use reqwest's default timeouts).
+
+### `MCP_PROXY_REQUEST_TIMEOUT`
+
+Only applies to `mcp serve`. Bounds how long the proxy will wait for any single client JSON-RPC request to complete end-to-end (auth + routing + backend I/O). If the bound is hit, the client receives a JSON-RPC error with code `-32000` and the in-flight request is dropped — other concurrent clients are unaffected. Set lower for tighter SLAs, higher for backends that legitimately take a long time.
+
+```bash
+MCP_PROXY_REQUEST_TIMEOUT=60 mcp serve --http :7332
+```
 
 ## Config variables
 

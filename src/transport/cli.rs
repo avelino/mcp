@@ -5,6 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::process::Command;
+use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
 
 use crate::cli_discovery;
@@ -55,6 +56,15 @@ pub struct CliTransportConfig {
     pub tool_args: HashMap<String, Vec<String>>,
 }
 
+/// Discovery state — protected by an `RwLock` so concurrent callers can read
+/// once discovery has finished, while still allowing a one-time mutation.
+struct CliDiscovery {
+    tools: Vec<Tool>,
+    /// Maps tool name → original subcommand name (preserving hyphens).
+    subcommand_map: HashMap<String, String>,
+    discovered: bool,
+}
+
 pub struct CliTransport {
     command: String,
     base_args: Vec<String>,
@@ -62,11 +72,8 @@ pub struct CliTransport {
     help_flag: String,
     depth: u8,
     only: Vec<String>,
-    tools: Vec<Tool>,
     tool_args: HashMap<String, Vec<String>>,
-    /// Maps tool name → original subcommand name (preserving hyphens).
-    subcommand_map: HashMap<String, String>,
-    discovered: bool,
+    discovery: RwLock<CliDiscovery>,
     timeout_secs: u64,
 }
 
@@ -84,16 +91,24 @@ impl CliTransport {
             help_flag: config.help_flag,
             depth: config.depth,
             only: config.only,
-            tools: config.preset_tools,
             tool_args: config.tool_args,
-            subcommand_map: HashMap::new(),
-            discovered,
+            discovery: RwLock::new(CliDiscovery {
+                tools: config.preset_tools,
+                subcommand_map: HashMap::new(),
+                discovered,
+            }),
             timeout_secs,
         }
     }
 
-    async fn ensure_discovered(&mut self) -> Result<()> {
-        if self.discovered {
+    async fn ensure_discovered(&self) -> Result<()> {
+        // Fast path under read lock.
+        if self.discovery.read().await.discovered {
+            return Ok(());
+        }
+        // Acquire write lock and re-check (another task may have raced us).
+        let mut guard = self.discovery.write().await;
+        if guard.discovered {
             return Ok(());
         }
         let results = cli_discovery::discover_tools(
@@ -108,12 +123,13 @@ impl CliTransport {
 
         for dt in &results {
             if !dt.subcommand.is_empty() {
-                self.subcommand_map
+                guard
+                    .subcommand_map
                     .insert(dt.tool.name.clone(), dt.subcommand.clone());
             }
         }
-        self.tools = results.into_iter().map(|dt| dt.tool).collect();
-        self.discovered = true;
+        guard.tools = results.into_iter().map(|dt| dt.tool).collect();
+        guard.discovered = true;
         Ok(())
     }
 
@@ -131,10 +147,11 @@ impl CliTransport {
         )
     }
 
-    async fn handle_tools_list(&mut self, id: Value) -> Result<JsonRpcResponse> {
+    async fn handle_tools_list(&self, id: Value) -> Result<JsonRpcResponse> {
         self.ensure_discovered().await?;
 
-        let tools_json: Vec<Value> = self
+        let guard = self.discovery.read().await;
+        let tools_json: Vec<Value> = guard
             .tools
             .iter()
             .map(serde_json::to_value)
@@ -143,11 +160,7 @@ impl CliTransport {
         Ok(JsonRpcResponse::success(id, json!({ "tools": tools_json })))
     }
 
-    async fn handle_tools_call(
-        &mut self,
-        id: Value,
-        params: Option<Value>,
-    ) -> Result<JsonRpcResponse> {
+    async fn handle_tools_call(&self, id: Value, params: Option<Value>) -> Result<JsonRpcResponse> {
         self.ensure_discovered().await?;
 
         // Validate params is an object with a non-empty "name"
@@ -177,10 +190,17 @@ impl CliTransport {
             }
         };
 
-        // Enforce allowlist: only permit tools that were discovered or preset
-        if !self.tools.iter().any(|t| t.name == tool_name)
-            && !self.tool_args.contains_key(&tool_name)
-        {
+        // Snapshot discovery state under the read lock so we can release it
+        // before the (potentially long) child process runs.
+        let (allowed, original_sub) = {
+            let guard = self.discovery.read().await;
+            let allowed = guard.tools.iter().any(|t| t.name == tool_name)
+                || self.tool_args.contains_key(&tool_name);
+            let sub = guard.subcommand_map.get(&tool_name).cloned();
+            (allowed, sub)
+        };
+
+        if !allowed {
             return Ok(JsonRpcResponse::error(
                 id,
                 -32602,
@@ -195,9 +215,9 @@ impl CliTransport {
         if let Some(fixed_args) = self.tool_args.get(&tool_name) {
             // Preset tool: use the exact args from config
             cmd_args.extend(fixed_args.clone());
-        } else if let Some(original_sub) = self.subcommand_map.get(&tool_name) {
+        } else if let Some(sub) = original_sub {
             // Discovered tool: use the original subcommand name (preserves hyphens)
-            cmd_args.push(original_sub.clone());
+            cmd_args.push(sub);
         } else {
             // Fallback for tools without subcommand mapping
             let cmd_base = Path::new(&self.command)
@@ -251,9 +271,11 @@ impl CliTransport {
             }
         }
 
-        // Run the command with timeout
+        // Run the command with timeout. kill_on_drop ensures the child is
+        // reaped if the request is cancelled (e.g. caller dropped, server
+        // shutting down) instead of leaking as an orphan.
         let mut cmd = Command::new(&self.command);
-        cmd.args(&cmd_args).envs(&self.env);
+        cmd.args(&cmd_args).envs(&self.env).kill_on_drop(true);
 
         let duration = Duration::from_secs(self.timeout_secs);
         let output = match timeout(duration, cmd.output()).await {
@@ -313,7 +335,7 @@ impl CliTransport {
 
 #[async_trait]
 impl Transport for CliTransport {
-    async fn request(&mut self, msg: &JsonRpcRequest) -> Result<JsonRpcResponse> {
+    async fn request(&self, msg: &JsonRpcRequest) -> Result<JsonRpcResponse> {
         match msg.method.as_str() {
             "initialize" => Ok(self.handle_initialize(msg.id.clone())),
             "tools/list" => self.handle_tools_list(msg.id.clone()).await,
@@ -329,12 +351,12 @@ impl Transport for CliTransport {
         }
     }
 
-    async fn notify(&mut self, _msg: &JsonRpcNotification) -> Result<()> {
+    async fn notify(&self, _msg: &JsonRpcNotification) -> Result<()> {
         // CLI transport doesn't need to handle notifications
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         // Nothing to clean up — each command is a separate process
         Ok(())
     }
@@ -381,25 +403,33 @@ mod tests {
             help_flag: "--help".to_string(),
             depth: 1,
             only: vec![],
-            tools: vec![Tool {
-                name: format!("{command}_test"),
-                description: Some("test tool".to_string()),
-                input_schema: None,
-            }],
             tool_args: HashMap::new(),
-            subcommand_map: HashMap::from([(format!("{command}_test"), "test".to_string())]),
-            discovered: true,
+            discovery: RwLock::new(CliDiscovery {
+                tools: vec![Tool {
+                    name: format!("{command}_test"),
+                    description: Some("test tool".to_string()),
+                    input_schema: None,
+                }],
+                subcommand_map: HashMap::from([(format!("{command}_test"), "test".to_string())]),
+                discovered: true,
+            }),
             timeout_secs: 5,
         }
+    }
+
+    async fn override_subcommand(t: &CliTransport, name: &str, sub: &str) {
+        t.discovery
+            .write()
+            .await
+            .subcommand_map
+            .insert(name.to_string(), sub.to_string());
     }
 
     #[tokio::test]
     async fn test_array_flags_expand_to_repeated_args() {
         // "echo" will print all received args, so we can verify the expansion
-        let mut transport = test_transport("echo");
-        transport
-            .subcommand_map
-            .insert("echo_test".to_string(), "".to_string());
+        let transport = test_transport("echo");
+        override_subcommand(&transport, "echo_test", "").await;
 
         let resp = transport
             .handle_tools_call(
@@ -441,10 +471,8 @@ mod tests {
     #[tokio::test]
     async fn test_failed_command_returns_jsonrpc_error() {
         // Use a command guaranteed to fail
-        let mut transport = test_transport("false");
-        transport
-            .subcommand_map
-            .insert("false_test".to_string(), "".to_string());
+        let transport = test_transport("false");
+        override_subcommand(&transport, "false_test", "").await;
 
         let resp = transport
             .handle_tools_call(
@@ -470,10 +498,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_successful_command_returns_success() {
-        let mut transport = test_transport("echo");
-        transport
-            .subcommand_map
-            .insert("echo_test".to_string(), "".to_string());
+        let transport = test_transport("echo");
+        override_subcommand(&transport, "echo_test", "").await;
 
         let resp = transport
             .handle_tools_call(
@@ -492,8 +518,8 @@ mod tests {
         assert!(!is_error, "isError should be false");
     }
 
-    #[test]
-    fn test_subcommand_map_used_for_hyphenated_names() {
+    #[tokio::test]
+    async fn test_subcommand_map_used_for_hyphenated_names() {
         let transport = CliTransport {
             command: "kubectl".to_string(),
             base_args: vec![],
@@ -501,23 +527,26 @@ mod tests {
             help_flag: "--help".to_string(),
             depth: 2,
             only: vec![],
-            tools: vec![Tool {
-                name: "kubectl_api_versions".to_string(),
-                description: Some("Print API versions".to_string()),
-                input_schema: None,
-            }],
             tool_args: HashMap::new(),
-            subcommand_map: HashMap::from([(
-                "kubectl_api_versions".to_string(),
-                "api-versions".to_string(),
-            )]),
-            discovered: true,
+            discovery: RwLock::new(CliDiscovery {
+                tools: vec![Tool {
+                    name: "kubectl_api_versions".to_string(),
+                    description: Some("Print API versions".to_string()),
+                    input_schema: None,
+                }],
+                subcommand_map: HashMap::from([(
+                    "kubectl_api_versions".to_string(),
+                    "api-versions".to_string(),
+                )]),
+                discovered: true,
+            }),
             timeout_secs: 5,
         };
 
         // Verify the subcommand map has the correct entry
+        let guard = transport.discovery.read().await;
         assert_eq!(
-            transport.subcommand_map.get("kubectl_api_versions"),
+            guard.subcommand_map.get("kubectl_api_versions"),
             Some(&"api-versions".to_string())
         );
     }
