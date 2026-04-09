@@ -90,6 +90,165 @@ pub fn add_http(name: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn update_from_registry(name: &str) -> Result<()> {
+    if is_reserved_name(name) {
+        bail!(
+            "\"{}\" is a reserved command name and cannot be used as a server name",
+            name
+        );
+    }
+
+    let server = registry::find_server(name)
+        .await?
+        .with_context(|| format!("server \"{name}\" not found in registry"))?;
+
+    let path = config::config_path()?;
+    if !path.exists() {
+        bail!("config file not found: {}", path.display());
+    }
+
+    let mut root = load_or_create_config(&path)?;
+    let servers = get_servers_mut(&mut root)?;
+    let servers_obj = servers
+        .as_object_mut()
+        .context("\"mcpServers\" must be a JSON object")?;
+
+    let existing = servers_obj.get(name).cloned().with_context(|| {
+        format!("server \"{name}\" not found in config (use `mcp add {name}` to add it)")
+    })?;
+
+    let fresh = build_config_entry(&server)?;
+
+    // Detect type transition (stdio <-> http)
+    let was_http = existing.get("url").is_some();
+    let now_http = fresh.get("url").is_some();
+    if was_http != now_http {
+        eprintln!(
+            "warning: server \"{}\" changed type ({} -> {}); type-specific fields will not be carried over",
+            name,
+            if was_http { "http" } else { "stdio" },
+            if now_http { "http" } else { "stdio" },
+        );
+    }
+
+    let merged = merge_entry(&fresh, &existing);
+
+    if merged == existing {
+        eprintln!("✓ Server \"{name}\" already up to date");
+        return Ok(());
+    }
+
+    // Compute newly added env vars (present in fresh, absent in existing)
+    let new_env_vars: Vec<(String, Option<String>)> = if !now_http {
+        let existing_env = existing.get("env").and_then(|v| v.as_object());
+        collect_env_vars(&server)
+            .into_iter()
+            .filter(|(k, _)| existing_env.is_none_or(|m| !m.contains_key(k)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    servers_obj.insert(name.to_string(), merged);
+    save_config(&path, &root)?;
+
+    eprintln!("✓ Server \"{}\" updated in {}", name, path.display());
+
+    if !new_env_vars.is_empty() {
+        eprintln!("\nNew environment variables to configure:");
+        for (var_name, description) in &new_env_vars {
+            let desc = description.as_deref().unwrap_or("(no description)");
+            eprintln!("  {var_name}  — {desc}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks if a string is a placeholder of form `${VAR_NAME}` (uppercase letters, digits, underscore).
+fn is_env_placeholder(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'$' || bytes[1] != b'{' || bytes[bytes.len() - 1] != b'}' {
+        return false;
+    }
+    bytes[2..bytes.len() - 1]
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// Merge a freshly-built registry entry with an existing config entry,
+/// preserving user customizations (filled env values, headers, idle_timeout, cli*, tools).
+fn merge_entry(fresh: &Value, existing: &Value) -> Value {
+    let mut merged = fresh.clone();
+    let merged_obj = match merged.as_object_mut() {
+        Some(o) => o,
+        None => return merged,
+    };
+    let existing_obj = match existing.as_object() {
+        Some(o) => o,
+        None => return merged,
+    };
+
+    let was_http = existing.get("url").is_some();
+    let now_http = fresh.get("url").is_some();
+    let same_type = was_http == now_http;
+
+    // Merge env: preserve filled-in values, drop env vars removed from registry,
+    // keep new ones as placeholders.
+    if !now_http {
+        if let (Some(fresh_env), Some(existing_env)) = (
+            merged_obj.get("env").and_then(|v| v.as_object()).cloned(),
+            existing_obj.get("env").and_then(|v| v.as_object()),
+        ) {
+            let mut new_env = fresh_env.clone();
+            for (key, fresh_val) in fresh_env.iter() {
+                if let Some(existing_val) = existing_env.get(key) {
+                    if let Some(s) = existing_val.as_str() {
+                        if !is_env_placeholder(s) {
+                            new_env.insert(key.clone(), existing_val.clone());
+                            continue;
+                        }
+                    }
+                    // Non-string user override (rare): preserve.
+                    if !existing_val.is_string() {
+                        new_env.insert(key.clone(), existing_val.clone());
+                        continue;
+                    }
+                    // Otherwise keep fresh (placeholder).
+                    let _ = fresh_val;
+                }
+            }
+            merged_obj.insert("env".to_string(), Value::Object(new_env));
+        }
+    }
+
+    // Type-agnostic user fields preserved across updates.
+    const ALWAYS_PRESERVE: &[&str] = &[
+        "idle_timeout",
+        "min_idle_timeout",
+        "max_idle_timeout",
+        "cli",
+        "cli_help",
+        "cli_depth",
+        "cli_only",
+        "tools",
+    ];
+    for key in ALWAYS_PRESERVE {
+        if let Some(v) = existing_obj.get(*key) {
+            merged_obj.insert((*key).to_string(), v.clone());
+        }
+    }
+
+    // headers only carry over if both sides are http.
+    if same_type && now_http {
+        if let Some(v) = existing_obj.get("headers") {
+            merged_obj.insert("headers".to_string(), v.clone());
+        }
+    }
+
+    merged
+}
+
 pub fn remove_server(name: &str) -> Result<()> {
     let path = config::config_path()?;
 
@@ -411,6 +570,155 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn test_is_env_placeholder() {
+        assert!(is_env_placeholder("${GITHUB_TOKEN}"));
+        assert!(is_env_placeholder("${API_KEY_2}"));
+        assert!(!is_env_placeholder("ghp_xxx"));
+        assert!(!is_env_placeholder("${lowercase}"));
+        assert!(!is_env_placeholder("${}"));
+        assert!(!is_env_placeholder(""));
+        assert!(!is_env_placeholder("$GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn test_merge_entry_preserves_filled_env_value() {
+        let fresh = json!({
+            "command": "npx",
+            "args": ["-y", "@scope/pkg"],
+            "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}
+        });
+        let existing = json!({
+            "command": "npx",
+            "args": ["-y", "@scope/pkg"],
+            "env": {"GITHUB_TOKEN": "ghp_secret"}
+        });
+        let merged = merge_entry(&fresh, &existing);
+        assert_eq!(merged["env"]["GITHUB_TOKEN"], "ghp_secret");
+    }
+
+    #[test]
+    fn test_merge_entry_keeps_placeholder_when_not_filled() {
+        let fresh = json!({
+            "command": "npx", "args": [],
+            "env": {"TOKEN": "${TOKEN}"}
+        });
+        let existing = json!({
+            "command": "npx", "args": [],
+            "env": {"TOKEN": "${TOKEN}"}
+        });
+        let merged = merge_entry(&fresh, &existing);
+        assert_eq!(merged["env"]["TOKEN"], "${TOKEN}");
+    }
+
+    #[test]
+    fn test_merge_entry_adds_new_registry_env_var() {
+        let fresh = json!({
+            "command": "npx", "args": [],
+            "env": {"OLD": "${OLD}", "NEW_VAR": "${NEW_VAR}"}
+        });
+        let existing = json!({
+            "command": "npx", "args": [],
+            "env": {"OLD": "old_value"}
+        });
+        let merged = merge_entry(&fresh, &existing);
+        assert_eq!(merged["env"]["OLD"], "old_value");
+        assert_eq!(merged["env"]["NEW_VAR"], "${NEW_VAR}");
+    }
+
+    #[test]
+    fn test_merge_entry_drops_removed_env_var() {
+        let fresh = json!({
+            "command": "npx", "args": [],
+            "env": {"KEEP": "${KEEP}"}
+        });
+        let existing = json!({
+            "command": "npx", "args": [],
+            "env": {"KEEP": "kept", "GONE": "stale"}
+        });
+        let merged = merge_entry(&fresh, &existing);
+        assert_eq!(merged["env"]["KEEP"], "kept");
+        assert!(merged["env"].get("GONE").is_none());
+    }
+
+    #[test]
+    fn test_merge_entry_preserves_user_customizations() {
+        let fresh = json!({
+            "command": "npx",
+            "args": ["-y", "@scope/pkg@2.0.0"],
+        });
+        let existing = json!({
+            "command": "npx",
+            "args": ["-y", "@scope/pkg@1.0.0"],
+            "idle_timeout": "adaptive",
+            "min_idle_timeout": "30s",
+            "cli_only": true,
+            "tools": ["foo", "bar"],
+        });
+        let merged = merge_entry(&fresh, &existing);
+        // Registry-derived fields are refreshed
+        assert_eq!(merged["args"][1], "@scope/pkg@2.0.0");
+        // User fields preserved
+        assert_eq!(merged["idle_timeout"], "adaptive");
+        assert_eq!(merged["min_idle_timeout"], "30s");
+        assert_eq!(merged["cli_only"], true);
+        assert_eq!(merged["tools"][0], "foo");
+    }
+
+    #[test]
+    fn test_merge_entry_preserves_http_headers() {
+        let fresh = json!({"url": "https://example.com/v2"});
+        let existing = json!({
+            "url": "https://example.com/v1",
+            "headers": {"Authorization": "Bearer xyz"},
+            "idle_timeout": "120s",
+        });
+        let merged = merge_entry(&fresh, &existing);
+        assert_eq!(merged["url"], "https://example.com/v2");
+        assert_eq!(merged["headers"]["Authorization"], "Bearer xyz");
+        assert_eq!(merged["idle_timeout"], "120s");
+    }
+
+    #[test]
+    fn test_merge_entry_type_transition_drops_headers() {
+        // stdio -> http: existing was stdio, no headers to carry. Just sanity-check no panic.
+        let fresh = json!({"url": "https://example.com/mcp"});
+        let existing = json!({
+            "command": "npx",
+            "args": ["-y", "old"],
+            "env": {"X": "filled"},
+            "idle_timeout": "60s",
+        });
+        let merged = merge_entry(&fresh, &existing);
+        assert_eq!(merged["url"], "https://example.com/mcp");
+        assert!(merged.get("command").is_none());
+        assert!(merged.get("env").is_none());
+        // type-agnostic preserved
+        assert_eq!(merged["idle_timeout"], "60s");
+
+        // http -> stdio: headers must NOT be carried over.
+        let fresh = json!({"command": "npx", "args": []});
+        let existing = json!({
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer xyz"},
+        });
+        let merged = merge_entry(&fresh, &existing);
+        assert!(merged.get("headers").is_none());
+        assert!(merged.get("url").is_none());
+    }
+
+    #[test]
+    fn test_merge_entry_noop_when_identical() {
+        let fresh = json!({
+            "command": "npx",
+            "args": ["-y", "@scope/pkg"],
+            "env": {"TOKEN": "${TOKEN}"}
+        });
+        let existing = fresh.clone();
+        let merged = merge_entry(&fresh, &existing);
+        assert_eq!(merged, existing);
     }
 
     #[test]

@@ -36,6 +36,7 @@ Everything:
 | `mcp search <query>` | `registry/search` |
 | `mcp add <name>` | `config/add` |
 | `mcp remove <name>` | `config/remove` |
+| `mcp update <name>` | `config/update` |
 | `mcp <server> --list` | `tools/list` |
 | `mcp <server> --info` | `tools/info` |
 | `mcp <server> <tool>` | `tools/call` |

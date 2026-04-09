@@ -64,6 +64,7 @@ Usage:
   mcp add <name>                      Add server from registry
   mcp add --url <url> <name>          Add HTTP server manually
   mcp remove <name>                   Remove server from config
+  mcp update <name>                   Refresh server config from registry
 ```
 
 ## Adding your first server

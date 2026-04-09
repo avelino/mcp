@@ -105,6 +105,8 @@ mcp remove filesystem
 mcp add filesystem
 ```
 
+> If you only want to pull fresh metadata from the registry (new package version, new env vars, updated args), use `mcp update <name>` instead — it preserves your customizations (filled env values, headers, idle_timeout, etc.). See [`mcp update`](../reference/cli.md#mcp-update-name).
+
 ## Manual HTTP servers
 
 For servers not in the registry, add them manually:

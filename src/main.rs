@@ -40,6 +40,7 @@ fn print_usage() {
     eprintln!("  mcp add <name>                      Add server from registry");
     eprintln!("  mcp add --url <url> <name>          Add HTTP server manually");
     eprintln!("  mcp remove <name>                   Remove server from config");
+    eprintln!("  mcp update <name>                   Refresh server config from registry");
     eprintln!("  mcp serve                           Start proxy server (stdio)");
     eprintln!("  mcp serve --http [addr]             Start proxy server over HTTP");
     eprintln!("  mcp logs                            Show recent audit log entries");
@@ -175,6 +176,28 @@ async fn run() -> Result<()> {
                 timestamp: chrono::Local::now().to_rfc3339(),
                 source: "cli".to_string(),
                 method: "config/remove".to_string(),
+                tool_name: None,
+                server_name: Some(args[1].clone()),
+                identity: "local".to_string(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                success: result.is_ok(),
+                error_message: result.as_ref().err().map(|e| format!("{e:#}")),
+                arguments: None,
+            });
+
+            return result;
+        }
+        "update" => {
+            if args.len() < 2 {
+                bail!("usage: mcp update <name>");
+            }
+            let start = std::time::Instant::now();
+            let result = manager::update_from_registry(&args[1]).await;
+
+            audit.log(audit::AuditEntry {
+                timestamp: chrono::Local::now().to_rfc3339(),
+                source: "cli".to_string(),
+                method: "config/update".to_string(),
                 tool_name: None,
                 server_name: Some(args[1].clone()),
                 identity: "local".to_string(),

@@ -255,3 +255,32 @@ mcp remove filesystem
 ```
 
 Fails if the server is not in the config.
+
+### `mcp update <name>`
+
+Refresh a server's config entry from the registry, preserving your customizations.
+
+```bash
+mcp update github
+```
+
+Use this when the registry metadata for a server changed (new package version, new env vars, updated args) and you want to pull the changes without losing what you customized locally.
+
+**What gets refreshed (from the registry):**
+- `command` and `args`
+- `url` (HTTP servers)
+- `env` schema — new vars are added as `${VAR_NAME}` placeholders, vars removed from the registry are dropped
+
+**What is preserved (your customizations):**
+- Filled-in `env` values (anything that isn't a `${VAR_NAME}` placeholder)
+- `idle_timeout`, `min_idle_timeout`, `max_idle_timeout`
+- `headers` (HTTP servers)
+- `cli`, `cli_help`, `cli_depth`, `cli_only`, `tools`
+
+If the entry already matches the registry, the file is not rewritten and `mcp` reports `already up to date`. New env vars introduced by the update are listed at the end so you know what to fill in.
+
+Fails if:
+- Server is not in the local config (use `mcp add <name>` first)
+- Server is not in the registry
+
+> If the server changed type in the registry (stdio ↔ http), `mcp update` warns and drops type-specific fields that no longer apply.
