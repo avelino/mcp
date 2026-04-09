@@ -205,14 +205,19 @@ Optional. Configures authentication for `mcp serve --http`. Ignored for direct C
 
 ### Bearer config
 
-Required when `provider` is `"bearer"`.
+Required when `provider` is `"bearer"`. Each entry in `tokens` accepts two shapes:
+
+- **Legacy (string):** `"<token>": "<subject>"` — subject only, no roles.
+- **Extended (object):** `"<token>": { "subject": "<subject>", "roles": ["<role>", ...] }` — subject plus roles used by ACL evaluation.
+
+Both forms can coexist in the same file.
 
 ```json
 {
   "bearer": {
     "tokens": {
-      "<token>": "<subject>",
-      "secret-abc": "alice"
+      "secret-abc": "alice",
+      "secret-def": { "subject": "bob", "roles": ["dev", "oncall"] }
     }
   }
 }
@@ -220,16 +225,24 @@ Required when `provider` is `"bearer"`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `tokens` | object | Map of token → subject identity |
+| `tokens` | object | Map of token → subject string **or** `{subject, roles}` object |
+
+Each extended entry:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `subject` | string | *required* | User identity for this token |
+| `roles` | string[] | `[]` | Roles assigned to this identity (used by ACL rules) |
 
 ### Forwarded config
 
-Optional when `provider` is `"forwarded"`. Defaults to `x-forwarded-user`.
+Optional when `provider` is `"forwarded"`. Reads the authenticated user from a header set by a trusted reverse proxy, and optionally reads a groups header to populate roles.
 
 ```json
 {
   "forwarded": {
-    "header": "x-forwarded-user"
+    "header": "x-forwarded-user",
+    "groups_header": "x-forwarded-groups"
   }
 }
 ```
@@ -237,6 +250,11 @@ Optional when `provider` is `"forwarded"`. Defaults to `x-forwarded-user`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `header` | string | `"x-forwarded-user"` | Header name to read the authenticated user from |
+| `groups_header` | string | `"x-forwarded-groups"` | Header name to read roles from (comma-separated, oauth2-proxy convention) |
+
+Groups header value is parsed as a comma-separated list: each entry is trimmed and empty entries are dropped. Missing header yields empty roles (not an error). Role matching is case-sensitive.
+
+> Only use `forwarded` behind a trusted reverse proxy. The proxy **must** strip these headers from incoming client requests — otherwise a client could forge identity and roles.
 
 ### ACL config
 
