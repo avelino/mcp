@@ -167,26 +167,53 @@ This is configured via the `serverAuth` key in `servers.json`. See the [proxy mo
     "bearer": {
       "tokens": {
         "tok-alice": "alice",
-        "tok-bob": "bob"
+        "tok-bob": { "subject": "bob", "roles": ["dev", "oncall"] }
       }
     },
     "acl": {
       "default": "allow",
       "rules": [
-        { "subjects": ["bob"], "tools": ["sentry__*"], "policy": "deny" }
+        { "roles": ["dev"], "tools": ["sentry__*"], "policy": "deny" }
       ]
     }
   }
 }
 ```
 
+Each entry in `tokens` supports two shapes:
+
+- **Legacy (string):** `"tok-alice": "alice"` — subject only, no roles.
+- **Extended (object):** `"tok-bob": { "subject": "bob", "roles": ["dev", "oncall"] }` — subject plus a list of roles that will flow into ACL evaluation.
+
+Both forms can coexist in the same config file.
+
 ### Available providers
 
 | Provider | Use case |
 |----------|----------|
 | `none` (default) | No auth — all requests are anonymous |
-| `bearer` | Static token-to-user mapping |
-| `forwarded` | Trust reverse proxy `X-Forwarded-User` header |
+| `bearer` | Static token-to-user mapping, with optional per-token roles |
+| `forwarded` | Trust reverse proxy `X-Forwarded-User` header (and optional `X-Forwarded-Groups` for roles) |
+
+### Forwarded provider and roles
+
+When `provider` is `forwarded`, the proxy reads the user from the configured user header (default `x-forwarded-user`) and, optionally, a groups header (default `x-forwarded-groups`, following the oauth2-proxy convention) to populate roles.
+
+```json
+{
+  "serverAuth": {
+    "provider": "forwarded",
+    "forwarded": {
+      "header": "x-forwarded-user",
+      "groups_header": "x-forwarded-groups"
+    }
+  }
+}
+```
+
+Groups header value is parsed as a comma-separated list: each entry is trimmed and empty entries are dropped. Missing header yields an empty role list (not an error). Role matching is **case-sensitive**.
+
+> Only use `forwarded` behind a trusted reverse proxy that strips these headers from incoming client requests — otherwise clients could forge identities and roles.
 
 ### Access control (ACL)
 

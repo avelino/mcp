@@ -74,19 +74,39 @@ fn default_provider() -> String {
     "none".to_string()
 }
 
+/// A single bearer token entry. Accepts two shapes for backwards compatibility:
+/// - Legacy: `"tok-alice": "alice"` → subject only, no roles.
+/// - Extended: `"tok-bob": { "subject": "bob", "roles": ["dev"] }`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum BearerToken {
+    Subject(String),
+    Extended {
+        subject: String,
+        #[serde(default)]
+        roles: Vec<String>,
+    },
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct BearerConfig {
-    pub tokens: HashMap<String, String>,
+    pub tokens: HashMap<String, BearerToken>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ForwardedConfig {
     #[serde(default = "default_header")]
     pub header: String,
+    #[serde(default = "default_groups_header")]
+    pub groups_header: String,
 }
 
 fn default_header() -> String {
     "x-forwarded-user".to_string()
+}
+
+fn default_groups_header() -> String {
+    "x-forwarded-groups".to_string()
 }
 
 /// Build an AuthProvider from config.
@@ -101,12 +121,12 @@ pub fn build_auth_provider(config: &ServerAuthConfig) -> Result<Arc<dyn AuthProv
             Ok(Arc::new(BearerTokenAuth::new(bearer.tokens.clone())))
         }
         "forwarded" => {
-            let header = config
+            let (header, groups_header) = config
                 .forwarded
                 .as_ref()
-                .map(|f| f.header.clone())
-                .unwrap_or_else(default_header);
-            Ok(Arc::new(ForwardedUserAuth::new(header)))
+                .map(|f| (f.header.clone(), f.groups_header.clone()))
+                .unwrap_or_else(|| (default_header(), default_groups_header()));
+            Ok(Arc::new(ForwardedUserAuth::new(header, groups_header)))
         }
         other => anyhow::bail!("unknown auth provider: {other}"),
     }
@@ -150,7 +170,10 @@ mod tests {
     #[tokio::test]
     async fn test_build_bearer_auth() {
         let mut tokens = HashMap::new();
-        tokens.insert("secret-abc".to_string(), "alice".to_string());
+        tokens.insert(
+            "secret-abc".to_string(),
+            BearerToken::Subject("alice".to_string()),
+        );
         let config = ServerAuthConfig {
             provider: "bearer".to_string(),
             bearer: Some(BearerConfig { tokens }),
@@ -180,6 +203,7 @@ mod tests {
             provider: "forwarded".to_string(),
             forwarded: Some(ForwardedConfig {
                 header: "x-forwarded-user".to_string(),
+                groups_header: "x-forwarded-groups".to_string(),
             }),
             ..Default::default()
         };
@@ -231,5 +255,76 @@ mod tests {
         assert_eq!(config.bearer.unwrap().tokens.len(), 2);
         let acl = config.acl.unwrap();
         assert_eq!(acl.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_bearer_config_deserialize_mixed() {
+        // Legacy string form and extended object form must coexist.
+        let json = r#"{
+            "tokens": {
+                "tok-alice": "alice",
+                "tok-bob": { "subject": "bob", "roles": ["dev", "oncall"] },
+                "tok-carol": { "subject": "carol" }
+            }
+        }"#;
+        let cfg: BearerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tokens.len(), 3);
+        match cfg.tokens.get("tok-alice").unwrap() {
+            BearerToken::Subject(s) => assert_eq!(s, "alice"),
+            _ => panic!("expected legacy subject form for tok-alice"),
+        }
+        match cfg.tokens.get("tok-bob").unwrap() {
+            BearerToken::Extended { subject, roles } => {
+                assert_eq!(subject, "bob");
+                assert_eq!(roles, &vec!["dev".to_string(), "oncall".to_string()]);
+            }
+            _ => panic!("expected extended form for tok-bob"),
+        }
+        // Missing roles defaults to empty vec.
+        match cfg.tokens.get("tok-carol").unwrap() {
+            BearerToken::Extended { subject, roles } => {
+                assert_eq!(subject, "carol");
+                assert!(roles.is_empty());
+            }
+            _ => panic!("expected extended form for tok-carol"),
+        }
+    }
+
+    #[test]
+    fn test_bearer_config_deserialize_malformed_roles_type() {
+        // roles must be an array — string should fail.
+        let json = r#"{
+            "tokens": {
+                "tok-x": { "subject": "x", "roles": "admin" }
+            }
+        }"#;
+        assert!(serde_json::from_str::<BearerConfig>(json).is_err());
+    }
+
+    #[test]
+    fn test_bearer_config_deserialize_extended_missing_subject() {
+        // Extended form without subject is invalid.
+        let json = r#"{
+            "tokens": {
+                "tok-x": { "roles": ["dev"] }
+            }
+        }"#;
+        assert!(serde_json::from_str::<BearerConfig>(json).is_err());
+    }
+
+    #[test]
+    fn test_forwarded_config_default_groups_header() {
+        let json = r#"{}"#;
+        let cfg: ForwardedConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.header, "x-forwarded-user");
+        assert_eq!(cfg.groups_header, "x-forwarded-groups");
+    }
+
+    #[test]
+    fn test_forwarded_config_custom_groups_header() {
+        let json = r#"{"header":"x-user","groups_header":"x-groups"}"#;
+        let cfg: ForwardedConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.header, "x-user");
+        assert_eq!(cfg.groups_header, "x-groups");
     }
 }
