@@ -14,6 +14,7 @@ pub struct BackendToolCache {
     pub cached_at: String,
 }
 
+#[derive(Clone)]
 pub struct ToolCacheStore {
     pool: Arc<DbPool>,
 }

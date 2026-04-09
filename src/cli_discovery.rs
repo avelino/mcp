@@ -132,8 +132,10 @@ async fn run_help(
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
 
+    // kill_on_drop ensures a help-probe child is reaped if the timeout fires
+    // or the discovery task is cancelled — no orphans from this path.
     let mut cmd = Command::new(command);
-    cmd.args(args).arg(help_flag).envs(env);
+    cmd.args(args).arg(help_flag).envs(env).kill_on_drop(true);
 
     let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
         .await

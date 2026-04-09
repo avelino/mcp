@@ -146,6 +146,12 @@ struct ProxyServer {
     /// I/O happens with the proxy mutex released, so request handlers
     /// targeting already-discovered backends are never blocked by it.
     discovery_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-backend connect locks. When a `tools/call` hits a disconnected
+    /// backend, the first caller acquires the per-backend lock, performs
+    /// the full connect (spawn + initialize + list_tools) with the proxy
+    /// mutex released, and installs the client. Concurrent callers wait on
+    /// the same per-backend lock instead of all spawning duplicate children.
+    connect_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl ProxyServer {
@@ -166,7 +172,17 @@ impl ProxyServer {
             config_hashes,
             cache_store,
             discovery_lock: Arc::new(tokio::sync::Mutex::new(())),
+            connect_locks: HashMap::new(),
         }
+    }
+
+    /// Return (creating on first call) the per-backend connect lock.
+    fn connect_lock_for(&mut self, server_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.connect_locks
+                .entry(server_name.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     fn register_tools(&mut self, server_name: &str, tools: &[Tool]) {
@@ -229,8 +245,11 @@ impl ProxyServer {
         }
     }
 
-    /// Persist current discovered tools to cache.
-    fn save_to_cache(&self) {
+    /// Build a snapshot of cache entries to persist. This is pure in-memory
+    /// work and is cheap to run under the proxy lock; the actual disk writes
+    /// are done by `persist_cache_snapshot` with the proxy lock released.
+    fn snapshot_cache_entries(&self) -> Vec<(String, BackendToolCache)> {
+        let mut out = Vec::new();
         for name in &self.discovered_backends {
             let prefix = format!("{name}{SEPARATOR}");
             let tools: Vec<Tool> = self
@@ -238,7 +257,6 @@ impl ProxyServer {
                 .iter()
                 .filter(|t| t.name.starts_with(&prefix))
                 .map(|t| {
-                    // Strip namespace to store original tool names
                     let original_name = t.name.strip_prefix(&prefix).unwrap_or(&t.name).to_string();
                     let original_desc = t.description.as_ref().map(|d| {
                         let tag = format!("[{name}] ");
@@ -257,14 +275,17 @@ impl ProxyServer {
             }
 
             if let Some(hash) = self.config_hashes.get(name) {
-                let entry = BackendToolCache {
-                    config_hash: hash.clone(),
-                    tools,
-                    cached_at: chrono::Utc::now().to_rfc3339(),
-                };
-                self.cache_store.save_backend(name, &entry);
+                out.push((
+                    name.clone(),
+                    BackendToolCache {
+                        config_hash: hash.clone(),
+                        tools,
+                        cached_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                ));
             }
         }
+        out
     }
 
     /// Returns true if any configured backend needs discovery (not yet discovered,
@@ -639,15 +660,21 @@ async fn discover_pending_backends(proxy: &SharedProxy) {
         }
     }
 
-    let p = proxy.lock().await;
-    eprintln!(
-        "[serve] ready — {} backend(s), {} tool(s)",
-        p.backends.len(),
-        p.tools.len()
-    );
-    // Persist tool cache outside of the request hot path. save_to_cache only
-    // touches local state + ChronDB; it does not block on the network.
-    p.save_to_cache();
+    // Build the cache snapshot under a brief lock, then release the lock
+    // before writing to disk. Disk writes through ChronDB are synchronous
+    // and would otherwise block every request handler.
+    let (cache_entries, cache_store) = {
+        let p = proxy.lock().await;
+        eprintln!(
+            "[serve] ready — {} backend(s), {} tool(s)",
+            p.backends.len(),
+            p.tools.len()
+        );
+        (p.snapshot_cache_entries(), p.cache_store.clone())
+    };
+    for (name, entry) in &cache_entries {
+        cache_store.save_backend(name, entry);
+    }
 }
 
 /// Top-level non-blocking request dispatcher.
@@ -703,6 +730,12 @@ async fn dispatch_request(
             JsonRpcResponse::success(id, json!({ "tools": tools_snapshot }))
         }
         "tools/call" => {
+            // Capture the requested tool name up front so access-denied and
+            // unknown-tool responses are still attributable in the audit log.
+            if let Some(Value::String(name)) = req.params.as_ref().and_then(|v| v.get("name")) {
+                tool_name_for_audit = Some(name.clone());
+            }
+
             // Decide whether discovery is needed before resolving routing.
             // Discovery happens **outside** the proxy lock; only its outcome
             // affects the resolve step.
@@ -726,6 +759,8 @@ async fn dispatch_request(
                 match p.resolve_tool_call(&id, req.params.clone(), identity, acl) {
                     Ok((server, orig, args)) => {
                         let client = p.try_get_client(&server);
+                        // Refine the audit entry now that we know the
+                        // namespaced tool resolves to a real backend.
                         tool_name_for_audit = Some(format!("{server}{SEPARATOR}{orig}"));
                         server_name_for_audit = Some(server.clone());
                         Ok((server, orig, args, client))
@@ -818,13 +853,31 @@ fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> JsonRpcResponse
 /// the new client and pick up the previous one (if any) for shutdown outside
 /// the lock.
 async fn connect_backend(proxy: &SharedProxy, server_name: &str) -> Result<Arc<McpClient>> {
-    let config = {
-        let p = proxy.lock().await;
-        p.configs
+    // Acquire the per-backend connect lock. This is what prevents two
+    // concurrent callers from both spawning a fresh child for the same
+    // backend and racing to install it — the second caller blocks here and,
+    // on the other side of the lock, finds the backend already Connected
+    // and returns the shared Arc without doing any I/O.
+    let (config, connect_lock) = {
+        let mut p = proxy.lock().await;
+        let config = p
+            .configs
             .get(server_name)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown backend: {server_name}"))?
+            .ok_or_else(|| anyhow::anyhow!("unknown backend: {server_name}"))?;
+        let lock = p.connect_lock_for(server_name);
+        (config, lock)
     };
+    let _connect_guard = connect_lock.lock().await;
+
+    // Re-check after acquiring the connect lock: another caller may have
+    // already completed the connect while we were queued.
+    if let Some(existing) = {
+        let mut p = proxy.lock().await;
+        p.try_get_client(server_name)
+    } {
+        return Ok(existing);
+    }
 
     eprintln!("[serve] connecting to {server_name}...");
     let client = McpClient::connect(&config).await?;
@@ -833,13 +886,6 @@ async fn connect_backend(proxy: &SharedProxy, server_name: &str) -> Result<Arc<M
 
     let prev = {
         let mut p = proxy.lock().await;
-        // Re-check: another concurrent caller may have already connected.
-        if let Some(existing) = p.try_get_client(server_name) {
-            // Discard our freshly-connected client; the other one wins.
-            // Drop our client outside the lock so its child is reaped.
-            drop(client);
-            return Ok(existing);
-        }
         p.install_client(server_name, Arc::clone(&client), &tools)
     };
 
