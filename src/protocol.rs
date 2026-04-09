@@ -109,7 +109,35 @@ pub struct ClientInfo {
 
 // --- MCP Tools ---
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ToolAnnotations {
+    #[serde(
+        default,
+        rename = "readOnlyHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub read_only_hint: Option<bool>,
+    #[serde(
+        default,
+        rename = "destructiveHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destructive_hint: Option<bool>,
+    #[serde(
+        default,
+        rename = "idempotentHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idempotent_hint: Option<bool>,
+    #[serde(
+        default,
+        rename = "openWorldHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub open_world_hint: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Tool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +148,8 @@ pub struct Tool {
         skip_serializing_if = "Option::is_none"
     )]
     pub input_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
 }
 
 #[derive(Debug, Deserialize)]

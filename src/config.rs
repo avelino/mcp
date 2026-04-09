@@ -39,6 +39,19 @@ pub fn parse_duration_str(s: &str) -> Option<Duration> {
 pub const DEFAULT_MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// Per-server manual classification overrides for tools.
+/// Glob patterns follow the same syntax as `server_auth::acl::glob_match`.
+/// Both fields are optional; if a tool name matches an override glob, the
+/// classifier is bypassed for it. A tool name matching **both** `read` and
+/// `write` is a configuration error and is rejected at load time.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ToolOverrides {
+    #[serde(default)]
+    pub read: Vec<String>,
+    #[serde(default)]
+    pub write: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct CliToolConfig {
     pub name: String,
@@ -72,6 +85,8 @@ pub enum ServerConfig {
         #[serde(default)]
         tools: Vec<CliToolConfig>,
         #[serde(default)]
+        tool_acl: Option<ToolOverrides>,
+        #[serde(default)]
         idle_timeout: IdleTimeoutPolicy,
         #[serde(default)]
         min_idle_timeout: Option<String>,
@@ -85,6 +100,8 @@ pub enum ServerConfig {
         #[serde(default)]
         env: HashMap<String, String>,
         #[serde(default)]
+        tool_acl: Option<ToolOverrides>,
+        #[serde(default)]
         idle_timeout: IdleTimeoutPolicy,
         #[serde(default)]
         min_idle_timeout: Option<String>,
@@ -95,6 +112,8 @@ pub enum ServerConfig {
         url: String,
         #[serde(default)]
         headers: HashMap<String, String>,
+        #[serde(default)]
+        tool_acl: Option<ToolOverrides>,
         #[serde(default)]
         idle_timeout: IdleTimeoutPolicy,
         #[serde(default)]
@@ -135,6 +154,14 @@ impl ServerConfig {
         };
         raw.and_then(parse_duration_str)
             .unwrap_or(DEFAULT_MIN_IDLE_TIMEOUT)
+    }
+
+    pub fn tool_acl(&self) -> Option<&ToolOverrides> {
+        match self {
+            ServerConfig::Cli { tool_acl, .. } => tool_acl.as_ref(),
+            ServerConfig::Stdio { tool_acl, .. } => tool_acl.as_ref(),
+            ServerConfig::Http { tool_acl, .. } => tool_acl.as_ref(),
+        }
     }
 
     pub fn max_idle_timeout(&self) -> Duration {
@@ -317,6 +344,9 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
                 );
             }
         }
+        if let Some(overrides) = config.tool_acl() {
+            validate_tool_overrides(name, overrides)?;
+        }
     }
 
     let server_auth: ServerAuthConfig = raw
@@ -349,6 +379,25 @@ fn substitute_env_vars(input: &str) -> String {
         std::env::var(var_name).unwrap_or_default()
     })
     .to_string()
+}
+
+/// Reject `tool_acl` configs where a single pattern (or one exactly equal
+/// pattern) appears in both `read` and `write`. This catches the obvious
+/// typo-class footgun at load time. Full cross-glob intersection analysis
+/// isn't worth the complexity — the classifier runtime check below still
+/// fires if a real tool name happens to match both lists.
+fn validate_tool_overrides(
+    server_name: &str,
+    overrides: &crate::config::ToolOverrides,
+) -> Result<()> {
+    for r in &overrides.read {
+        if overrides.write.iter().any(|w| w == r) {
+            anyhow::bail!(
+                "server '{server_name}': tool_acl pattern '{r}' appears in both 'read' and 'write'"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_server_names(config: &Config) -> Vec<String> {

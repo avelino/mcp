@@ -70,7 +70,7 @@ fn matches_tool(tool_name: &str, patterns: &[String]) -> bool {
 
 /// Glob matching: supports `*` as wildcard for any characters.
 /// Handles multiple wildcards (e.g., `*admin*`, `foo*bar*baz`).
-fn glob_match(pattern: &str, value: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
     let segments: Vec<&str> = pattern.split('*').collect();
 
     if segments.len() == 1 {

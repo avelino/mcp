@@ -1,6 +1,7 @@
 mod acl;
 mod providers;
 
+pub(crate) use acl::glob_match;
 pub use acl::AclConfig;
 pub use providers::{BearerTokenAuth, ForwardedUserAuth, NoAuth};
 

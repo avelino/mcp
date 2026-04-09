@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 
 use crate::audit::{AuditEntry, AuditLogger};
 use crate::cache::{BackendToolCache, ToolCacheStore};
+use crate::classifier::{classify, Kind, ToolClassification};
+use crate::classifier_cache::{cache_key, ClassifierCache};
 use crate::client::McpClient;
 use crate::config::{parse_duration_str, Config, IdleTimeoutPolicy, ServerConfig};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, Tool, PROTOCOL_VERSION};
@@ -131,6 +133,13 @@ struct ProxyServer {
     backends: HashMap<String, BackendState>,
     tool_map: HashMap<String, (String, String)>, // namespaced -> (server, original_name)
     tools: Vec<Tool>,
+    /// Per-tool read/write classification, keyed by namespaced tool name.
+    /// Populated after each successful `tools/list` from an upstream and
+    /// consumed by future ACL enforcement (issue #54 only produces it).
+    classifications: HashMap<String, ToolClassification>,
+    /// Persistent classifier cache. Loaded at startup, saved after each
+    /// successful discovery batch. Overrides are never cached.
+    classifier_cache: ClassifierCache,
     audit: Arc<AuditLogger>,
     /// Tracks which backends have been successfully discovered.
     discovered_backends: std::collections::HashSet<String>,
@@ -166,6 +175,8 @@ impl ProxyServer {
             backends: HashMap::new(),
             tool_map: HashMap::new(),
             tools: Vec::new(),
+            classifications: HashMap::new(),
+            classifier_cache: ClassifierCache::load(),
             audit,
             discovered_backends: std::collections::HashSet::new(),
             discovery_failures: HashMap::new(),
@@ -186,6 +197,11 @@ impl ProxyServer {
     }
 
     fn register_tools(&mut self, server_name: &str, tools: &[Tool]) {
+        let overrides = self
+            .configs
+            .get(server_name)
+            .and_then(|c| c.tool_acl())
+            .cloned();
         for tool in tools {
             let namespaced = format!("{server_name}{SEPARATOR}{}", tool.name);
             let description = match &tool.description {
@@ -196,10 +212,35 @@ impl ProxyServer {
                 namespaced.clone(),
                 (server_name.to_string(), tool.name.clone()),
             );
+            // Classify against raw tool (with annotations + original description).
+            // Consult the persistent cache first — overrides are NEVER cached,
+            // so re-classify when an override is defined for this server.
+            let classification = if overrides.is_none() {
+                let key = cache_key(server_name, &tool.name, tool.description.as_deref());
+                if let Some(cached) = self.classifier_cache.get(&key).cloned() {
+                    cached
+                } else {
+                    let c = classify(tool, None);
+                    self.classifier_cache.put(key, c.clone());
+                    c
+                }
+            } else {
+                classify(tool, overrides.as_ref())
+            };
+            if classification.kind == Kind::Ambiguous {
+                eprintln!(
+                    "[serve] {server_name}:{tool_name}: classification ambiguous → treated as write (reasons: {reasons})",
+                    tool_name = tool.name,
+                    reasons = classification.reasons.join("; "),
+                );
+            }
+            self.classifications
+                .insert(namespaced.clone(), classification);
             self.tools.push(Tool {
                 name: namespaced,
                 description,
                 input_schema: tool.input_schema.clone(),
+                annotations: tool.annotations.clone(),
             });
         }
     }
@@ -208,6 +249,7 @@ impl ProxyServer {
         let prefix = format!("{server_name}{SEPARATOR}");
         self.tools.retain(|t| !t.name.starts_with(&prefix));
         self.tool_map.retain(|k, _| !k.starts_with(&prefix));
+        self.classifications.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Collect cached tools for a server from the current tool list (for storing in Disconnected state).
@@ -266,6 +308,7 @@ impl ProxyServer {
                         name: original_name,
                         description: original_desc,
                         input_schema: t.input_schema.clone(),
+                        annotations: t.annotations.clone(),
                     }
                 })
                 .collect();
@@ -674,6 +717,12 @@ async fn discover_pending_backends(proxy: &SharedProxy) {
     };
     for (name, entry) in &cache_entries {
         cache_store.save_backend(name, entry);
+    }
+
+    // Persist classifier cache (fresh entries from register_tools).
+    {
+        let mut p = proxy.lock().await;
+        p.classifier_cache.save();
     }
 }
 
@@ -1529,6 +1578,7 @@ mod tests {
             name: "search_issues".to_string(),
             description: Some("Search for issues".to_string()),
             input_schema: None,
+            annotations: None,
         };
 
         let server_name = "sentry";
@@ -1591,6 +1641,7 @@ mod tests {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search for issues".to_string()),
             input_schema: None,
+            annotations: None,
         });
         server.tool_map.insert(
             "sentry__search_issues".to_string(),
@@ -1812,11 +1863,13 @@ mod tests {
             name: "sentry__search_issues".to_string(),
             description: Some("[sentry] Search".to_string()),
             input_schema: None,
+            annotations: None,
         });
         server.tools.push(Tool {
             name: "slack__send_message".to_string(),
             description: Some("[slack] Send".to_string()),
             input_schema: None,
+            annotations: None,
         });
 
         let acl = Some(AclConfig {
@@ -1988,11 +2041,13 @@ mod tests {
                 name: "search".to_string(),
                 description: Some("Search stuff".to_string()),
                 input_schema: None,
+                annotations: None,
             },
             Tool {
                 name: "create".to_string(),
                 description: None,
                 input_schema: None,
+                annotations: None,
             },
         ];
 
@@ -2009,6 +2064,7 @@ mod tests {
                 name: "send".to_string(),
                 description: Some("Send msg".to_string()),
                 input_schema: None,
+                annotations: None,
             }],
         );
         assert_eq!(server.tools.len(), 3);
@@ -2029,6 +2085,7 @@ mod tests {
                 name: "search".to_string(),
                 description: Some("Search".to_string()),
                 input_schema: None,
+                annotations: None,
             }],
         );
         server.register_tools(
@@ -2037,6 +2094,7 @@ mod tests {
                 name: "send".to_string(),
                 description: Some("Send".to_string()),
                 input_schema: None,
+                annotations: None,
             }],
         );
 

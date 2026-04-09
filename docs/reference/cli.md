@@ -284,3 +284,47 @@ Fails if:
 - Server is not in the registry
 
 > If the server changed type in the registry (stdio ↔ http), `mcp update` warns and drops type-specific fields that no longer apply.
+
+## ACL commands
+
+### `mcp acl classify`
+
+Classify every tool of every configured backend as `read`, `write`, or
+`ambiguous`, using the automatic classifier combined with manual
+`tool_acl` overrides from `servers.json`. This is metadata only — no
+enforcement path changes yet.
+
+```bash
+mcp acl classify                      # all servers, table output
+mcp acl classify --server grafana     # one server
+mcp acl classify --format json        # machine-readable
+```
+
+**Flags:**
+- `--server <alias>` — restrict to one backend
+- `--format table|json` — override the auto-detected output format
+
+**Table columns:**
+
+| Column | Meaning |
+|---|---|
+| `SERVER` | Backend alias |
+| `TOOL` | Upstream tool name (not namespaced) |
+| `KIND` | `read`, `write`, or `ambiguous` |
+| `CONF` | Classifier confidence (0.00–1.00) |
+| `SOURCE` | `override`, `annotation`, `classifier`, or `fallback` |
+| `reasons` | Which signals fired (name tokens, description patterns, schema hints) |
+
+Rows prefixed with `[!]` are **ambiguous** — the classifier could not
+decide. They are treated as `write` at runtime (fail-safe). Add a
+`tool_acl` entry in `servers.json` to pin them explicitly.
+
+**Example (JSON):**
+
+```bash
+mcp acl classify --server databricks --format json | jq '.[] | {tool, kind}'
+```
+
+The JSON form is an array of `{server, tool, kind, confidence, source, reasons}` objects, suitable for scripting or diffing across config changes.
+
+See [Tool ACL overrides](./config-file.md#tool-acl-overrides) for how to pin tools manually, and [`docs/acl-redesign-plan.md`](../acl-redesign-plan.md) for the full redesign context.

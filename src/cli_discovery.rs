@@ -381,6 +381,7 @@ fn build_tool(name: &str, description: &str, flags: &[Flag]) -> Tool {
             Some(description.to_string())
         },
         input_schema: Some(schema),
+        annotations: None,
     }
 }
 

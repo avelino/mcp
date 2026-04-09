@@ -45,6 +45,7 @@ impl McpClient {
                             name: t.name.clone(),
                             description: t.description.clone(),
                             input_schema: t.input_schema.clone(),
+                            annotations: None,
                         }
                     })
                     .collect();

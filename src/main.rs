@@ -1,6 +1,8 @@
 mod audit;
 mod auth;
 mod cache;
+mod classifier;
+mod classifier_cache;
 mod cli_discovery;
 mod client;
 mod config;
@@ -50,6 +52,9 @@ fn print_usage() {
     eprintln!("  mcp logs --errors                   Show only failures");
     eprintln!("  mcp logs --since <duration>         Filter by time (5m, 1h, 24h, 7d)");
     eprintln!("  mcp logs -f                         Follow mode (streams new entries live)");
+    eprintln!("  mcp acl classify                    Classify tools as read/write");
+    eprintln!("  mcp acl classify --server <alias>   Classify tools for one backend");
+    eprintln!("  mcp acl classify --format json      Emit classification as JSON");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  --json                              Force JSON output");
@@ -212,6 +217,9 @@ async fn run() -> Result<()> {
         "logs" => {
             return handle_logs_command(&args[1..], &cfg, fmt, db_pool.clone()).await;
         }
+        "acl" => {
+            return handle_acl_command(&args[1..], &cfg, fmt).await;
+        }
         _ => {}
     }
 
@@ -281,6 +289,139 @@ async fn handle_logs_follow(
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+/// `mcp acl classify [--server <alias>] [--format table|json]`
+///
+/// Connects to each configured backend (or one named via --server), runs
+/// `tools/list`, and classifies each tool via `classifier::classify`.
+/// No HTTP listener, no ACL enforcement — this is the inspection path that
+/// validates the classifier itself (issue #54).
+async fn handle_acl_command(
+    args: &[String],
+    cfg: &config::Config,
+    fmt: OutputFormat,
+) -> Result<()> {
+    let sub = args.first().map(String::as_str).ok_or_else(|| {
+        anyhow::anyhow!("usage: mcp acl classify [--server <alias>] [--format table|json]")
+    })?;
+    if sub != "classify" {
+        bail!("unknown acl subcommand: {sub} (did you mean 'classify'?)");
+    }
+
+    // Parse flags
+    let mut server_filter: Option<String> = None;
+    let mut format_override: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--server" => {
+                server_filter = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--format" => {
+                format_override = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other => bail!("unknown flag: {other}"),
+        }
+    }
+    let use_json = match format_override.as_deref() {
+        Some("json") => true,
+        Some("table") => false,
+        Some(other) => bail!("unknown --format: {other} (expected 'table' or 'json')"),
+        None => matches!(fmt, OutputFormat::Json),
+    };
+
+    // Pick servers to classify.
+    let targets: Vec<(&String, &config::ServerConfig)> = match &server_filter {
+        Some(name) => {
+            let cfg_entry = cfg
+                .servers
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("server \"{name}\" not found in config"))?;
+            vec![(name, cfg_entry)]
+        }
+        None => cfg.servers.iter().collect(),
+    };
+
+    #[derive(serde::Serialize)]
+    struct Row {
+        server: String,
+        tool: String,
+        kind: &'static str,
+        confidence: f32,
+        source: &'static str,
+        reasons: Vec<String>,
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+
+    for (name, server_config) in targets {
+        if !use_json {
+            eprintln!("[acl] listing tools from {name}...");
+        }
+        let client = match client::McpClient::connect(server_config).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[acl] {name}: failed to connect: {e:#}");
+                continue;
+            }
+        };
+        let tools = match client.list_tools().await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[acl] {name}: failed to list tools: {e:#}");
+                let _ = client.shutdown().await;
+                continue;
+            }
+        };
+        let overrides = server_config.tool_acl();
+        for tool in &tools {
+            let c = classifier::classify(tool, overrides);
+            rows.push(Row {
+                server: name.clone(),
+                tool: tool.name.clone(),
+                kind: c.kind.as_str(),
+                confidence: c.confidence,
+                source: c.source.as_str(),
+                reasons: c.reasons,
+            });
+        }
+        let _ = client.shutdown().await;
+    }
+
+    // Stable ordering.
+    rows.sort_by(|a, b| a.server.cmp(&b.server).then(a.tool.cmp(&b.tool)));
+
+    if use_json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    // Table output. Highlight Ambiguous with a `[!]` prefix for easy grep.
+    println!(
+        "{:<20} {:<40} {:<10} {:<6} {:<11} reasons",
+        "SERVER", "TOOL", "KIND", "CONF", "SOURCE"
+    );
+    for r in &rows {
+        let flag = if r.kind == "ambiguous" { "[!]" } else { "   " };
+        let reasons = if r.reasons.is_empty() {
+            String::new()
+        } else {
+            r.reasons.join("; ")
+        };
+        println!(
+            "{flag} {server:<16} {tool:<40} {kind:<10} {conf:<6.2} {source:<11} {reasons}",
+            server = r.server,
+            tool = r.tool,
+            kind = r.kind,
+            conf = r.confidence,
+            source = r.source,
+        );
+    }
+
+    Ok(())
 }
 
 async fn handle_server_command(
