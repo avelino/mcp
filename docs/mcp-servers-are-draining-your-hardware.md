@@ -134,6 +134,21 @@ All sessions share one proxy. The proxy manages backend lifecycles. You can conf
 
 Full configuration reference: [idle timeout options](https://mcp.avelino.run/reference/config-file#idle-timeout). Proxy mode setup: [proxy mode guide](https://mcp.avelino.run/guides/proxy-mode).
 
+### Update (April 2026): N clients, M backends
+
+The original `mcp serve` only solved half the problem — it stopped *one* client from spawning duplicate backends, but if you had multiple editors connecting at the same time, the proxy itself could serialize them or, worse, accumulate orphan processes when a client died. After [#51](https://github.com/avelino/mcp/issues/51) the proxy is now an actual orchestrator: a single backend process is shared across **every connected client**, requests run in parallel through the stdio multiplexer, and dead clients can never leak backend children. The numbers from a real run with 5 editor sessions and 9 backends:
+
+```json
+{
+  "backends_configured": 9,
+  "backends_connected": 9,
+  "active_clients": 5,
+  "tools": 213
+}
+```
+
+9 processes serving 5 clients, not 45. That's the full version of the win this post described.
+
 ## What should change in the ecosystem
 
 This isn't just a `mcp` CLI problem. Every MCP client should implement some form of lazy lifecycle management:

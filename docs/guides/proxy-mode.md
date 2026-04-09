@@ -43,6 +43,53 @@ graph LR
 2. Client calls `tools/list` — the proxy returns tools instantly from persistent cache (if available), while refreshing from real backends in the background. On first run, it connects to all backends to discover their tool lists.
 3. Client calls `tools/call` — the proxy reconnects the target backend on demand (if it was shut down), routes the request, and tracks usage for adaptive timeout
 
+## Concurrency model
+
+The proxy is built to be the **orchestration layer for N concurrent clients sharing the same set of backend processes**. This is the whole point of the project — without it, every editor session and every chat window spawns its own copy of every MCP server, multiplying RAM, CPU, and API rate-limit cost by the number of clients.
+
+The guarantees the proxy makes:
+
+- **One backend = one OS process**, regardless of how many clients are connected. 5 clients hitting `slack` share a single `slack-mcp-server` child.
+- **Calls to different backends run in parallel.** Two clients calling `sentry__search_issues` and `github__list_repos` at the same time do not block each other.
+- **Calls to the same backend also run in parallel.** The stdio transport multiplexes JSON-RPC requests on a single pipe via id matching, so 5 clients all hitting `slack__conversations_replies` simultaneously fan out and back through the same process — none of them serializes on the others.
+- **A slow or hung backend only delays the requests targeting it.** The rest of the proxy keeps moving.
+- **A dead client only loses its own request.** TCP keepalive (30s/10s) on the HTTP listener detects half-open sockets from crashed editors within ~60s, and `MCP_PROXY_REQUEST_TIMEOUT` (default 120s) is a final hard bound at the request boundary.
+- **No orphan backends.** Every spawned child is registered with `kill_on_drop`, so a panicked task, a cancelled request, or a stalled graceful shutdown all converge on the same outcome: the child gets reaped.
+
+You can verify the orchestration on a running proxy with `/health`:
+
+```bash
+curl -s http://127.0.0.1:7332/health | jq
+```
+
+```json
+{
+  "status": "ok",
+  "backends_configured": 9,
+  "backends_connected": 9,
+  "active_clients": 5,
+  "tools": 213,
+  "version": "0.4.3"
+}
+```
+
+`backends_connected` should never grow with `active_clients` — that's the win.
+
+```mermaid
+graph LR
+    C1["claude code #1"] --> P
+    C2["claude code #2"] --> P
+    C3["opencode"] --> P
+    C4["cursor"] --> P
+    C5["windsurf"] --> P
+    P["mcp serve --http<br/>(orchestrator)"] --> Slack["slack-mcp<br/>(1 process)"]
+    P --> Sentry["sentry-mcp<br/>(1 process)"]
+    P --> GH["github-mcp<br/>(1 process)"]
+    P --> N["...N backends"]
+
+    style P fill:#4a9,color:#fff
+```
+
 ## Tool namespacing
 
 Tools are prefixed with the server name using double underscore (`__`) as separator:
@@ -69,14 +116,21 @@ Diagnostics go to stderr:
 
 ```
 [serve] discovering tools from sentry...
-[serve] sentry: 8 tool(s)
 [serve] discovering tools from slack...
+[serve] sentry: 8 tool(s)
 [serve] slack: 12 tool(s)
 [serve] ready — 2 backend(s), 20 tool(s)
-[serve] shutting down idle backend: sentry (idle 62s, 0 reqs)
-[serve] connecting to sentry... (on next tools/call)
+[serve] shutting down idle backend: sentry (idle 74s, 1 reqs)
+[serve] finalizing shutdown for sentry
+[serve] connecting to sentry...
 [serve] sentry: 8 tool(s) (reconnected)
 ```
+
+A few things to note about reaping:
+
+- A backend is **never reaped before its first request** until `max_idle_timeout` has elapsed since connect (warm-up grace). You won't see "shutting down idle backend: X (... 0 reqs)" inside the first few minutes after start anymore — the proxy waits for X to actually be used before considering it idle.
+- When the reaper does fire, all eligible backends shut down **in parallel** — 8 idle backends take ~5s, not 8 × 5s.
+- If a backend's graceful shutdown stalls past 5s, you'll see `shutdown timed out — force-killed via drop`. The child is guaranteed reaped via `kill_on_drop`; the proxy never leaks orphan processes.
 
 ## HTTP mode
 
@@ -148,17 +202,20 @@ JSON-RPC responses are delivered as `message` events on the SSE stream. The conn
 
 ### GET /health
 
-Returns the proxy status:
+Returns the proxy status, including backend pool size and live client sessions:
 
 ```json
 {
   "status": "ok",
-  "backends_configured": 3,
-  "backends_connected": 1,
-  "tools": 20,
-  "version": "0.3.0"
+  "backends_configured": 9,
+  "backends_connected": 9,
+  "active_clients": 5,
+  "tools": 213,
+  "version": "0.4.3"
 }
 ```
+
+`active_clients` is the number of SSE sessions currently registered. Combined with `backends_connected`, this is the metric that proves the proxy is doing its job: **N clients sharing M backends, not N × M processes**. If you ever see `backends_connected` grow proportionally to `active_clients`, something is wrong (clients should be hitting the proxy, not bypassing it to spawn their own backends).
 
 ### Graceful shutdown
 
