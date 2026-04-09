@@ -38,6 +38,7 @@ Three variants, distinguished by their fields:
 | `command` | string | *required* | Executable to spawn |
 | `args` | string[] | `[]` | Arguments passed to the command |
 | `env` | object | `{}` | Environment variables for the process |
+| `tool_acl` | object | `null` | Manual read/write classification overrides (see [Tool ACL overrides](#tool-acl-overrides)) |
 | `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
 | `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
 | `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
@@ -57,6 +58,7 @@ Three variants, distinguished by their fields:
 |---|---|---|---|
 | `url` | string | *required* | Server endpoint URL |
 | `headers` | object | `{}` | HTTP headers for every request |
+| `tool_acl` | object | `null` | Manual read/write classification overrides (see [Tool ACL overrides](#tool-acl-overrides)) |
 | `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
 | `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
 | `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
@@ -83,6 +85,7 @@ Three variants, distinguished by their fields:
 | `args` | string[] | `[]` | Base arguments prepended to every invocation |
 | `env` | object | `{}` | Environment variables for the CLI process |
 | `tools` | array | `[]` | Preset tool definitions (skips auto-discovery when set) |
+| `tool_acl` | object | `null` | Manual read/write classification overrides (see [Tool ACL overrides](#tool-acl-overrides)) |
 | `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
 | `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
 | `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
@@ -141,6 +144,55 @@ When a backend is shut down due to inactivity, its tools remain visible in `tool
   }
 }
 ```
+
+## Tool ACL overrides
+
+The proxy ships with an automatic classifier that labels every tool of every
+upstream MCP as `read`, `write`, or `ambiguous` (treated as write, fail-safe).
+The classifier is auditable — run `mcp acl classify` to see the verdict,
+confidence, source, and reasons for each tool.
+
+When the classifier is wrong (or when you just want to be explicit),
+add `tool_acl` to any server and pin individual tools to `read` or `write`
+using the same glob syntax as the ACL rules (`*`, prefix, suffix, contains).
+
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "mcp-grafana",
+      "tool_acl": {
+        "read":  ["get_*", "list_*", "search_*", "find_*", "query_*", "generate_deeplink"],
+        "write": ["update_dashboard", "create_*", "alerting_manage_*"]
+      }
+    },
+    "databricks": {
+      "command": "databricks-mcp",
+      "tool_acl": {
+        "read":  ["execute_sql_read_only", "poll_sql_result"],
+        "write": ["execute_sql"]
+      }
+    }
+  }
+}
+```
+
+Semantics:
+
+- Both `read` and `write` are optional — omit either or both.
+- Overrides run **before** the classifier. A tool that matches an override
+  is never scored.
+- The same pattern string may not appear in both `read` and `write` for the
+  same server — that fails loudly at load time.
+- If two different globs on the same server both match a single tool name
+  (e.g. `get_*` in `read` and `*_thing` in `write` both match `get_thing`),
+  the proxy fails safe to `write` at classification time and logs the
+  conflict. Narrow your globs to avoid this.
+- Overrides are **never cached** — they are re-read from the config on
+  every startup.
+
+For the full redesign plan and the token/description dictionaries the
+classifier uses, see [`docs/acl-redesign-plan.md`](../acl-redesign-plan.md).
 
 ## Type detection
 

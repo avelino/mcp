@@ -619,6 +619,7 @@ mod tests {
                 command: "echo".to_string(),
                 args: vec!["hello".to_string()],
                 env: HashMap::new(),
+                tool_acl: None,
                 idle_timeout: Default::default(),
                 min_idle_timeout: None,
                 max_idle_timeout: None,
@@ -629,6 +630,7 @@ mod tests {
             ServerConfig::Http {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
+                tool_acl: None,
                 idle_timeout: Default::default(),
                 min_idle_timeout: None,
                 max_idle_timeout: None,
@@ -651,6 +653,7 @@ mod tests {
             ServerConfig::Http {
                 url: "https://mcp.sentry.dev/sse".to_string(),
                 headers: HashMap::new(),
+                tool_acl: None,
                 idle_timeout: Default::default(),
                 min_idle_timeout: None,
                 max_idle_timeout: None,
@@ -662,6 +665,7 @@ mod tests {
                 command: "npx".to_string(),
                 args: vec!["-y".to_string(), "slack-mcp-server".to_string()],
                 env: HashMap::new(),
+                tool_acl: None,
                 idle_timeout: Default::default(),
                 min_idle_timeout: None,
                 max_idle_timeout: None,
@@ -673,6 +677,7 @@ mod tests {
                 command: "uvx".to_string(),
                 args: vec![],
                 env: HashMap::new(),
+                tool_acl: None,
                 idle_timeout: Default::default(),
                 min_idle_timeout: None,
                 max_idle_timeout: None,
@@ -689,6 +694,7 @@ mod tests {
             name: "search".to_string(),
             description: Some("Search things".to_string()),
             input_schema: None,
+            annotations: None,
         }];
         print_tools_json(&tools).unwrap();
     }
@@ -705,11 +711,13 @@ mod tests {
                 name: "search_issues".to_string(),
                 description: Some("Search for issues in Sentry".to_string()),
                 input_schema: None,
+                annotations: None,
             },
             Tool {
                 name: "ping".to_string(),
                 description: None,
                 input_schema: None,
+                annotations: None,
             },
         ];
         print_tools_text(&tools).unwrap();
@@ -735,6 +743,7 @@ mod tests {
                 },
                 "required": ["query"]
             })),
+            annotations: None,
         }];
         print_tools_info_text(&tools).unwrap();
     }
@@ -745,6 +754,7 @@ mod tests {
             name: "ping".to_string(),
             description: None,
             input_schema: None,
+            annotations: None,
         }];
         print_tools_info_text(&tools).unwrap();
     }
@@ -764,6 +774,7 @@ mod tests {
                 "properties": {"q": {"type": "string"}},
                 "required": ["q"]
             })),
+            annotations: None,
         }];
         print_tools_info_json(&tools).unwrap();
     }
