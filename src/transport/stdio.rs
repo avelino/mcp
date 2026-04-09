@@ -170,6 +170,12 @@ impl Transport for StdioTransport {
             bail!("transport closed{}", self.stderr_context().await);
         }
 
+        // Serialize BEFORE registering a pending entry. If serialization
+        // fails, we haven't touched the pending map and there's nothing to
+        // clean up.
+        let mut data = serde_json::to_vec(msg)?;
+        data.push(b'\n');
+
         let key = msg.id.to_string();
         let (tx, rx) = oneshot::channel();
         {
@@ -177,14 +183,26 @@ impl Transport for StdioTransport {
             p.insert(key.clone(), tx);
         }
 
-        let mut data = serde_json::to_vec(msg)?;
-        data.push(b'\n');
-        if self.writer_tx.send(data).await.is_err() {
-            self.pending.lock().await.remove(&key);
-            bail!(
-                "failed to write to stdin (writer task gone){}",
-                self.stderr_context().await
-            );
+        // Bound the writer send: if the writer task is stuck on child stdin
+        // backpressure, we fail fast instead of waiting for the full response
+        // timeout. Clean up the pending entry on any failure path.
+        let send_timeout = Duration::from_secs(5);
+        match timeout(send_timeout, self.writer_tx.send(data)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.pending.lock().await.remove(&key);
+                bail!(
+                    "failed to write to stdin (writer task gone){}",
+                    self.stderr_context().await
+                );
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&key);
+                bail!(
+                    "writer stalled on stdin backpressure{}",
+                    self.stderr_context().await
+                );
+            }
         }
 
         let dur = Duration::from_secs(self.timeout_secs);
@@ -212,30 +230,27 @@ impl Transport for StdioTransport {
         }
         let mut data = serde_json::to_vec(msg)?;
         data.push(b'\n');
-        self.writer_tx
-            .send(data)
-            .await
-            .map_err(|_| anyhow!("writer task gone"))?;
-        Ok(())
+        let send_timeout = Duration::from_secs(5);
+        match timeout(send_timeout, self.writer_tx.send(data)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(anyhow!("writer task gone")),
+            Err(_) => Err(anyhow!("writer stalled on stdin backpressure")),
+        }
     }
 
     async fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
 
-        // Take ownership of the child, give it a brief grace period to exit
-        // gracefully after stdin closes, then force-kill if still alive.
+        // Take ownership of the child and kill it explicitly. We do NOT try
+        // to "wait for graceful exit first" because stdin is owned by the
+        // writer task (not by `close()`), so there's nothing here that would
+        // signal EOF to the child. The child's reader task sees EOF only
+        // when we kill it or when the last write_all fails. The honest thing
+        // to do is kill and bounded-wait.
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
-            // Wait briefly for graceful exit. The writer task will close
-            // stdin when its channel is dropped (after this transport is
-            // dropped). For an explicit close path, we just kill.
-            match timeout(Duration::from_secs(2), child.wait()).await {
-                Ok(Ok(_)) => {}
-                _ => {
-                    let _ = child.start_kill();
-                    let _ = timeout(Duration::from_secs(2), child.wait()).await;
-                }
-            }
+            let _ = child.start_kill();
+            let _ = timeout(Duration::from_secs(2), child.wait()).await;
         }
         Ok(())
     }
