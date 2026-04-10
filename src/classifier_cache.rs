@@ -3,7 +3,7 @@
 //! Lives at `~/.config/mcp/tool-classification.json` by default, or at the
 //! path given by `$MCP_CLASSIFIER_CACHE` (for CI/container use).
 //!
-//! Key format: `server_alias:tool_name:blake2b(description)`. When the
+//! Key format: `server_alias:tool_name:sha256(description+annotations)`. When the
 //! description changes, the cache key changes and the old entry is
 //! transparently replaced.
 //!
@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::classifier::ToolClassification;
+use crate::protocol::ToolAnnotations;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ClassifierCache {
@@ -37,9 +38,24 @@ fn default_cache_path() -> Option<PathBuf> {
         .map(|d| d.join("tool-classification.json"))
 }
 
-pub fn cache_key(server: &str, tool: &str, description: Option<&str>) -> String {
+pub fn cache_key(
+    server: &str,
+    tool: &str,
+    description: Option<&str>,
+    annotations: Option<&ToolAnnotations>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(description.unwrap_or("").as_bytes());
+    // Include annotations so that changes to readOnlyHint/destructiveHint
+    // invalidate the cache entry even when the description is unchanged.
+    if let Some(ann) = annotations {
+        if let Some(v) = ann.read_only_hint {
+            hasher.update(if v { b"ro:1" } else { b"ro:0" });
+        }
+        if let Some(v) = ann.destructive_hint {
+            hasher.update(if v { b"dh:1" } else { b"dh:0" });
+        }
+    }
     let hash = hasher.finalize();
     // First 8 bytes hex is enough — collision within a single (server,tool) is
     // effectively impossible for any realistic description set.
@@ -139,16 +155,35 @@ mod tests {
 
     #[test]
     fn key_changes_when_description_changes() {
-        let k1 = cache_key("grafana", "get_thing", Some("returns data"));
-        let k2 = cache_key("grafana", "get_thing", Some("returns NEW data"));
+        let k1 = cache_key("grafana", "get_thing", Some("returns data"), None);
+        let k2 = cache_key("grafana", "get_thing", Some("returns NEW data"), None);
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn key_stable_for_same_description() {
-        let k1 = cache_key("grafana", "get_thing", Some("x"));
-        let k2 = cache_key("grafana", "get_thing", Some("x"));
+        let k1 = cache_key("grafana", "get_thing", Some("x"), None);
+        let k2 = cache_key("grafana", "get_thing", Some("x"), None);
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn key_changes_when_annotations_change() {
+        use crate::protocol::ToolAnnotations;
+        let ann_ro = ToolAnnotations {
+            read_only_hint: Some(true),
+            ..Default::default()
+        };
+        let ann_dh = ToolAnnotations {
+            destructive_hint: Some(true),
+            ..Default::default()
+        };
+        let k_none = cache_key("s", "t", Some("d"), None);
+        let k_ro = cache_key("s", "t", Some("d"), Some(&ann_ro));
+        let k_dh = cache_key("s", "t", Some("d"), Some(&ann_dh));
+        assert_ne!(k_none, k_ro);
+        assert_ne!(k_none, k_dh);
+        assert_ne!(k_ro, k_dh);
     }
 
     #[test]

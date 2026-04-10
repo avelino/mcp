@@ -310,17 +310,26 @@ async fn handle_acl_command(
     }
 
     // Parse flags
+    let usage = "usage: mcp acl classify [--server <alias>] [--format table|json]";
     let mut server_filter: Option<String> = None;
     let mut format_override: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--server" => {
-                server_filter = args.get(i + 1).cloned();
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("{usage}"))?;
+                server_filter = Some(value.clone());
                 i += 2;
             }
             "--format" => {
-                format_override = args.get(i + 1).cloned();
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("{usage}"))?;
+                format_override = Some(value.clone());
                 i += 2;
             }
             other => bail!("unknown flag: {other}"),
@@ -356,6 +365,7 @@ async fn handle_acl_command(
     }
 
     let mut rows: Vec<Row> = Vec::new();
+    let mut cache = classifier_cache::ClassifierCache::load();
 
     for (name, server_config) in targets {
         if !use_json {
@@ -377,8 +387,25 @@ async fn handle_acl_command(
             }
         };
         let overrides = server_config.tool_acl();
+        let has_overrides = overrides.is_some_and(|o| !o.read.is_empty() || !o.write.is_empty());
         for tool in &tools {
-            let c = classifier::classify(tool, overrides);
+            let c = if has_overrides {
+                classifier::classify(tool, overrides)
+            } else {
+                let key = classifier_cache::cache_key(
+                    name,
+                    &tool.name,
+                    tool.description.as_deref(),
+                    tool.annotations.as_ref(),
+                );
+                if let Some(cached) = cache.get(&key).cloned() {
+                    cached
+                } else {
+                    let c = classifier::classify(tool, None);
+                    cache.put(key, c.clone());
+                    c
+                }
+            };
             rows.push(Row {
                 server: name.clone(),
                 tool: tool.name.clone(),
@@ -390,6 +417,8 @@ async fn handle_acl_command(
         }
         let _ = client.shutdown().await;
     }
+
+    cache.save();
 
     // Stable ordering.
     rows.sort_by(|a, b| a.server.cmp(&b.server).then(a.tool.cmp(&b.tool)));

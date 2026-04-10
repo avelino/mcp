@@ -201,6 +201,7 @@ impl ProxyServer {
             .configs
             .get(server_name)
             .and_then(|c| c.tool_acl())
+            .filter(|o| !o.read.is_empty() || !o.write.is_empty())
             .cloned();
         for tool in tools {
             let namespaced = format!("{server_name}{SEPARATOR}{}", tool.name);
@@ -216,7 +217,12 @@ impl ProxyServer {
             // Consult the persistent cache first — overrides are NEVER cached,
             // so re-classify when an override is defined for this server.
             let classification = if overrides.is_none() {
-                let key = cache_key(server_name, &tool.name, tool.description.as_deref());
+                let key = cache_key(
+                    server_name,
+                    &tool.name,
+                    tool.description.as_deref(),
+                    tool.annotations.as_ref(),
+                );
                 if let Some(cached) = self.classifier_cache.get(&key).cloned() {
                     cached
                 } else {
@@ -935,7 +941,10 @@ async fn connect_backend(proxy: &SharedProxy, server_name: &str) -> Result<Arc<M
 
     let prev = {
         let mut p = proxy.lock().await;
-        p.install_client(server_name, Arc::clone(&client), &tools)
+        let prev = p.install_client(server_name, Arc::clone(&client), &tools);
+        // Persist new classifications from register_tools.
+        p.classifier_cache.save();
+        prev
     };
 
     // Shut down any displaced previous client outside the lock.
