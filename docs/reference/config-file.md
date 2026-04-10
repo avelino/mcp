@@ -186,8 +186,8 @@ Semantics:
   same server — that fails loudly at load time.
 - If two different globs on the same server both match a single tool name
   (e.g. `get_*` in `read` and `*_thing` in `write` both match `get_thing`),
-  the proxy fails safe to `write` at classification time and logs the
-  conflict. Narrow your globs to avoid this.
+  the proxy fails safe to `write` at classification time. Narrow your
+  globs to avoid this.
 - Overrides are **never cached** — they are re-read from the config on
   every startup.
 
