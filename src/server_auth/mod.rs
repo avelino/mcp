@@ -2,7 +2,7 @@ mod acl;
 mod providers;
 
 pub(crate) use acl::glob_match;
-pub use acl::AclConfig;
+pub use acl::{AclConfig, ToolContext};
 pub use providers::{BearerTokenAuth, ForwardedUserAuth, NoAuth};
 
 // Re-exported for tests in other modules (serve.rs)
@@ -134,9 +134,14 @@ pub fn build_auth_provider(config: &ServerAuthConfig) -> Result<Arc<dyn AuthProv
 }
 
 /// Check if a tool is allowed for the given identity.
-pub fn is_tool_allowed(identity: &AuthIdentity, tool_name: &str, acl: &Option<AclConfig>) -> bool {
+pub fn is_tool_allowed(
+    identity: &AuthIdentity,
+    tool_name: &str,
+    acl: &Option<AclConfig>,
+    ctx: Option<&acl::ToolContext>,
+) -> bool {
     match acl {
-        Some(acl) => acl::is_tool_allowed(identity, tool_name, acl),
+        Some(acl) => acl::is_tool_allowed(identity, tool_name, acl, ctx),
         None => true,
     }
 }
@@ -255,7 +260,10 @@ mod tests {
         assert_eq!(config.provider, "bearer");
         assert_eq!(config.bearer.unwrap().tokens.len(), 2);
         let acl = config.acl.unwrap();
-        assert_eq!(acl.rules.len(), 1);
+        match &acl {
+            AclConfig::Legacy(legacy) => assert_eq!(legacy.rules.len(), 1),
+            AclConfig::RoleBased(_) => panic!("expected legacy schema"),
+        }
     }
 
     #[test]
