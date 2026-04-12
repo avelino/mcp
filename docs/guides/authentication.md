@@ -187,6 +187,35 @@ Each entry in `tokens` supports two shapes:
 
 Both forms can coexist in the same config file.
 
+#### Role-based ACL (recommended for new setups)
+
+```json
+{
+  "mcpServers": { ... },
+  "serverAuth": {
+    "provider": "bearer",
+    "bearer": {
+      "tokens": {
+        "tok-alice": { "subject": "alice", "roles": ["admin"] },
+        "tok-bob": { "subject": "bob", "roles": ["dev"] }
+      }
+    },
+    "acl": {
+      "default": "deny",
+      "roles": {
+        "admin": [{ "server": "*", "access": "*" }],
+        "dev": [
+          { "server": ["github", "grafana"], "access": "read" },
+          { "server": "github", "access": "write", "tools": ["gh_pr", "gh_issue"] }
+        ]
+      }
+    }
+  }
+}
+```
+
+See [proxy mode ACL docs](proxy-mode.md#access-control-acl) for the full schema, access expansion table, and evaluation model.
+
 ### Available providers
 
 | Provider | Use case |
@@ -217,4 +246,9 @@ Groups header value is parsed as a comma-separated list: each entry is trimmed a
 
 ### Access control (ACL)
 
-Rules control which authenticated users can access which tools. Rules are evaluated in order — first match wins. Tool patterns support full glob matching with `*` wildcards (prefix, suffix, contains, and multiple). See [proxy mode ACL docs](proxy-mode.md#access-control-acl) for the full rule syntax.
+The ACL controls which authenticated users can access which tools. It supports two schemas:
+
+- **Role-based** (recommended) — define reusable roles with server-aware, read/write-aware grants. Evaluation is union-based and order-independent. Deny always wins.
+- **Legacy** — flat rules list with first-match-wins semantics, fully backward compatible.
+
+See [proxy mode ACL docs](proxy-mode.md#access-control-acl) for the full schema reference and examples.

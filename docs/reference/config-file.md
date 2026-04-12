@@ -310,7 +310,79 @@ Groups header value is parsed as a comma-separated list: each entry is trimmed a
 
 ### ACL config
 
-Optional. Controls which users can access which tools.
+Optional. Controls which users can access which tools. Supports two schemas: **role-based** (recommended) and **legacy** (backward compatible). Detection is automatic — see [schema detection](#schema-detection).
+
+#### Role-based schema (recommended)
+
+```json
+{
+  "acl": {
+    "default": "deny",
+    "strictClassification": false,
+    "roles": {
+      "admin": [{ "server": "*", "access": "*" }],
+      "dev": [
+        { "server": ["github", "grafana"], "access": "read" },
+        { "server": "github", "access": "write", "tools": ["gh_pr", "gh_issue"] }
+      ],
+      "readonly": [{ "server": "*", "access": "read" }]
+    },
+    "subjects": {
+      "alice": { "roles": ["admin"] },
+      "bob":   { "roles": ["dev"] },
+      "charlie": {
+        "roles": ["readonly"],
+        "extra": [{ "server": "sentry", "access": "read" }]
+      }
+    }
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `default` | `"allow"` \| `"deny"` | `"allow"` | Policy when no grant matches |
+| `strictClassification` | bool | `false` | Block ambiguous tools entirely (require explicit override) |
+| `roles` | object | `{}` | Map of role name → list of grants |
+| `subjects` | object | `{}` | Map of subject → `{ roles, extra }` |
+
+#### Grant
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `server` | string or string[] | *required* | Server alias(es) to match (`"*"` = any) |
+| `access` | `"read"` \| `"write"` \| `"*"` | *required* | Access level |
+| `tools` | string[] | `[]` (all tools) | Tool name globs to narrow the grant |
+| `resources` | string[] | `[]` | Parsed but not enforced yet |
+| `prompts` | string[] | `[]` | Parsed but not enforced yet |
+| `deny` | bool | `false` | Turns grant into explicit deny (always wins over allows) |
+
+#### Subject config
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `roles` | string[] | `[]` | Roles assigned to this subject (merged with token roles) |
+| `extra` | Grant[] | `[]` | Additional per-subject grants |
+
+#### Access expansion
+
+| `access` | Read tools | Write tools | Ambiguous tools | Ambiguous (strict) |
+|-----------|-----------|-------------|-----------------|-------------------|
+| `"read"` | allowed | denied | denied | denied |
+| `"write"` | denied | allowed | allowed | **denied** |
+| `"*"` | allowed | allowed | allowed | allowed |
+
+#### Evaluation model
+
+1. Collect all grants from all roles (token roles + subject config roles) + `extra`
+2. Filter to grants matching the target server and tool
+3. If any matching grant has `deny: true` → **deny**
+4. If any matching allow grant covers the access level → **allow**
+5. No match → apply `default`
+
+Union-based, order-independent. Deny always wins.
+
+#### Legacy schema
 
 ```json
 {
@@ -333,7 +405,7 @@ Optional. Controls which users can access which tools.
 | `default` | `"allow"` \| `"deny"` | `"allow"` | Default policy when no rule matches |
 | `rules` | array | `[]` | Ordered list of ACL rules (first match wins) |
 
-#### ACL rule
+#### Legacy ACL rule
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -344,9 +416,18 @@ Optional. Controls which users can access which tools.
 
 Both `subjects` and `roles` must match for a rule to apply. Empty means "match all".
 
+#### Schema detection
+
+| JSON keys present | Schema used |
+|-------------------|-------------|
+| `roles` (as object) or `subjects` (as object) | Role-based |
+| `rules` (as array) | Legacy |
+| Both `rules` and `roles`/`subjects` | Config error |
+| Neither | Legacy with default allow |
+
 #### Tool pattern glob syntax
 
-The `tools` field supports glob patterns with `*` wildcards:
+The `tools` field supports glob patterns with `*` wildcards (both schemas):
 
 | Pattern | Matches | Example |
 |---------|---------|---------|

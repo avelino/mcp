@@ -496,7 +496,11 @@ Trusts a reverse proxy header (e.g. `X-Forwarded-User`). Only use behind a trust
 
 ### Access control (ACL)
 
-Control which users can access which tools using glob patterns:
+The ACL supports two schemas: a **role-based schema** (recommended) and a **legacy schema** (for backward compatibility). Detection is automatic based on the JSON keys present.
+
+#### Role-based schema (recommended)
+
+Define reusable roles with server-aware, read/write-aware grants:
 
 ```json
 {
@@ -505,25 +509,98 @@ Control which users can access which tools using glob patterns:
     "provider": "bearer",
     "bearer": {
       "tokens": {
-        "tok-alice": "alice",
-        "tok-bob": "bob"
+        "tok-alice": { "subject": "alice", "roles": ["admin"] },
+        "tok-bob": { "subject": "bob", "roles": ["dev"] },
+        "tok-charlie": { "subject": "charlie", "roles": ["readonly"] }
       }
     },
     "acl": {
-      "default": "allow",
-      "rules": [
-        { "subjects": ["bob"], "tools": ["sentry__*"], "policy": "deny" },
-        { "subjects": ["bob"], "tools": ["*admin*"], "policy": "deny" },
-        { "roles": ["admin"], "tools": ["*"], "policy": "allow" }
-      ]
+      "default": "deny",
+      "strictClassification": false,
+      "roles": {
+        "admin":    [{ "server": "*", "access": "*" }],
+        "dev": [
+          { "server": ["github", "grafana"], "access": "read" },
+          { "server": "github", "access": "write", "tools": ["gh_pr", "gh_issue"] }
+        ],
+        "readonly": [{ "server": "*", "access": "read" }]
+      },
+      "subjects": {
+        "charlie": {
+          "roles": ["readonly"],
+          "extra": [{ "server": "sentry", "access": "read" }]
+        }
+      }
     }
   }
 }
 ```
 
-Rules are evaluated in order — first match wins. If no rule matches, the default policy applies.
+**How it works:**
 
-ACL fields:
+- **`roles`** — Map of role name to a list of grants. Roles are reusable and referenced by subjects.
+- **`subjects`** — Map of subject identifier to `{ roles, extra }`. Roles reference entries in the top-level `roles` map. `extra` is a per-subject list of additional grants.
+- **Evaluation is union-based** — collect all grants from all roles the identity has (token roles + subject config roles + extra). If any grant with `deny: true` matches, access is denied. Otherwise, if any allow grant matches, access is allowed. No match falls back to `default`.
+- **Order doesn't matter** — unlike the legacy schema, rules are not position-sensitive.
+
+**Grant fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `server` | string or string[] | Server alias(es) to match. `"*"` matches any server. |
+| `access` | `"read"` \| `"write"` \| `"*"` | Access level (see below) |
+| `tools` | string[] | Optional tool name globs to narrow the grant. Empty = all tools. |
+| `resources` | string[] | Optional (parsed, not enforced yet) |
+| `prompts` | string[] | Optional (parsed, not enforced yet) |
+| `deny` | bool | If `true`, turns this into an explicit deny that always wins over allows |
+
+**Access expansion:**
+
+The `access` field interacts with the tool classifier (read/write/ambiguous):
+
+| `access` | Read tools | Write tools | Ambiguous tools |
+|-----------|-----------|-------------|-----------------|
+| `"read"` | allowed | denied | denied |
+| `"write"` | denied | allowed | allowed |
+| `"*"` | allowed | allowed | allowed |
+
+When `strictClassification: true`, ambiguous tools are blocked entirely — even with `access: "write"`. This forces explicit classification overrides in the server config.
+
+**Deny always wins:**
+
+```json
+{
+  "roles": {
+    "dev": [
+      { "server": "github", "access": "*" },
+      { "server": "github", "access": "write", "tools": ["gh_repo_delete"], "deny": true }
+    ]
+  }
+}
+```
+
+The `dev` role has full access to github, except `gh_repo_delete` is explicitly denied.
+
+#### Legacy schema
+
+The original flat rules list, still fully supported. Detected when `rules` is present in the ACL config:
+
+```json
+{
+  "acl": {
+    "default": "allow",
+    "rules": [
+      { "subjects": ["bob"], "tools": ["sentry__*"], "policy": "deny" },
+      { "subjects": ["bob"], "tools": ["*admin*"], "policy": "deny" },
+      { "roles": ["admin"], "tools": ["*"], "policy": "allow" }
+    ]
+  }
+}
+```
+
+Rules are evaluated in order — **first match wins**. If no rule matches, the default policy applies.
+
+Legacy ACL fields:
 - `subjects` — list of user subjects to match (supports `*` wildcard)
 - `roles` — list of roles to match (supports `*` wildcard)
 - `tools` — list of tool name patterns (supports `*` wildcards: prefix `sentry__*`, suffix `*_issues`, contains `*admin*`, multiple `sentry__*_admin__*`, exact match, or `*` for all)
@@ -531,7 +608,37 @@ ACL fields:
 
 Both `subjects` and `roles` must match for a rule to apply. Empty `subjects` or `roles` means "match all".
 
+#### Schema detection
+
+| JSON keys present | Schema used |
+|-------------------|-------------|
+| `roles` (as object) or `subjects` (as object) | Role-based |
+| `rules` (as array) | Legacy |
+| Both `rules` and `roles`/`subjects` | Config error (fails loudly) |
+| Neither | Legacy with default allow |
+
 > **Note:** Stdio mode always uses anonymous identity. ACL rules still apply but the subject is always "anonymous".
+
+### ACL enforcement points
+
+The ACL is enforced at two points in the proxy:
+
+1. **`tools/list`** — The response is **filtered** to only include tools the identity is allowed to call. A tool the identity cannot reach is invisible in the listing.
+2. **`tools/call`** — The request is checked against the ACL before it reaches the backend. Denied requests return a JSON-RPC error (`-32603`) with the subject and tool name.
+
+This dual enforcement means an unauthorized identity can't discover tool names via `tools/list` and can't bypass the filter by guessing tool names in `tools/call`.
+
+### Request timeout
+
+Each client request has a hard upper bound of 120 seconds (configurable via `MCP_PROXY_REQUEST_TIMEOUT`). If a backend takes longer, the client gets a JSON-RPC error and the in-flight request is dropped. Other concurrent clients are unaffected.
+
+```bash
+MCP_PROXY_REQUEST_TIMEOUT=300 mcp serve --http
+```
+
+### Discovery retry with backoff
+
+When a backend fails to connect during discovery, the proxy applies exponential backoff: 30s → 60s → 120s → 240s (capped at 300s). This prevents a flaky backend from repeatedly stealing the discovery lock and blocking healthy backends. After the backoff expires, the proxy retries on the next `tools/call` or discovery cycle. Success clears the backoff.
 
 ## Security considerations
 
@@ -571,10 +678,14 @@ Backend tokens (Slack, GitHub, etc.) live in `servers.json` on the proxy server.
 
 All standard `mcp` env vars apply:
 
-| Variable | Effect |
-|----------|--------|
-| `MCP_CONFIG_PATH` | Custom config file path |
-| `MCP_TIMEOUT` | Timeout in seconds for backend connections (default: 60) |
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `MCP_CONFIG_PATH` | `~/.config/mcp/servers.json` | Custom config file path |
+| `MCP_TIMEOUT` | `60` | Timeout in seconds for backend connections |
+| `MCP_PROXY_REQUEST_TIMEOUT` | `120` | Hard upper bound (seconds) per client request in proxy mode |
+| `MCP_CLASSIFIER_CACHE` | `~/.config/mcp/tool-classification.json` | Path to the tool classification cache |
+
+See [environment variables reference](../reference/environment-variables.md) for full details.
 
 ## When to use each mode
 
