@@ -543,17 +543,6 @@ impl ProxyServer {
             }
         };
 
-        if !server_auth::is_tool_allowed(identity, &tool_name, acl) {
-            return Err(JsonRpcResponse::error(
-                id.clone(),
-                -32603,
-                &format!(
-                    "access denied: '{}' cannot use tool '{tool_name}'",
-                    identity.subject
-                ),
-            ));
-        }
-
         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
         let (server_name, original_name) = match self.tool_map.get(&tool_name) {
@@ -566,6 +555,24 @@ impl ProxyServer {
                 ));
             }
         };
+
+        let classification = self.classifications.get(&tool_name);
+        let ctx = server_auth::ToolContext {
+            server_alias: &server_name,
+            tool_name: &original_name,
+            classification,
+        };
+
+        if !server_auth::is_tool_allowed(identity, &tool_name, acl, Some(&ctx)) {
+            return Err(JsonRpcResponse::error(
+                id.clone(),
+                -32603,
+                &format!(
+                    "access denied: '{}' cannot use tool '{tool_name}'",
+                    identity.subject
+                ),
+            ));
+        }
 
         Ok((server_name, original_name, arguments))
     }
@@ -778,7 +785,16 @@ async fn dispatch_request(
                 let p = proxy.lock().await;
                 p.tools
                     .iter()
-                    .filter(|t| server_auth::is_tool_allowed(identity, &t.name, acl))
+                    .filter(|t| {
+                        let ctx = p.tool_map.get(&t.name).map(|(server, orig)| {
+                            server_auth::ToolContext {
+                                server_alias: server.as_str(),
+                                tool_name: orig.as_str(),
+                                classification: p.classifications.get(&t.name),
+                            }
+                        });
+                        server_auth::is_tool_allowed(identity, &t.name, acl, ctx.as_ref())
+                    })
                     .map(|t| serde_json::to_value(t).unwrap())
                     .collect()
             };
@@ -1864,7 +1880,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_list_filtered_by_acl() {
-        use crate::server_auth::{AclConfig, AclPolicy, AclRule};
+        use crate::server_auth::{AclPolicy, AclRule};
 
         let mut server = test_server();
         // No configs → has_undiscovered_backends() is false, discovery is skipped
@@ -1881,15 +1897,15 @@ mod tests {
             annotations: None,
         });
 
-        let acl = Some(AclConfig {
-            default: AclPolicy::Allow,
-            rules: vec![AclRule {
+        let acl = Some(AclConfig::legacy(
+            AclPolicy::Allow,
+            vec![AclRule {
                 subjects: vec!["bob".to_string()],
                 roles: vec![],
                 tools: vec!["sentry__*".to_string()],
                 policy: AclPolicy::Deny,
             }],
-        });
+        ));
 
         let bob = AuthIdentity::new("bob", vec![]);
         let req = JsonRpcRequest::new(10, "tools/list", None);
@@ -1902,7 +1918,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_call_denied_by_acl() {
-        use crate::server_auth::{AclConfig, AclPolicy, AclRule};
+        use crate::server_auth::{AclPolicy, AclRule};
 
         let mut server = test_server();
         server.tool_map.insert(
@@ -1910,15 +1926,15 @@ mod tests {
             ("sentry".to_string(), "search".to_string()),
         );
 
-        let acl = Some(AclConfig {
-            default: AclPolicy::Allow,
-            rules: vec![AclRule {
+        let acl = Some(AclConfig::legacy(
+            AclPolicy::Allow,
+            vec![AclRule {
                 subjects: vec!["bob".to_string()],
                 roles: vec![],
                 tools: vec!["sentry__*".to_string()],
                 policy: AclPolicy::Deny,
             }],
-        });
+        ));
 
         let bob = AuthIdentity::new("bob", vec![]);
         let req = JsonRpcRequest::new(
