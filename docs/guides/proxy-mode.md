@@ -564,7 +564,7 @@ The `access` field interacts with the tool classifier (read/write/ambiguous):
 | `"write"` | denied | allowed | allowed |
 | `"*"` | allowed | allowed | allowed |
 
-When `strictClassification: true`, ambiguous tools are blocked entirely — even with `access: "write"`. This forces explicit classification overrides in the server config.
+When `strictClassification: true`, ambiguous tools are blocked entirely — regardless of access level (including `"*"`). This forces explicit classification overrides in the server config before ambiguous tools can be used.
 
 **Deny always wins:**
 

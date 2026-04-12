@@ -120,9 +120,9 @@ impl<'de> Deserialize<'de> for AclConfig {
             .ok_or_else(|| serde::de::Error::custom("ACL config must be a JSON object"))?;
 
         let has_rules = obj.contains_key("rules");
-        let has_roles_map = obj.get("roles").is_some_and(|v| v.is_object());
-        let has_subjects_map = obj.get("subjects").is_some_and(|v| v.is_object());
-        let is_new = has_roles_map || has_subjects_map;
+        let has_roles = obj.contains_key("roles");
+        let has_subjects = obj.contains_key("subjects");
+        let is_new = has_roles || has_subjects;
 
         if has_rules && is_new {
             return Err(serde::de::Error::custom(
@@ -133,6 +133,17 @@ impl<'de> Deserialize<'de> for AclConfig {
         if is_new {
             let rbac: RoleBasedAclConfig =
                 serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+            // Validate that all roles referenced by subjects exist in the roles map.
+            for (subject, config) in &rbac.subjects {
+                for role in &config.roles {
+                    if !rbac.roles.contains_key(role) {
+                        return Err(serde::de::Error::custom(format!(
+                            "subject '{}' references unknown role '{}'",
+                            subject, role
+                        )));
+                    }
+                }
+            }
             Ok(AclConfig::RoleBased(rbac))
         } else {
             let legacy: LegacyAclConfig =
@@ -245,12 +256,16 @@ fn is_tool_allowed_rbac(
         .filter(|g| matches_server(g, ctx.server_alias) && matches_tool_grant(g, ctx.tool_name))
         .collect();
 
-    // Union evaluation: deny always wins.
-    if matching.iter().any(|g| g.deny) {
+    let kind = ctx.classification.map(|c| c.kind);
+
+    // Union evaluation: deny always wins, but only for grants that also
+    // cover the current access classification.
+    if matching
+        .iter()
+        .any(|g| g.deny && deny_covers_access(g, kind, acl.strict_classification))
+    {
         return false;
     }
-
-    let kind = ctx.classification.map(|c| c.kind);
 
     if matching
         .iter()
@@ -300,18 +315,32 @@ fn matches_tool_grant(grant: &Grant, tool_name: &str) -> bool {
         .any(|pattern| glob_match(pattern, tool_name))
 }
 
+/// Check if a grant's access level covers the tool's classified kind (for allow grants).
 fn grant_covers_access(grant: &Grant, kind: Option<Kind>, strict: bool) -> bool {
     if grant.deny {
+        return false;
+    }
+    // Strict mode blocks ambiguous tools entirely, regardless of access level.
+    if strict && matches!(kind, Some(Kind::Ambiguous)) {
         return false;
     }
     match grant.access {
         AccessLevel::All => true,
         AccessLevel::Read => matches!(kind, Some(Kind::Read)),
-        AccessLevel::Write => match kind {
-            Some(Kind::Write) => true,
-            Some(Kind::Ambiguous) => !strict,
-            _ => false,
-        },
+        AccessLevel::Write => matches!(kind, Some(Kind::Write) | Some(Kind::Ambiguous)),
+    }
+}
+
+/// Check if a deny grant's access level covers the tool's classified kind.
+/// Same expansion logic as allow, but ignores the `deny` flag guard.
+fn deny_covers_access(grant: &Grant, kind: Option<Kind>, strict: bool) -> bool {
+    if strict && matches!(kind, Some(Kind::Ambiguous)) {
+        return true; // strict mode: deny always catches ambiguous
+    }
+    match grant.access {
+        AccessLevel::All => true,
+        AccessLevel::Read => matches!(kind, Some(Kind::Read)),
+        AccessLevel::Write => matches!(kind, Some(Kind::Write) | Some(Kind::Ambiguous)),
     }
 }
 
@@ -736,6 +765,7 @@ mod tests {
     fn test_deserialize_subjects_only_schema() {
         let json = r#"{
             "default": "deny",
+            "roles": { "dev": [{ "server": "*", "access": "read" }] },
             "subjects": {
                 "bob": { "roles": ["dev"] }
             }
@@ -1099,10 +1129,10 @@ mod tests {
     }
 
     #[test]
-    fn test_all_access_allows_everything() {
+    fn test_all_access_allows_everything_non_strict() {
         let acl = RoleBasedAclConfig {
             default: AclPolicy::Deny,
-            strict_classification: true,
+            strict_classification: false,
             roles: HashMap::from([(
                 "admin".to_string(),
                 vec![Grant {
@@ -1127,9 +1157,56 @@ mod tests {
             };
             assert!(
                 is_tool_allowed_rbac(&identity, &ctx, &acl),
-                "access=* should allow Kind::{kind:?}"
+                "access=* non-strict should allow Kind::{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_all_access_blocks_ambiguous_in_strict_mode() {
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Deny,
+            strict_classification: true,
+            roles: HashMap::from([(
+                "admin".to_string(),
+                vec![Grant {
+                    server: ServerPattern::Single("*".to_string()),
+                    access: AccessLevel::All,
+                    tools: vec![],
+                    resources: vec![],
+                    prompts: vec![],
+                    deny: false,
+                }],
+            )]),
+            subjects: HashMap::new(),
+        };
+        let identity = AuthIdentity::new("alice", vec!["admin".to_string()]);
+
+        // Read and Write still allowed
+        for kind in [Kind::Read, Kind::Write] {
+            let cls = make_classification(kind);
+            let ctx = ToolContext {
+                server_alias: "any",
+                tool_name: "any_tool",
+                classification: Some(&cls),
+            };
+            assert!(
+                is_tool_allowed_rbac(&identity, &ctx, &acl),
+                "access=* strict should allow Kind::{kind:?}"
+            );
+        }
+
+        // Ambiguous blocked in strict mode
+        let cls = make_classification(Kind::Ambiguous);
+        let ctx = ToolContext {
+            server_alias: "any",
+            tool_name: "any_tool",
+            classification: Some(&cls),
+        };
+        assert!(
+            !is_tool_allowed_rbac(&identity, &ctx, &acl),
+            "access=* strict should block Kind::Ambiguous"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1525,5 +1602,149 @@ mod tests {
             classification: Some(&read_cls),
         };
         assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+    }
+
+    // -----------------------------------------------------------------------
+    // PR review fixes: deny access scoping, schema detection, role validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_deny_read_does_not_block_write() {
+        // A deny grant with access=read should only block read tools,
+        // not write tools on the same server/tool pattern.
+        let read_cls = make_classification(Kind::Read);
+        let write_cls = make_classification(Kind::Write);
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Deny,
+            strict_classification: false,
+            roles: HashMap::from([(
+                "dev".to_string(),
+                vec![
+                    Grant {
+                        server: ServerPattern::Single("github".to_string()),
+                        access: AccessLevel::All,
+                        tools: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: false,
+                    },
+                    Grant {
+                        server: ServerPattern::Single("github".to_string()),
+                        access: AccessLevel::Read,
+                        tools: vec!["gh_secret_tool".to_string()],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: true,
+                    },
+                ],
+            )]),
+            subjects: HashMap::new(),
+        };
+        let identity = AuthIdentity::new("alice", vec!["dev".to_string()]);
+
+        // Read is denied by the deny grant
+        let ctx = ToolContext {
+            server_alias: "github",
+            tool_name: "gh_secret_tool",
+            classification: Some(&read_cls),
+        };
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+
+        // Write is NOT denied — the deny grant only covers read
+        let ctx = ToolContext {
+            server_alias: "github",
+            tool_name: "gh_secret_tool",
+            classification: Some(&write_cls),
+        };
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+    }
+
+    #[test]
+    fn test_deny_write_does_not_block_read() {
+        let read_cls = make_classification(Kind::Read);
+        let write_cls = make_classification(Kind::Write);
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Deny,
+            strict_classification: false,
+            roles: HashMap::from([(
+                "dev".to_string(),
+                vec![
+                    Grant {
+                        server: ServerPattern::Single("*".to_string()),
+                        access: AccessLevel::All,
+                        tools: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: false,
+                    },
+                    Grant {
+                        server: ServerPattern::Single("github".to_string()),
+                        access: AccessLevel::Write,
+                        tools: vec!["gh_repo_delete".to_string()],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: true,
+                    },
+                ],
+            )]),
+            subjects: HashMap::new(),
+        };
+        let identity = AuthIdentity::new("bob", vec!["dev".to_string()]);
+
+        // Write is denied
+        let ctx = ToolContext {
+            server_alias: "github",
+            tool_name: "gh_repo_delete",
+            classification: Some(&write_cls),
+        };
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+
+        // Read is NOT denied — the deny grant only covers write
+        let ctx = ToolContext {
+            server_alias: "github",
+            tool_name: "gh_repo_delete",
+            classification: Some(&read_cls),
+        };
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+    }
+
+    #[test]
+    fn test_deserialize_roles_wrong_type_errors() {
+        // roles as array (not object) should trigger new schema detection
+        // and then fail deserialization, not silently fall to legacy.
+        let json = r#"{
+            "default": "deny",
+            "roles": ["admin"]
+        }"#;
+        let result: Result<AclConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_subjects_wrong_type_errors() {
+        let json = r#"{
+            "default": "deny",
+            "subjects": "alice"
+        }"#;
+        let result: Result<AclConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_unknown_role_reference_errors() {
+        // Subject references a role that doesn't exist in the roles map.
+        let json = r#"{
+            "default": "deny",
+            "roles": {
+                "admin": [{ "server": "*", "access": "*" }]
+            },
+            "subjects": {
+                "alice": { "roles": ["nonexistent"] }
+            }
+        }"#;
+        let result: Result<AclConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown role"));
     }
 }
