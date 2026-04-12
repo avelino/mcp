@@ -370,7 +370,7 @@ Optional. Controls which users can access which tools. Supports two schemas: **r
 |-----------|-----------|-------------|-----------------|-------------------|
 | `"read"` | allowed | denied | denied | denied |
 | `"write"` | denied | allowed | allowed | **denied** |
-| `"*"` | allowed | allowed | allowed | allowed |
+| `"*"` | allowed | allowed | allowed | **denied** |
 
 #### Evaluation model
 
