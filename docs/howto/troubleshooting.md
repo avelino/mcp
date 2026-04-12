@@ -108,6 +108,52 @@ Validate your JSON:
 python3 -m json.tool ~/.config/mcp/servers.json
 ```
 
+## Proxy mode errors
+
+### Backend stuck in discovery retry
+
+When a backend fails to connect during `mcp serve`, the proxy applies exponential backoff before retrying: 30s → 60s → 120s → 240s (capped at 300s). This prevents a flaky backend from stealing the discovery lock and blocking healthy backends.
+
+If you see repeated discovery failures in stderr:
+
+```
+[serve] backend "slack" discovery failed: timeout waiting for server response
+```
+
+**Fixes:**
+
+1. **Check the backend command works standalone:**
+   ```bash
+   mcp slack --list
+   ```
+2. **Increase timeout for slow backends:**
+   ```bash
+   MCP_TIMEOUT=120 mcp serve --http
+   ```
+3. **Check credentials** — a backend stuck on an auth prompt will hang until timeout.
+
+After fixing the issue, restart `mcp serve` — the backoff state is in-memory and resets on restart.
+
+### "access denied" on tools/call
+
+The ACL blocks both `tools/call` requests **and** filters `tools/list` responses. If a tool doesn't appear in `tools/list`, the identity doesn't have access to it. If a tool appears but `tools/call` returns access denied, the ACL rules may have changed between the list and the call, or the tool's read/write classification doesn't match the identity's access level.
+
+**Debug:** Check what the classifier thinks about the tool:
+
+```bash
+mcp acl classify --server <backend>
+```
+
+Tools marked `[!]` (ambiguous) are treated as write by default. Add explicit `tool_acl` overrides in `servers.json` if the classifier is wrong.
+
+### Request timeout in proxy mode
+
+Each client request has a hard timeout of 120 seconds (configurable via `MCP_PROXY_REQUEST_TIMEOUT`). If a backend takes longer than this, the client gets a JSON-RPC error with code `-32000`. Other concurrent requests are unaffected.
+
+```bash
+MCP_PROXY_REQUEST_TIMEOUT=300 mcp serve --http
+```
+
 ## Tool errors
 
 ### "tools/call failed: ..."

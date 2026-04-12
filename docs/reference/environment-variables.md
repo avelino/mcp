@@ -10,6 +10,7 @@ These variables configure `mcp` behavior:
 | `MCP_TIMEOUT` | `60` | Timeout in seconds for stdio server responses |
 | `MCP_PROXY_REQUEST_TIMEOUT` | `120` | (proxy mode) Hard upper bound, in seconds, that any single client request can spend inside `mcp serve` before the proxy returns a JSON-RPC error. Acts as a belt-and-suspenders boundary on top of the per-transport `MCP_TIMEOUT`. |
 | `MCP_CLASSIFIER_CACHE` | `~/.config/mcp/tool-classification.json` | Path to the persistent tool read/write classification cache (see [`mcp acl classify`](./cli.md#mcp-acl-classify)). Override this in CI/containers that cannot write to `$HOME`. |
+| `MCP_DISCOVERY_CONCURRENCY` | `10` | Max parallel `--help` calls during CLI subcommand discovery (see [CLI as MCP](../guides/cli-as-mcp.md)) |
 
 ### `MCP_CONFIG_PATH`
 
@@ -53,6 +54,14 @@ MCP_CLASSIFIER_CACHE=/tmp/classify.json mcp acl classify
 
 Corrupt or unreadable cache files are non-fatal: a warning is logged and
 the process proceeds with fresh in-memory classifications.
+
+### `MCP_DISCOVERY_CONCURRENCY`
+
+Only applies to CLI servers (`cli: true`). Limits how many `--help` calls run in parallel during subcommand discovery. Lower this if your machine struggles with many concurrent child processes, or raise it to speed up discovery for deeply nested CLIs.
+
+```bash
+MCP_DISCOVERY_CONCURRENCY=5 mcp kubectl --list
+```
 
 ## Config variables
 

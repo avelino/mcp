@@ -193,7 +193,7 @@ Exposes the proxy over HTTP with the following endpoints:
 |--------|------|-------------|
 | `POST` | `/mcp` | JSON-RPC 2.0 request/response endpoint |
 | `GET` | `/mcp/sse` | SSE endpoint for streaming (per MCP spec) |
-| `GET` | `/health` | Health check (returns JSON status) |
+| `GET` | `/health` | Health check (returns JSON status, see below) |
 
 Default bind address is `127.0.0.1:8080` (localhost only). To bind to a different address:
 
@@ -205,6 +205,32 @@ mcp serve --http :3000              # shorthand for 0.0.0.0:3000 — requires --
 #### `--insecure`
 
 Allow binding to non-loopback addresses without TLS. Required when using addresses like `0.0.0.0`, `192.168.x.x`, etc. Without this flag, the server refuses to start on non-loopback interfaces to prevent accidental plaintext exposure.
+
+#### Health check (`GET /health`)
+
+Returns the proxy status as JSON:
+
+```json
+{
+  "status": "ok",
+  "backends_configured": 9,
+  "backends_connected": 3,
+  "active_clients": 5,
+  "tools": 213,
+  "version": "0.4.3"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `status` | Always `"ok"` |
+| `backends_configured` | Total servers in `servers.json` |
+| `backends_connected` | Backends currently running (others are idle-shutdown or not yet connected) |
+| `active_clients` | Number of SSE sessions currently registered |
+| `tools` | Total tools across all backends (including idle ones — tools are cached) |
+| `version` | `mcp` binary version |
+
+`backends_connected` should **not** grow with `active_clients` — that's the proxy doing its job (N clients sharing M backends). If they grow together, clients may be bypassing the proxy.
 
 #### Graceful shutdown
 
