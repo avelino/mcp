@@ -22,6 +22,9 @@ FROM alpine:latest AS certs
 FROM scratch AS release
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --chmod=755 mcp /usr/local/bin/mcp
+# Scratch has no writable filesystem — disable audit by default.
+# Override with -e MCP_AUDIT_ENABLED=true when a volume is mounted.
+ENV MCP_AUDIT_ENABLED=false
 EXPOSE 8080
 ENTRYPOINT ["mcp"]
 
@@ -29,5 +32,8 @@ ENTRYPOINT ["mcp"]
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/target/release/mcp /usr/local/bin/mcp
+# Scratch has no writable filesystem — disable audit by default.
+# Override with -e MCP_AUDIT_ENABLED=true when a volume is mounted.
+ENV MCP_AUDIT_ENABLED=false
 EXPOSE 8080
 ENTRYPOINT ["mcp"]

@@ -198,6 +198,8 @@ Each entry is stored as a JSON document with key `audit:{timestamp_millis}-{uuid
 
 ## Disabling audit logging
 
+Via config file:
+
 ```json
 {
   "audit": {
@@ -206,4 +208,33 @@ Each entry is stored as a JSON document with key `audit:{timestamp_millis}-{uuid
 }
 ```
 
-When disabled, the logger is a no-op — zero overhead, no files created.
+Via environment variable (takes priority over config file):
+
+```bash
+MCP_AUDIT_ENABLED=false mcp serve --http 0.0.0.0:8080
+```
+
+When disabled, the logger is a no-op and the database is not initialized — zero overhead, no files created, no filesystem writes. This is the default in the Docker image.
+
+## Environment variable overrides
+
+All audit settings can be overridden via environment variables, which take priority over the config file. This is useful for container deployments where editing the config JSON is impractical.
+
+| Variable | Overrides | Description |
+|---|---|---|
+| `MCP_AUDIT_ENABLED` | `audit.enabled` | Set to `false` or `0` to disable |
+| `MCP_AUDIT_PATH` | `audit.path` | ChronDB data directory |
+| `MCP_AUDIT_INDEX_PATH` | `audit.index_path` | ChronDB index directory |
+
+Example: redirect audit to a mounted volume in Docker:
+
+```bash
+docker run -d \
+  -e MCP_AUDIT_ENABLED=true \
+  -e MCP_AUDIT_PATH=/data/audit/data \
+  -e MCP_AUDIT_INDEX_PATH=/data/audit/index \
+  -v audit-vol:/data/audit \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080
+```
+
+See the full list of variables in the [environment variables reference](../reference/environment-variables.md).

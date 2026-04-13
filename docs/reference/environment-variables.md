@@ -6,11 +6,54 @@ These variables configure `mcp` behavior:
 
 | Variable | Default | Description |
 |---|---|---|
+| `MCP_SERVERS_CONFIG` | — | Inline JSON config (entire `servers.json` content). Highest priority — skips file read entirely. |
 | `MCP_CONFIG_PATH` | `~/.config/mcp/servers.json` | Path to the config file |
+| `MCP_CONFIG_DIR` | `~/.config/mcp` | Config directory. Falls back to `/tmp/mcp` when `HOME` is not set. |
 | `MCP_TIMEOUT` | `60` | Timeout in seconds for stdio server responses |
+| `MCP_MAX_OUTPUT` | `1048576` | Maximum output bytes from CLI server commands |
 | `MCP_PROXY_REQUEST_TIMEOUT` | `120` | (proxy mode) Hard upper bound, in seconds, that any single client request can spend inside `mcp serve` before the proxy returns a JSON-RPC error. Acts as a belt-and-suspenders boundary on top of the per-transport `MCP_TIMEOUT`. |
 | `MCP_CLASSIFIER_CACHE` | `~/.config/mcp/tool-classification.json` | Path to the persistent tool read/write classification cache (see [`mcp acl classify`](./cli.md#mcp-acl-classify)). Override this in CI/containers that cannot write to `$HOME`. |
 | `MCP_DISCOVERY_CONCURRENCY` | `10` | Max parallel `--help` calls during CLI subcommand discovery (see [CLI as MCP](../guides/cli-as-mcp.md)) |
+| `MCP_AUDIT_ENABLED` | `true` | Set to `false` or `0` to disable audit logging and database initialization. Overrides `audit.enabled` in the config file. |
+| `MCP_AUDIT_PATH` | `~/.config/mcp/db/data` | Override the ChronDB data directory. Overrides `audit.path` in the config file. |
+| `MCP_AUDIT_INDEX_PATH` | `~/.config/mcp/db/index` | Override the ChronDB index directory. Overrides `audit.index_path` in the config file. |
+| `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override the OAuth token storage location |
+
+### Config loading priority
+
+`mcp` resolves its configuration in this order:
+
+1. **`MCP_SERVERS_CONFIG`** — inline JSON string, parsed directly (no file read)
+2. **`MCP_CONFIG_PATH`** — path to a config file
+3. **`MCP_CONFIG_DIR`/servers.json** — config directory override
+4. **`~/.config/mcp/servers.json`** — default file location
+5. **`/tmp/mcp/servers.json`** — last-resort fallback when `HOME` is not set
+
+Environment variable substitution (`${VAR_NAME}`) works in all cases, including inline config.
+
+### `MCP_SERVERS_CONFIG`
+
+Provide the entire config as a JSON string. This is the recommended approach for containers — no file mounts required:
+
+```bash
+export MCP_SERVERS_CONFIG='{
+  "mcpServers": {
+    "sentry": {
+      "url": "https://mcp.sentry.dev/sse",
+      "headers": {"Authorization": "Bearer ${SENTRY_TOKEN}"}
+    }
+  }
+}'
+mcp serve --http 0.0.0.0:8080
+```
+
+Load from an existing file with `$(cat ...)`:
+
+```bash
+MCP_SERVERS_CONFIG="$(cat servers.json)" mcp serve --http 0.0.0.0:8080
+```
+
+`MCP_SERVERS_CONFIG` takes priority over `MCP_CONFIG_PATH`. If both are set, the inline config wins.
 
 ### `MCP_CONFIG_PATH`
 
@@ -19,6 +62,16 @@ Override the default config file location. Useful for maintaining multiple confi
 ```bash
 MCP_CONFIG_PATH=./test-servers.json mcp --list
 ```
+
+### `MCP_CONFIG_DIR`
+
+Override the base config directory (default `~/.config/mcp`). All default paths (`servers.json`, `auth.json`, `db/`, `tool-classification.json`) resolve relative to this directory.
+
+```bash
+MCP_CONFIG_DIR=/data/mcp mcp serve --http 0.0.0.0:8080
+```
+
+When `HOME` is not set (common in `scratch` and `distroless` containers), `mcp` falls back to `/tmp/mcp` with a warning.
 
 ### `MCP_TIMEOUT`
 
@@ -29,6 +82,14 @@ MCP_TIMEOUT=120 mcp slack --list
 ```
 
 Does not affect HTTP servers (they use reqwest's default timeouts).
+
+### `MCP_MAX_OUTPUT`
+
+Maximum number of bytes to capture from a CLI server's stdout. Commands that exceed this limit have their output truncated. Default is 1 MB.
+
+```bash
+MCP_MAX_OUTPUT=5242880 mcp my-cli some-tool '{"query": "large dataset"}'
+```
 
 ### `MCP_PROXY_REQUEST_TIMEOUT`
 
@@ -61,6 +122,37 @@ Only applies to CLI servers (`cli: true`). Limits how many `--help` calls run in
 
 ```bash
 MCP_DISCOVERY_CONCURRENCY=5 mcp kubectl --list
+```
+
+### `MCP_AUDIT_ENABLED`
+
+Disable audit logging entirely. When set to `false` or `0`, the database is not initialized and no filesystem writes occur. This overrides `"enabled": true` in the config file's `audit` section.
+
+The default Docker image sets `MCP_AUDIT_ENABLED=false` because `scratch` images have no writable filesystem. Override it when you mount a volume:
+
+```bash
+docker run --rm \
+  -e MCP_AUDIT_ENABLED=true \
+  -e MCP_AUDIT_PATH=/data/audit/data \
+  -e MCP_AUDIT_INDEX_PATH=/data/audit/index \
+  -v audit-data:/data/audit \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080
+```
+
+### `MCP_AUDIT_PATH` / `MCP_AUDIT_INDEX_PATH`
+
+Override the ChronDB data and index directories. These take priority over the `audit.path` and `audit.index_path` fields in the config file.
+
+```bash
+MCP_AUDIT_PATH=/var/lib/mcp/data MCP_AUDIT_INDEX_PATH=/var/lib/mcp/index mcp serve --http 0.0.0.0:8080
+```
+
+### `MCP_AUTH_PATH`
+
+Override the OAuth token storage location. Default is `~/.config/mcp/auth.json`. Useful in containers where `$HOME` doesn't exist or is read-only.
+
+```bash
+MCP_AUTH_PATH=/data/auth.json mcp add sentry --remote https://mcp.sentry.dev
 ```
 
 ## Config variables

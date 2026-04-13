@@ -191,9 +191,18 @@ pub struct Config {
     pub config_hashes: HashMap<String, String>,
 }
 
+/// Returns the MCP configuration directory.
+/// Uses `MCP_CONFIG_DIR` if set, then `$HOME/.config/mcp`, then `/tmp/mcp` as
+/// a last-resort fallback for containers without a home directory.
 pub fn config_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
-    Ok(home.join(".config").join("mcp"))
+    if let Ok(dir) = std::env::var("MCP_CONFIG_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(home) = dirs::home_dir() {
+        return Ok(home.join(".config").join("mcp"));
+    }
+    eprintln!("warning: HOME not set, using /tmp/mcp as config directory");
+    Ok(PathBuf::from("/tmp/mcp"))
 }
 
 /// Returns the data path for the shared ChronDB database.
@@ -289,6 +298,11 @@ fn strip_json_comments(input: &str) -> String {
 }
 
 pub fn load_config() -> Result<Config> {
+    // Priority 1: inline config via MCP_SERVERS_CONFIG (no file mount needed)
+    if let Ok(raw) = std::env::var("MCP_SERVERS_CONFIG") {
+        return parse_config_content(&raw, PathBuf::from("<env:MCP_SERVERS_CONFIG>"));
+    }
+    // Priority 2: file path (existing behavior)
     let path = config_path()?;
     load_config_from_path(&path)
 }
@@ -298,7 +312,7 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         return Ok(Config {
             servers: HashMap::new(),
             server_auth: ServerAuthConfig::default(),
-            audit: AuditConfig::default(),
+            audit: apply_audit_env_overrides(AuditConfig::default()),
             path: path.clone(),
             config_hashes: HashMap::new(),
         });
@@ -307,11 +321,15 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
-    let content = substitute_env_vars(&content);
+    parse_config_content(&content, path.clone())
+}
+
+fn parse_config_content(content: &str, source: PathBuf) -> Result<Config> {
+    let content = substitute_env_vars(content);
     let content = strip_json_comments(&content);
 
     let raw: Value = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
+        .with_context(|| format!("failed to parse config from: {}", source.display()))?;
 
     let servers_value = raw
         .get("mcpServers")
@@ -363,13 +381,34 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
         .transpose()?
         .unwrap_or_default();
 
+    // Apply environment variable overrides for container-friendly deployment
+    let audit = apply_audit_env_overrides(audit);
+
     Ok(Config {
         servers,
         server_auth,
         audit,
-        path: path.clone(),
+        path: source,
         config_hashes,
     })
+}
+
+/// Applies environment variable overrides to `AuditConfig`.
+/// Container deployments can use these to disable audit or redirect paths
+/// without modifying the config JSON.
+fn apply_audit_env_overrides(mut audit: AuditConfig) -> AuditConfig {
+    if let Ok(v) = std::env::var("MCP_AUDIT_ENABLED") {
+        if v.eq_ignore_ascii_case("false") || v == "0" {
+            audit.enabled = false;
+        }
+    }
+    if let Ok(v) = std::env::var("MCP_AUDIT_PATH") {
+        audit.path = Some(v);
+    }
+    if let Ok(v) = std::env::var("MCP_AUDIT_INDEX_PATH") {
+        audit.index_path = Some(v);
+    }
+    audit
 }
 
 fn substitute_env_vars(input: &str) -> String {
@@ -813,5 +852,184 @@ mod tests {
         .unwrap();
         assert!(config.servers.contains_key("active"));
         assert!(!config.servers.contains_key("disabled"));
+    }
+
+    // --- Container-friendly config tests (issue #67) ---
+
+    /// Serialize env var access for tests that set/remove env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_inline_config_via_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let json = r#"{"mcpServers":{"demo":{"url":"https://example.com/mcp"}}}"#;
+        std::env::set_var("MCP_SERVERS_CONFIG", json);
+        // Ensure MCP_CONFIG_PATH doesn't interfere
+        std::env::remove_var("MCP_CONFIG_PATH");
+        // Clear audit overrides
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        let config = load_config().unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert!(config.servers.contains_key("demo"));
+        assert_eq!(config.path, PathBuf::from("<env:MCP_SERVERS_CONFIG>"));
+
+        std::env::remove_var("MCP_SERVERS_CONFIG");
+    }
+
+    #[test]
+    fn test_inline_config_env_var_substitution() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MCP_INLINE_TEST_TOKEN", "tok_abc");
+        let json = r#"{"mcpServers":{"s":{"url":"https://ex.com","headers":{"Authorization":"Bearer ${MCP_INLINE_TEST_TOKEN}"}}}}"#;
+        std::env::set_var("MCP_SERVERS_CONFIG", json);
+        std::env::remove_var("MCP_CONFIG_PATH");
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        let config = load_config().unwrap();
+        match &config.servers["s"] {
+            ServerConfig::Http { headers, .. } => {
+                assert_eq!(headers["Authorization"], "Bearer tok_abc");
+            }
+            _ => panic!("expected Http config"),
+        }
+
+        std::env::remove_var("MCP_SERVERS_CONFIG");
+        std::env::remove_var("MCP_INLINE_TEST_TOKEN");
+    }
+
+    #[test]
+    fn test_inline_config_invalid_json_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MCP_SERVERS_CONFIG", "not json {{{");
+        std::env::remove_var("MCP_CONFIG_PATH");
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        let result = load_config();
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("MCP_SERVERS_CONFIG"),
+            "error should reference source: {err_msg}"
+        );
+
+        std::env::remove_var("MCP_SERVERS_CONFIG");
+    }
+
+    #[test]
+    fn test_inline_config_takes_precedence_over_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Point MCP_CONFIG_PATH to a file with different content
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"{{"mcpServers":{{"file_server":{{"url":"https://file.com"}}}}}}"#
+        )
+        .unwrap();
+        std::env::set_var("MCP_CONFIG_PATH", file.path().to_str().unwrap());
+
+        // Inline config should win
+        std::env::set_var(
+            "MCP_SERVERS_CONFIG",
+            r#"{"mcpServers":{"inline_server":{"url":"https://inline.com"}}}"#,
+        );
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        let config = load_config().unwrap();
+        assert!(config.servers.contains_key("inline_server"));
+        assert!(!config.servers.contains_key("file_server"));
+
+        std::env::remove_var("MCP_SERVERS_CONFIG");
+        std::env::remove_var("MCP_CONFIG_PATH");
+    }
+
+    #[test]
+    fn test_audit_disabled_via_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MCP_AUDIT_ENABLED", "false");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        // Config JSON has audit enabled, but env override disables it
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {},
+                "audit": {"enabled": true}
+            }"#,
+        )
+        .unwrap();
+        assert!(!config.audit.enabled);
+
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+    }
+
+    #[test]
+    fn test_audit_disabled_via_env_zero() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MCP_AUDIT_ENABLED", "0");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        let config = config_from_json(r#"{"mcpServers": {}}"#).unwrap();
+        assert!(!config.audit.enabled);
+
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+    }
+
+    #[test]
+    fn test_audit_enabled_not_overridden_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        let config = config_from_json(r#"{"mcpServers": {}}"#).unwrap();
+        assert!(config.audit.enabled); // default is true
+    }
+
+    #[test]
+    fn test_audit_path_overrides_via_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::set_var("MCP_AUDIT_PATH", "/data/audit/data");
+        std::env::set_var("MCP_AUDIT_INDEX_PATH", "/data/audit/index");
+
+        let config = config_from_json(r#"{"mcpServers": {}}"#).unwrap();
+        assert_eq!(config.audit.path.as_deref(), Some("/data/audit/data"));
+        assert_eq!(
+            config.audit.index_path.as_deref(),
+            Some("/data/audit/index")
+        );
+
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+    }
+
+    #[test]
+    fn test_audit_env_overrides_json_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::set_var("MCP_AUDIT_PATH", "/env/data");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        // JSON sets one path, env overrides it
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {},
+                "audit": {"path": "/json/data"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.audit.path.as_deref(), Some("/env/data"));
+
+        std::env::remove_var("MCP_AUDIT_PATH");
     }
 }
