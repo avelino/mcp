@@ -164,6 +164,115 @@ impl McpClient {
         Ok(result)
     }
 
+    pub async fn list_resources(&self) -> Result<Vec<Resource>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let params = cursor.as_ref().map(|c| json!({"cursor": c}));
+            let req = JsonRpcRequest::new(self.next_id(), "resources/list", params);
+            let resp = self.transport.request(&req).await?;
+
+            if let Some(err) = resp.error {
+                bail!("resources/list failed: {} (code {})", err.message, err.code);
+            }
+
+            let result: ResourcesListResult =
+                serde_json::from_value(resp.result.context("resources/list returned no result")?)
+                    .context("failed to parse resources/list result")?;
+
+            all.extend(result.resources);
+
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(all)
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> Result<ResourceReadResult> {
+        let params = ResourceReadParams {
+            uri: uri.to_string(),
+        };
+
+        let req = JsonRpcRequest::new(
+            self.next_id(),
+            "resources/read",
+            Some(serde_json::to_value(&params)?),
+        );
+
+        let resp = self.transport.request(&req).await?;
+
+        if let Some(err) = resp.error {
+            bail!("resources/read failed: {} (code {})", err.message, err.code);
+        }
+
+        let result: ResourceReadResult =
+            serde_json::from_value(resp.result.context("resources/read returned no result")?)
+                .context("failed to parse resources/read result")?;
+
+        Ok(result)
+    }
+
+    pub async fn list_prompts(&self) -> Result<Vec<Prompt>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let params = cursor.as_ref().map(|c| json!({"cursor": c}));
+            let req = JsonRpcRequest::new(self.next_id(), "prompts/list", params);
+            let resp = self.transport.request(&req).await?;
+
+            if let Some(err) = resp.error {
+                bail!("prompts/list failed: {} (code {})", err.message, err.code);
+            }
+
+            let result: PromptsListResult =
+                serde_json::from_value(resp.result.context("prompts/list returned no result")?)
+                    .context("failed to parse prompts/list result")?;
+
+            all.extend(result.prompts);
+
+            match result.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        Ok(all)
+    }
+
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<PromptGetResult> {
+        let params = PromptGetParams {
+            name: name.to_string(),
+            arguments,
+        };
+
+        let req = JsonRpcRequest::new(
+            self.next_id(),
+            "prompts/get",
+            Some(serde_json::to_value(&params)?),
+        );
+
+        let resp = self.transport.request(&req).await?;
+
+        if let Some(err) = resp.error {
+            bail!("prompts/get failed: {} (code {})", err.message, err.code);
+        }
+
+        let result: PromptGetResult =
+            serde_json::from_value(resp.result.context("prompts/get returned no result")?)
+                .context("failed to parse prompts/get result")?;
+
+        Ok(result)
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.transport.close().await
     }
