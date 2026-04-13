@@ -55,6 +55,10 @@ fn print_usage() {
     eprintln!("  mcp acl classify                    Classify tools as read/write");
     eprintln!("  mcp acl classify --server <alias>   Classify tools for one backend");
     eprintln!("  mcp acl classify --format json      Emit classification as JSON");
+    eprintln!("  mcp acl check --subject <name> --server <alias> --tool <name>");
+    eprintln!("                                      Check ACL decision for a request");
+    eprintln!("  mcp acl check --role <name> --server <alias> --all-tools");
+    eprintln!("                                      Check all tools for a role");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  --json                              Force JSON output");
@@ -129,6 +133,12 @@ async fn run() -> Result<()> {
             success: result.is_ok(),
             error_message: result.as_ref().err().map(|e| format!("{e:#}")),
             arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         });
         return result;
     }
@@ -162,6 +172,12 @@ async fn run() -> Result<()> {
                 success,
                 error_message,
                 arguments: Some(serde_json::json!({"query": query})),
+                acl_decision: None,
+                acl_matched_rule: None,
+                acl_access_kind: None,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
             });
 
             output::print_search_results(&result?, fmt)?;
@@ -188,6 +204,12 @@ async fn run() -> Result<()> {
                 success: result.is_ok(),
                 error_message: result.as_ref().err().map(|e| format!("{e:#}")),
                 arguments: None,
+                acl_decision: None,
+                acl_matched_rule: None,
+                acl_access_kind: None,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
             });
 
             return result;
@@ -210,6 +232,12 @@ async fn run() -> Result<()> {
                 success: result.is_ok(),
                 error_message: result.as_ref().err().map(|e| format!("{e:#}")),
                 arguments: None,
+                acl_decision: None,
+                acl_matched_rule: None,
+                acl_access_kind: None,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
             });
 
             return result;
@@ -218,7 +246,7 @@ async fn run() -> Result<()> {
             return handle_logs_command(&args[1..], &cfg, fmt, db_pool.clone()).await;
         }
         "acl" => {
-            return handle_acl_command(&args[1..], &cfg, fmt).await;
+            return handle_acl_command(&args[1..], &cfg, fmt, &audit).await;
         }
         _ => {}
     }
@@ -301,12 +329,17 @@ async fn handle_acl_command(
     args: &[String],
     cfg: &config::Config,
     fmt: OutputFormat,
+    audit: &Arc<audit::AuditLogger>,
 ) -> Result<()> {
     let sub = args.first().map(String::as_str).ok_or_else(|| {
-        anyhow::anyhow!("usage: mcp acl classify [--server <alias>] [--format table|json]")
+        anyhow::anyhow!(
+            "usage: mcp acl <classify|check> [flags]\n  mcp acl classify [--server <alias>]\n  mcp acl check --subject <name> --server <alias> --tool <name>"
+        )
     })?;
-    if sub != "classify" {
-        bail!("unknown acl subcommand: {sub} (did you mean 'classify'?)");
+    match sub {
+        "classify" => {}
+        "check" => return handle_acl_check(&args[1..], cfg, fmt, audit).await,
+        _ => bail!("unknown acl subcommand: {sub} (available: classify, check)"),
     }
 
     // Parse flags
@@ -453,6 +486,310 @@ async fn handle_acl_command(
     Ok(())
 }
 
+/// `mcp acl check --subject <name> --server <alias> --tool <name> [flags]`
+///
+/// Pure policy check: loads config, synthesizes an identity, and evaluates the
+/// ACL without starting the proxy. Useful for validating rule changes before
+/// rolling them out.
+async fn handle_acl_check(
+    args: &[String],
+    cfg: &config::Config,
+    fmt: OutputFormat,
+    audit: &Arc<audit::AuditLogger>,
+) -> Result<()> {
+    use server_auth::{AclConfig, Decision, ToolContext};
+
+    let usage = "usage: mcp acl check --subject <name> --server <alias> --tool <name> \
+                 [--access read|write] [--role <name>] [--all-tools] [--format json|table]";
+
+    let mut subject: Option<String> = None;
+    let mut server_alias: Option<String> = None;
+    let mut tool_name: Option<String> = None;
+    let mut access_override: Option<String> = None;
+    let mut role_override: Option<String> = None;
+    let mut all_tools = false;
+    let mut format_override: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--subject" => {
+                subject = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--server" => {
+                server_alias = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--tool" => {
+                tool_name = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--access" => {
+                let val = args
+                    .get(i + 1)
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                    .clone();
+                if val != "read" && val != "write" {
+                    bail!("--access must be 'read' or 'write', got '{val}'");
+                }
+                access_override = Some(val);
+                i += 2;
+            }
+            "--role" => {
+                role_override = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--all-tools" => {
+                all_tools = true;
+                i += 1;
+            }
+            "--format" => {
+                format_override = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            other => bail!("unknown flag: {other}\n{usage}"),
+        }
+    }
+
+    let use_json = match format_override.as_deref() {
+        Some("json") => true,
+        Some("table") => false,
+        Some(other) => bail!("unknown --format: {other} (expected 'table' or 'json')"),
+        None => matches!(fmt, OutputFormat::Json),
+    };
+
+    let server = server_alias.ok_or_else(|| anyhow::anyhow!("--server is required\n{usage}"))?;
+    if subject.is_none() && role_override.is_none() {
+        bail!("--subject or --role is required\n{usage}");
+    }
+    if tool_name.is_none() && !all_tools {
+        bail!("--tool or --all-tools is required\n{usage}");
+    }
+
+    // Verify server exists in config.
+    if !cfg.servers.contains_key(&server) {
+        bail!("server \"{server}\" not found in config");
+    }
+
+    let acl_config = &cfg.server_auth.acl;
+
+    // Synthesize identity.
+    let identity = match (&subject, &role_override) {
+        (Some(subj), Some(role)) => {
+            // Subject with a specific role override
+            server_auth::AuthIdentity::new(subj.clone(), vec![role.clone()])
+        }
+        (Some(subj), None) => {
+            // Look up roles from subjects map in ACL config
+            let roles = match acl_config {
+                Some(AclConfig::RoleBased(rbac)) => rbac
+                    .subjects
+                    .get(subj.as_str())
+                    .map(|sc| sc.roles.clone())
+                    .unwrap_or_default(),
+                _ => vec![],
+            };
+            server_auth::AuthIdentity::new(subj.clone(), roles)
+        }
+        (None, Some(role)) => {
+            // Hypothetical role check
+            server_auth::AuthIdentity::new("__check__", vec![role.clone()])
+        }
+        (None, None) => unreachable!(), // validated above
+    };
+
+    // Build the classification for tool(s).
+    #[derive(serde::Serialize)]
+    struct CheckResult {
+        tool: String,
+        decision: &'static str,
+        matched_rule: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        access_evaluated: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        classification_kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        classification_source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        classification_confidence: Option<f32>,
+    }
+
+    fn decision_to_result(tool_name: &str, d: &Decision) -> CheckResult {
+        CheckResult {
+            tool: tool_name.to_string(),
+            decision: if d.allowed { "ALLOW" } else { "DENY" },
+            matched_rule: d.matched_rule.to_string(),
+            access_evaluated: d.access_evaluated.as_ref().map(|a| a.as_str().to_string()),
+            classification_kind: d.classification_kind.map(|k| k.as_str().to_string()),
+            classification_source: d.classification_source.map(|s| s.as_str().to_string()),
+            classification_confidence: d.classification_confidence,
+        }
+    }
+
+    let mut results: Vec<CheckResult> = Vec::new();
+
+    if all_tools {
+        // Connect to backend, list tools, classify, and check each.
+        let server_config = &cfg.servers[&server];
+        if !use_json {
+            eprintln!("[acl] listing tools from {server}...");
+        }
+        let mcp_client = client::McpClient::connect(server_config).await?;
+        let tools = mcp_client.list_tools().await?;
+        let overrides = server_config.tool_acl();
+        let mut cache = classifier_cache::ClassifierCache::load();
+
+        let has_overrides = overrides.is_some_and(|o| !o.read.is_empty() || !o.write.is_empty());
+
+        for tool in &tools {
+            let cls = if has_overrides {
+                classifier::classify(tool, overrides)
+            } else {
+                let key = classifier_cache::cache_key(
+                    &server,
+                    &tool.name,
+                    tool.description.as_deref(),
+                    tool.annotations.as_ref(),
+                );
+                if let Some(cached) = cache.get(&key).cloned() {
+                    cached
+                } else {
+                    let c = classifier::classify(tool, None);
+                    cache.put(key, c.clone());
+                    c
+                }
+            };
+
+            let ctx = ToolContext {
+                server_alias: &server,
+                tool_name: &tool.name,
+                classification: Some(&cls),
+            };
+            let d = server_auth::is_tool_allowed(&identity, &tool.name, acl_config, Some(&ctx));
+            results.push(decision_to_result(&tool.name, &d));
+        }
+        cache.save();
+        let _ = mcp_client.shutdown().await;
+    } else {
+        // Single tool check.
+        let tool = tool_name.unwrap();
+        let cls_kind = match access_override.as_deref() {
+            Some("read") => Some(classifier::Kind::Read),
+            Some("write") => Some(classifier::Kind::Write),
+            _ => None,
+        };
+        let cls = cls_kind.map(|k| classifier::ToolClassification {
+            kind: k,
+            confidence: 1.0,
+            source: classifier::Source::Override,
+            reasons: vec!["--access flag".to_string()],
+        });
+        let ctx = ToolContext {
+            server_alias: &server,
+            tool_name: &tool,
+            classification: cls.as_ref(),
+        };
+
+        let d = server_auth::is_tool_allowed(&identity, &tool, acl_config, Some(&ctx));
+        results.push(decision_to_result(&tool, &d));
+    }
+
+    // Sort results for stable output.
+    results.sort_by(|a, b| a.tool.cmp(&b.tool));
+
+    if use_json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        if all_tools {
+            println!(
+                "{:<40} {:<6} {:<25} {:<6} {:<10} {:<11} CONF",
+                "TOOL", "DECISION", "RULE", "ACCESS", "KIND", "SOURCE"
+            );
+        }
+        for r in &results {
+            let access = r.access_evaluated.as_deref().unwrap_or("-");
+            let kind = r.classification_kind.as_deref().unwrap_or("-");
+            let source = r.classification_source.as_deref().unwrap_or("-");
+            let conf = r
+                .classification_confidence
+                .map(|c| format!("{c:.2}"))
+                .unwrap_or_else(|| "-".to_string());
+
+            if all_tools {
+                println!(
+                    "{:<40} {:<6} {:<25} {:<6} {:<10} {:<11} {}",
+                    r.tool, r.decision, r.matched_rule, access, kind, source, conf
+                );
+            } else {
+                println!(
+                    "{:<6} via {}  access={}  classification={}:{} (confidence {})",
+                    r.decision, r.matched_rule, access, source, kind, conf
+                );
+            }
+        }
+    }
+
+    // Log the check to audit.
+    let identity_str = subject
+        .as_deref()
+        .or(role_override.as_deref())
+        .unwrap_or("unknown");
+    for r in &results {
+        audit.log(audit::AuditEntry {
+            timestamp: chrono::Local::now().to_rfc3339(),
+            source: "cli".to_string(),
+            method: "acl/check".to_string(),
+            tool_name: Some(r.tool.clone()),
+            server_name: Some(server.clone()),
+            identity: identity_str.to_string(),
+            duration_ms: 0,
+            success: true,
+            error_message: None,
+            arguments: None,
+            acl_decision: Some(r.decision.to_lowercase()),
+            acl_matched_rule: Some(r.matched_rule.clone()),
+            acl_access_kind: r.access_evaluated.clone(),
+            classification_kind: r.classification_kind.clone(),
+            classification_source: r.classification_source.clone(),
+            classification_confidence: r.classification_confidence,
+        });
+    }
+
+    // Exit code: for single tool, 1 = deny.
+    if !all_tools && results.first().is_some_and(|r| r.decision == "DENY") {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 async fn handle_server_command(
     args: &[String],
     cfg: &config::Config,
@@ -491,6 +828,12 @@ async fn handle_server_command(
             success,
             error_message,
             arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         });
 
         if let Some(tools) = tools {
@@ -516,6 +859,12 @@ async fn handle_server_command(
             success: true,
             error_message: None,
             arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         });
 
         client.shutdown().await?;
@@ -556,6 +905,12 @@ async fn handle_server_command(
             success,
             error_message,
             arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         });
 
         if let Some(tools) = tools {
@@ -609,6 +964,12 @@ async fn handle_server_command(
         success,
         error_message,
         arguments: log_arguments,
+        acl_decision: None,
+        acl_matched_rule: None,
+        acl_access_kind: None,
+        classification_kind: None,
+        classification_source: None,
+        classification_confidence: None,
     });
 
     if let Some(r) = call_result {
@@ -647,6 +1008,12 @@ async fn handle_add(args: &[String], audit: &Arc<audit::AuditLogger>) -> Result<
             success: result.is_ok(),
             error_message: result.as_ref().err().map(|e| format!("{e:#}")),
             arguments: Some(serde_json::json!({"url": url})),
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         });
 
         return result;
@@ -666,6 +1033,12 @@ async fn handle_add(args: &[String], audit: &Arc<audit::AuditLogger>) -> Result<
         success: result.is_ok(),
         error_message: result.as_ref().err().map(|e| format!("{e:#}")),
         arguments: Some(serde_json::json!({"from": "registry"})),
+        acl_decision: None,
+        acl_matched_rule: None,
+        acl_access_kind: None,
+        classification_kind: None,
+        classification_source: None,
+        classification_confidence: None,
     });
 
     result

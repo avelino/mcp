@@ -126,7 +126,13 @@ type SharedProxy = Arc<Mutex<ProxyServer>>;
 
 /// Result of resolving a `tools/call` request: server name, original tool
 /// name, arguments, and (optionally) an already-connected client.
-type ResolvedCall = (String, String, Value, Option<Arc<McpClient>>);
+type ResolvedCall = (
+    String,
+    String,
+    Value,
+    Option<Arc<McpClient>>,
+    server_auth::Decision,
+);
 
 struct ProxyServer {
     configs: HashMap<String, ServerConfig>,
@@ -520,7 +526,7 @@ impl ProxyServer {
         params: Option<Value>,
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
-    ) -> std::result::Result<(String, String, Value), JsonRpcResponse> {
+    ) -> std::result::Result<(String, String, Value, server_auth::Decision), JsonRpcResponse> {
         let params = match params {
             Some(p) => p,
             None => {
@@ -563,7 +569,8 @@ impl ProxyServer {
             classification,
         };
 
-        if !server_auth::is_tool_allowed(identity, &tool_name, acl, Some(&ctx)) {
+        let decision = server_auth::is_tool_allowed(identity, &tool_name, acl, Some(&ctx));
+        if !decision.allowed {
             return Err(JsonRpcResponse::error(
                 id.clone(),
                 -32603,
@@ -574,7 +581,7 @@ impl ProxyServer {
             ));
         }
 
-        Ok((server_name, original_name, arguments))
+        Ok((server_name, original_name, arguments, decision))
     }
 
     /// Drain all connected backends and return them so they can be shut down
@@ -696,7 +703,26 @@ async fn discover_pending_backends(proxy: &SharedProxy) {
             }
             Ok(Err(e)) => {
                 let mut p = proxy.lock().await;
-                eprintln!("[serve] {name}: failed to discover: {e:#}");
+                let msg = format!("failed to discover: {e:#}");
+                eprintln!("[serve] {name}: {msg}");
+                p.audit.log(AuditEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    source: "serve:discovery".to_string(),
+                    method: "discovery/failure".to_string(),
+                    tool_name: None,
+                    server_name: Some(name.clone()),
+                    identity: "system".to_string(),
+                    duration_ms: 0,
+                    success: false,
+                    error_message: Some(msg),
+                    arguments: None,
+                    acl_decision: None,
+                    acl_matched_rule: None,
+                    acl_access_kind: None,
+                    classification_kind: None,
+                    classification_source: None,
+                    classification_confidence: None,
+                });
                 p.discovery_failures
                     .entry(name)
                     .or_insert_with(DiscoveryFailure::new)
@@ -704,10 +730,26 @@ async fn discover_pending_backends(proxy: &SharedProxy) {
             }
             Err(_) => {
                 let mut p = proxy.lock().await;
-                eprintln!(
-                    "[serve] {name}: discovery timed out ({}s)",
-                    discovery_timeout.as_secs()
-                );
+                let msg = format!("discovery timed out ({}s)", discovery_timeout.as_secs());
+                eprintln!("[serve] {name}: {msg}");
+                p.audit.log(AuditEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    source: "serve:discovery".to_string(),
+                    method: "discovery/timeout".to_string(),
+                    tool_name: None,
+                    server_name: Some(name.clone()),
+                    identity: "system".to_string(),
+                    duration_ms: discovery_timeout.as_millis() as u64,
+                    success: false,
+                    error_message: Some(msg),
+                    arguments: None,
+                    acl_decision: None,
+                    acl_matched_rule: None,
+                    acl_access_kind: None,
+                    classification_kind: None,
+                    classification_source: None,
+                    classification_confidence: None,
+                });
                 p.discovery_failures
                     .entry(name)
                     .or_insert_with(DiscoveryFailure::new)
@@ -762,6 +804,7 @@ async fn dispatch_request(
     let audit_logger: Arc<AuditLogger>;
     let mut tool_name_for_audit: Option<String> = None;
     let mut server_name_for_audit: Option<String> = None;
+    let mut decision_for_audit: Option<server_auth::Decision> = None;
 
     let response = match req.method.as_str() {
         "initialize" => {
@@ -783,20 +826,56 @@ async fn dispatch_request(
             }
             let tools_snapshot: Vec<Value> = {
                 let p = proxy.lock().await;
-                p.tools
-                    .iter()
-                    .filter(|t| {
-                        let ctx = p.tool_map.get(&t.name).map(|(server, orig)| {
-                            server_auth::ToolContext {
+                let mut allowed = Vec::new();
+                for t in &p.tools {
+                    let ctx =
+                        p.tool_map
+                            .get(&t.name)
+                            .map(|(server, orig)| server_auth::ToolContext {
                                 server_alias: server.as_str(),
                                 tool_name: orig.as_str(),
                                 classification: p.classifications.get(&t.name),
-                            }
+                            });
+                    let decision =
+                        server_auth::is_tool_allowed(identity, &t.name, acl, ctx.as_ref());
+                    if decision.allowed {
+                        allowed.push(serde_json::to_value(t).unwrap());
+                    } else {
+                        // Log each filtered-out tool so operators can see
+                        // what was hidden from a given identity.
+                        let (server_name, _) = p
+                            .tool_map
+                            .get(&t.name)
+                            .map(|(s, _)| (Some(s.clone()), ()))
+                            .unwrap_or((None, ()));
+                        p.audit.log(AuditEntry {
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            source: source.to_string(),
+                            method: "tools/list:filtered".to_string(),
+                            tool_name: Some(t.name.clone()),
+                            server_name,
+                            identity: identity.subject.clone(),
+                            duration_ms: 0,
+                            success: true,
+                            error_message: None,
+                            arguments: None,
+                            acl_decision: Some("deny".to_string()),
+                            acl_matched_rule: Some(decision.matched_rule.to_string()),
+                            acl_access_kind: decision
+                                .access_evaluated
+                                .as_ref()
+                                .map(|a| a.as_str().to_string()),
+                            classification_kind: decision
+                                .classification_kind
+                                .map(|k| k.as_str().to_string()),
+                            classification_source: decision
+                                .classification_source
+                                .map(|s| s.as_str().to_string()),
+                            classification_confidence: decision.classification_confidence,
                         });
-                        server_auth::is_tool_allowed(identity, &t.name, acl, ctx.as_ref())
-                    })
-                    .map(|t| serde_json::to_value(t).unwrap())
-                    .collect()
+                    }
+                }
+                allowed
             };
             JsonRpcResponse::success(id, json!({ "tools": tools_snapshot }))
         }
@@ -828,13 +907,13 @@ async fn dispatch_request(
             let resolved: std::result::Result<ResolvedCall, JsonRpcResponse> = {
                 let mut p = proxy.lock().await;
                 match p.resolve_tool_call(&id, req.params.clone(), identity, acl) {
-                    Ok((server, orig, args)) => {
+                    Ok((server, orig, args, decision)) => {
                         let client = p.try_get_client(&server);
                         // Refine the audit entry now that we know the
                         // namespaced tool resolves to a real backend.
                         tool_name_for_audit = Some(format!("{server}{SEPARATOR}{orig}"));
                         server_name_for_audit = Some(server.clone());
-                        Ok((server, orig, args, client))
+                        Ok((server, orig, args, client, decision))
                     }
                     Err(resp) => Err(resp),
                 }
@@ -842,7 +921,8 @@ async fn dispatch_request(
 
             match resolved {
                 Err(resp) => resp,
-                Ok((server, original, args, maybe_client)) => {
+                Ok((server, original, args, maybe_client, acl_decision)) => {
+                    decision_for_audit = Some(acl_decision);
                     // Phase 2: ensure connected (without holding the proxy
                     // lock during the connect itself).
                     let client_result: Result<Arc<McpClient>> = match maybe_client {
@@ -888,6 +968,7 @@ async fn dispatch_request(
             server_name: server_name_for_audit,
             identity,
             start,
+            decision: decision_for_audit,
         },
         response,
     )
@@ -901,9 +982,23 @@ struct AuditCtx<'a> {
     server_name: Option<String>,
     identity: &'a AuthIdentity,
     start: std::time::Instant,
+    decision: Option<server_auth::Decision>,
 }
 
 fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> JsonRpcResponse {
+    let (acl_decision, acl_matched_rule, acl_access_kind, cls_kind, cls_source, cls_conf) =
+        match &ctx.decision {
+            Some(d) => (
+                Some(if d.allowed { "allow" } else { "deny" }.to_string()),
+                Some(d.matched_rule.to_string()),
+                d.access_evaluated.as_ref().map(|a| a.as_str().to_string()),
+                d.classification_kind.map(|k| k.as_str().to_string()),
+                d.classification_source.map(|s| s.as_str().to_string()),
+                d.classification_confidence,
+            ),
+            None => (None, None, None, None, None, None),
+        };
+
     ctx.audit.log(AuditEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         source: ctx.source.to_string(),
@@ -915,6 +1010,12 @@ fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> JsonRpcResponse
         success: response.error.is_none(),
         error_message: response.error.as_ref().map(|e| e.message.clone()),
         arguments: None,
+        acl_decision,
+        acl_matched_rule,
+        acl_access_kind,
+        classification_kind: cls_kind,
+        classification_source: cls_source,
+        classification_confidence: cls_conf,
     });
     response
 }
@@ -1111,12 +1212,36 @@ fn extract_credentials(headers: &HeaderMap) -> Credentials {
 }
 
 /// Authenticate an HTTP request. Returns identity on success, or a 401 response.
+/// Logs authentication failures to the audit log.
 async fn authenticate_request(
     state: &AppState,
     headers: &HeaderMap,
+    source: &str,
 ) -> Result<AuthIdentity, (StatusCode, Json<Value>)> {
     let creds = extract_credentials(headers);
     state.auth_provider.authenticate(&creds).await.map_err(|e| {
+        // Log the authentication failure to audit.
+        // Use blocking_lock since we're inside a sync closure (map_err).
+        // This is safe — the proxy lock is never held long enough to cause issues.
+        let audit = Arc::clone(&state.proxy.blocking_lock().audit);
+        audit.log(AuditEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source: source.to_string(),
+            method: "auth/failure".to_string(),
+            tool_name: None,
+            server_name: None,
+            identity: "anonymous".to_string(),
+            duration_ms: 0,
+            success: false,
+            error_message: Some(format!("authentication failed: {e}")),
+            arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+        });
         let err =
             JsonRpcResponse::error(Value::Null, -32000, &format!("authentication failed: {e}"));
         (StatusCode::UNAUTHORIZED, Json(json!(err)))
@@ -1376,7 +1501,7 @@ async fn mcp_handler(
     }
 
     // Authenticate
-    let identity = match authenticate_request(&state, &headers).await {
+    let identity = match authenticate_request(&state, &headers, "serve:http").await {
         Ok(id) => id,
         Err(resp) => return resp,
     };
@@ -1476,7 +1601,7 @@ async fn mcp_handler(
 // and receives JSON-RPC responses as SSE `message` events.
 async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Authenticate
-    if let Err(resp) = authenticate_request(&state, &headers).await {
+    if let Err(resp) = authenticate_request(&state, &headers, "serve:http").await {
         return resp.into_response();
     }
 

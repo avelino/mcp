@@ -989,6 +989,12 @@ mod tests {
                 Some("connection timeout".to_string())
             },
             arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         }
     }
 

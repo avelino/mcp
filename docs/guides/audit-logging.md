@@ -25,6 +25,15 @@ Every entry records:
 | `duration_ms` | How long it took |
 | `success` | Whether it worked |
 | `error_message` | Error details when it failed |
+| `acl_decision` | `allow` or `deny` (proxy `tools/call` only) |
+| `acl_matched_rule` | Which rule decided: `dev[1]`, `alice.extra[0]`, `default`, `legacy[3]`, `no-acl` |
+| `acl_access_kind` | Effective access evaluated: `read`, `write`, or `*` |
+| `classification_kind` | Tool classification: `read`, `write`, or `ambiguous` |
+| `classification_source` | How it was classified: `override`, `annotation`, `classifier`, or `fallback` |
+| `classification_confidence` | Classifier confidence (0.00–1.00) |
+
+The ACL fields are only present on proxy `tools/call` entries. CLI commands
+and other methods omit them (the fields are absent, not null).
 
 ## What gets logged
 
@@ -102,6 +111,15 @@ mcp logs --errors --json | jq '.[].error_message'
 
 # Count calls per server
 mcp logs --json | jq 'group_by(.server_name) | map({server: .[0].server_name, count: length})'
+
+# Denied write requests
+mcp logs --json | jq '.[] | select(.acl_decision=="deny" and .acl_access_kind=="write")'
+
+# Low-confidence classifications that were allowed
+mcp logs --json | jq '.[] | select(.classification_confidence < 0.5 and .acl_decision=="allow")'
+
+# Which rules are denying requests
+mcp logs --json | jq '[.[] | select(.acl_decision=="deny")] | group_by(.acl_matched_rule) | map({rule: .[0].acl_matched_rule, count: length})'
 ```
 
 ## Follow mode
