@@ -687,12 +687,17 @@ async fn handle_acl_check(
                 }
             };
 
+            // Legacy ACL matches namespaced tools (e.g. "sentry__search_issues"),
+            // while RBAC matches un-namespaced tool names. Pass the namespaced
+            // form to is_tool_allowed (legacy rules match on it; RBAC ToolContext
+            // uses the original tool_name field for grant matching).
+            let namespaced = format!("{server}__{}", tool.name);
             let ctx = ToolContext {
                 server_alias: &server,
                 tool_name: &tool.name,
                 classification: Some(&cls),
             };
-            let d = server_auth::is_tool_allowed(&identity, &tool.name, acl_config, Some(&ctx));
+            let d = server_auth::is_tool_allowed(&identity, &namespaced, acl_config, Some(&ctx));
             results.push(decision_to_result(&tool.name, &d));
         }
         cache.save();
@@ -700,24 +705,52 @@ async fn handle_acl_check(
     } else {
         // Single tool check.
         let tool = tool_name.unwrap();
-        let cls_kind = match access_override.as_deref() {
-            Some("read") => Some(classifier::Kind::Read),
-            Some("write") => Some(classifier::Kind::Write),
-            _ => None,
+        let cls = match access_override.as_deref() {
+            Some("read") => Some(classifier::ToolClassification {
+                kind: classifier::Kind::Read,
+                confidence: 1.0,
+                source: classifier::Source::Override,
+                reasons: vec!["--access flag".to_string()],
+            }),
+            Some("write") => Some(classifier::ToolClassification {
+                kind: classifier::Kind::Write,
+                confidence: 1.0,
+                source: classifier::Source::Override,
+                reasons: vec!["--access flag".to_string()],
+            }),
+            _ => {
+                // No --access given: connect to backend and classify the tool
+                // so grants with access=read/write can match correctly.
+                let server_config = &cfg.servers[&server];
+                if !use_json {
+                    eprintln!("[acl] connecting to {server} to classify {tool}...");
+                }
+                match client::McpClient::connect(server_config).await {
+                    Ok(mcp_client) => {
+                        let tools = mcp_client.list_tools().await.unwrap_or_default();
+                        let _ = mcp_client.shutdown().await;
+                        tools
+                            .iter()
+                            .find(|t| t.name == tool)
+                            .map(|t| classifier::classify(t, server_config.tool_acl()))
+                    }
+                    Err(e) => {
+                        if !use_json {
+                            eprintln!("[acl] warning: could not connect to classify tool: {e:#}");
+                        }
+                        None
+                    }
+                }
+            }
         };
-        let cls = cls_kind.map(|k| classifier::ToolClassification {
-            kind: k,
-            confidence: 1.0,
-            source: classifier::Source::Override,
-            reasons: vec!["--access flag".to_string()],
-        });
+        let namespaced = format!("{server}__{tool}");
         let ctx = ToolContext {
             server_alias: &server,
             tool_name: &tool,
             classification: cls.as_ref(),
         };
 
-        let d = server_auth::is_tool_allowed(&identity, &tool, acl_config, Some(&ctx));
+        let d = server_auth::is_tool_allowed(&identity, &namespaced, acl_config, Some(&ctx));
         results.push(decision_to_result(&tool, &d));
     }
 

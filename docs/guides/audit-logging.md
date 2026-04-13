@@ -25,15 +25,16 @@ Every entry records:
 | `duration_ms` | How long it took |
 | `success` | Whether it worked |
 | `error_message` | Error details when it failed |
-| `acl_decision` | `allow` or `deny` (proxy `tools/call` only) |
-| `acl_matched_rule` | Which rule decided: `dev[1]`, `alice.extra[0]`, `default`, `legacy[3]`, `no-acl` |
+| `acl_decision` | `allow` or `deny` when ACL evaluation is performed |
+| `acl_matched_rule` | Which rule decided: `dev[1]`, `alice.extra[0]`, `default`, `legacy[3]`, `legacy:default`, `no-acl` |
 | `acl_access_kind` | Effective access evaluated: `read`, `write`, or `*` |
 | `classification_kind` | Tool classification: `read`, `write`, or `ambiguous` |
 | `classification_source` | How it was classified: `override`, `annotation`, `classifier`, or `fallback` |
 | `classification_confidence` | Classifier confidence (0.00–1.00) |
 
-The ACL fields are only present on proxy `tools/call` entries. CLI commands
-and other methods omit them (the fields are absent, not null).
+ACL/classification fields are present on entries that perform ACL checks:
+proxy `tools/call`, `tools/list:filtered`, and CLI `acl/check`. Other entries
+omit them (the fields are absent, not null).
 
 ## What gets logged
 

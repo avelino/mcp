@@ -371,7 +371,7 @@ mcp acl check --subject alice --server github --all-tools --format json
 - `--subject <name>` — subject to check (looks up roles from `subjects` map in ACL config)
 - `--server <alias>` — backend server alias (required)
 - `--tool <name>` — single tool to check (required unless `--all-tools`)
-- `--access read|write` — override the tool classification for single-tool checks
+- `--access read|write` — override the tool classification (if omitted, the CLI connects to the backend to classify the tool automatically)
 - `--role <name>` — check a hypothetical role (creates a synthetic identity)
 - `--all-tools` — connect to the backend, list all tools, and check each one
 - `--format table|json` — override the auto-detected output format
