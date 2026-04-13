@@ -83,10 +83,8 @@ pub struct Grant {
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub resources: Vec<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     pub prompts: Vec<String>,
     #[serde(default)]
     pub deny: bool,
@@ -179,6 +177,16 @@ pub struct ToolContext<'a> {
     pub server_alias: &'a str,
     pub tool_name: &'a str,
     pub classification: Option<&'a ToolClassification>,
+}
+
+pub struct ResourceContext<'a> {
+    pub server_alias: &'a str,
+    pub resource_uri: &'a str,
+}
+
+pub struct PromptContext<'a> {
+    pub server_alias: &'a str,
+    pub prompt_name: &'a str,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +461,253 @@ fn matches_tool_grant(grant: &Grant, tool_name: &str) -> bool {
         .tools
         .iter()
         .any(|pattern| glob_match(pattern, tool_name))
+}
+
+fn matches_resource_grant(grant: &Grant, resource_uri: &str) -> bool {
+    if grant.resources.is_empty() {
+        return true;
+    }
+    grant
+        .resources
+        .iter()
+        .any(|pattern| glob_match(pattern, resource_uri))
+}
+
+fn matches_prompt_grant(grant: &Grant, prompt_name: &str) -> bool {
+    if grant.prompts.is_empty() {
+        return true;
+    }
+    grant
+        .prompts
+        .iter()
+        .any(|pattern| glob_match(pattern, prompt_name))
+}
+
+/// Check if a grant's access level covers read (for resources/prompts).
+fn grant_covers_read(grant: &Grant) -> bool {
+    matches!(grant.access, AccessLevel::All | AccessLevel::Read)
+}
+
+/// Check if a tool is allowed for the given identity.
+/// Legacy schema uses first-match-wins; role-based uses union evaluation.
+/// Returns a structured `Decision` with provenance information.
+pub fn is_resource_allowed(
+    identity: &AuthIdentity,
+    _resource_uri: &str,
+    acl: &AclConfig,
+    ctx: Option<&ResourceContext>,
+) -> Decision {
+    match acl {
+        AclConfig::Legacy(legacy) => {
+            // Legacy: deny read unless default is allow.
+            Decision {
+                allowed: legacy.default == AclPolicy::Allow,
+                matched_rule: MatchedRule::LegacyDefault,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+                access_evaluated: Some(AccessLevel::Read),
+            }
+        }
+        AclConfig::RoleBased(rbac) => match ctx {
+            Some(c) => is_resource_allowed_rbac(identity, c, rbac),
+            None => Decision {
+                allowed: rbac.default == AclPolicy::Allow,
+                matched_rule: MatchedRule::RbacDefault,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+                access_evaluated: None,
+            },
+        },
+    }
+}
+
+pub fn is_prompt_allowed(
+    identity: &AuthIdentity,
+    _prompt_name: &str,
+    acl: &AclConfig,
+    ctx: Option<&PromptContext>,
+) -> Decision {
+    match acl {
+        AclConfig::Legacy(legacy) => {
+            // Legacy: deny get unless default is allow.
+            Decision {
+                allowed: legacy.default == AclPolicy::Allow,
+                matched_rule: MatchedRule::LegacyDefault,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+                access_evaluated: Some(AccessLevel::Read),
+            }
+        }
+        AclConfig::RoleBased(rbac) => match ctx {
+            Some(c) => is_prompt_allowed_rbac(identity, c, rbac),
+            None => Decision {
+                allowed: rbac.default == AclPolicy::Allow,
+                matched_rule: MatchedRule::RbacDefault,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+                access_evaluated: None,
+            },
+        },
+    }
+}
+
+fn is_resource_allowed_rbac(
+    identity: &AuthIdentity,
+    ctx: &ResourceContext,
+    acl: &RoleBasedAclConfig,
+) -> Decision {
+    let (role_names, extra_grants) = resolve_subject(identity, acl);
+
+    let mut all_grants: Vec<TaggedGrant> = Vec::new();
+    for role_name in &role_names {
+        if let Some(grants) = acl.roles.get(role_name) {
+            for (i, grant) in grants.iter().enumerate() {
+                all_grants.push(TaggedGrant {
+                    grant,
+                    origin: MatchedRule::RoleGrant {
+                        role: role_name.clone(),
+                        index: i,
+                    },
+                });
+            }
+        }
+    }
+    for (i, grant) in extra_grants.iter().enumerate() {
+        all_grants.push(TaggedGrant {
+            grant,
+            origin: MatchedRule::SubjectExtra {
+                subject: identity.subject.clone(),
+                index: i,
+            },
+        });
+    }
+
+    let matching: Vec<&TaggedGrant> = all_grants
+        .iter()
+        .filter(|tg| {
+            matches_server(tg.grant, ctx.server_alias)
+                && matches_resource_grant(tg.grant, ctx.resource_uri)
+        })
+        .collect();
+
+    // Deny always wins.
+    if let Some(tg) = matching
+        .iter()
+        .find(|tg| tg.grant.deny && grant_covers_read(tg.grant))
+    {
+        return Decision {
+            allowed: false,
+            matched_rule: tg.origin.clone(),
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+            access_evaluated: Some(tg.grant.access.clone()),
+        };
+    }
+
+    if let Some(tg) = matching
+        .iter()
+        .find(|tg| !tg.grant.deny && grant_covers_read(tg.grant))
+    {
+        return Decision {
+            allowed: true,
+            matched_rule: tg.origin.clone(),
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+            access_evaluated: Some(tg.grant.access.clone()),
+        };
+    }
+
+    Decision {
+        allowed: acl.default == AclPolicy::Allow,
+        matched_rule: MatchedRule::RbacDefault,
+        classification_kind: None,
+        classification_source: None,
+        classification_confidence: None,
+        access_evaluated: None,
+    }
+}
+
+fn is_prompt_allowed_rbac(
+    identity: &AuthIdentity,
+    ctx: &PromptContext,
+    acl: &RoleBasedAclConfig,
+) -> Decision {
+    let (role_names, extra_grants) = resolve_subject(identity, acl);
+
+    let mut all_grants: Vec<TaggedGrant> = Vec::new();
+    for role_name in &role_names {
+        if let Some(grants) = acl.roles.get(role_name) {
+            for (i, grant) in grants.iter().enumerate() {
+                all_grants.push(TaggedGrant {
+                    grant,
+                    origin: MatchedRule::RoleGrant {
+                        role: role_name.clone(),
+                        index: i,
+                    },
+                });
+            }
+        }
+    }
+    for (i, grant) in extra_grants.iter().enumerate() {
+        all_grants.push(TaggedGrant {
+            grant,
+            origin: MatchedRule::SubjectExtra {
+                subject: identity.subject.clone(),
+                index: i,
+            },
+        });
+    }
+
+    let matching: Vec<&TaggedGrant> = all_grants
+        .iter()
+        .filter(|tg| {
+            matches_server(tg.grant, ctx.server_alias)
+                && matches_prompt_grant(tg.grant, ctx.prompt_name)
+        })
+        .collect();
+
+    if let Some(tg) = matching
+        .iter()
+        .find(|tg| tg.grant.deny && grant_covers_read(tg.grant))
+    {
+        return Decision {
+            allowed: false,
+            matched_rule: tg.origin.clone(),
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+            access_evaluated: Some(tg.grant.access.clone()),
+        };
+    }
+
+    if let Some(tg) = matching
+        .iter()
+        .find(|tg| !tg.grant.deny && grant_covers_read(tg.grant))
+    {
+        return Decision {
+            allowed: true,
+            matched_rule: tg.origin.clone(),
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+            access_evaluated: Some(tg.grant.access.clone()),
+        };
+    }
+
+    Decision {
+        allowed: acl.default == AclPolicy::Allow,
+        matched_rule: MatchedRule::RbacDefault,
+        classification_kind: None,
+        classification_source: None,
+        classification_confidence: None,
+        access_evaluated: None,
+    }
 }
 
 /// Check if a grant's access level covers the tool's classified kind (for allow grants).
@@ -2201,5 +2456,395 @@ mod tests {
         assert_eq!(AccessLevel::Read.as_str(), "read");
         assert_eq!(AccessLevel::Write.as_str(), "write");
         assert_eq!(AccessLevel::All.as_str(), "*");
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource ACL tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matches_resource_grant_empty_allows_all() {
+        let grant = Grant {
+            server: ServerPattern::Single("sentry".to_string()),
+            access: AccessLevel::Read,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![],
+            deny: false,
+        };
+        assert!(matches_resource_grant(&grant, "issue://123"));
+        assert!(matches_resource_grant(&grant, "project://foo"));
+    }
+
+    #[test]
+    fn test_matches_resource_grant_glob_restricts() {
+        let grant = Grant {
+            server: ServerPattern::Single("sentry".to_string()),
+            access: AccessLevel::Read,
+            tools: vec![],
+            resources: vec!["issue://*".to_string()],
+            prompts: vec![],
+            deny: false,
+        };
+        assert!(matches_resource_grant(&grant, "issue://123"));
+        assert!(matches_resource_grant(&grant, "issue://abc"));
+        assert!(!matches_resource_grant(&grant, "project://foo"));
+    }
+
+    #[test]
+    fn test_matches_resource_grant_multiple_globs() {
+        let grant = Grant {
+            server: ServerPattern::Single("sentry".to_string()),
+            access: AccessLevel::Read,
+            tools: vec![],
+            resources: vec!["issue://*".to_string(), "project://*".to_string()],
+            prompts: vec![],
+            deny: false,
+        };
+        assert!(matches_resource_grant(&grant, "issue://123"));
+        assert!(matches_resource_grant(&grant, "project://foo"));
+        assert!(!matches_resource_grant(&grant, "user://bar"));
+    }
+
+    #[test]
+    fn test_matches_prompt_grant_empty_allows_all() {
+        let grant = Grant {
+            server: ServerPattern::Single("ai".to_string()),
+            access: AccessLevel::Read,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![],
+            deny: false,
+        };
+        assert!(matches_prompt_grant(&grant, "summarize"));
+        assert!(matches_prompt_grant(&grant, "translate"));
+    }
+
+    #[test]
+    fn test_matches_prompt_grant_glob_restricts() {
+        let grant = Grant {
+            server: ServerPattern::Single("ai".to_string()),
+            access: AccessLevel::Read,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec!["summarize*".to_string()],
+            deny: false,
+        };
+        assert!(matches_prompt_grant(&grant, "summarize"));
+        assert!(matches_prompt_grant(&grant, "summarize_long"));
+        assert!(!matches_prompt_grant(&grant, "translate"));
+    }
+
+    fn rbac_with_resource_grants() -> AclConfig {
+        let json = serde_json::json!({
+            "default": "deny",
+            "roles": {
+                "reader": [
+                    {
+                        "server": "sentry",
+                        "access": "read",
+                        "resources": ["issue://*"]
+                    }
+                ],
+                "all_access": [
+                    {
+                        "server": "*",
+                        "access": "*"
+                    }
+                ]
+            },
+            "subjects": {
+                "bob": { "roles": ["reader"] },
+                "alice": { "roles": ["all_access"] }
+            }
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_resource_allowed_rbac_matching_grant() {
+        let acl = rbac_with_resource_grants();
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "issue://123",
+        };
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn test_resource_denied_rbac_non_matching_uri() {
+        let acl = rbac_with_resource_grants();
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "project://foo",
+        };
+        let d = is_resource_allowed(&bob(), "sentry__project://foo", &acl, Some(&ctx));
+        assert!(!d.allowed);
+        assert_eq!(d.matched_rule, MatchedRule::RbacDefault);
+    }
+
+    #[test]
+    fn test_resource_allowed_rbac_wildcard_server() {
+        let acl = rbac_with_resource_grants();
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "project://foo",
+        };
+        let d = is_resource_allowed(&alice(), "sentry__project://foo", &acl, Some(&ctx));
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn test_resource_denied_rbac_unknown_subject() {
+        let acl = rbac_with_resource_grants();
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "issue://123",
+        };
+        let unknown = AuthIdentity::new("charlie", vec![]);
+        let d = is_resource_allowed(&unknown, "sentry__issue://123", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_resource_deny_grant_wins() {
+        let json = serde_json::json!({
+            "default": "allow",
+            "roles": {
+                "restricted": [
+                    {
+                        "server": "sentry",
+                        "access": "read",
+                        "resources": ["secret://*"],
+                        "deny": true
+                    },
+                    {
+                        "server": "sentry",
+                        "access": "read"
+                    }
+                ]
+            },
+            "subjects": {
+                "bob": { "roles": ["restricted"] }
+            }
+        });
+        let acl: AclConfig = serde_json::from_value(json).unwrap();
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "secret://key",
+        };
+        let d = is_resource_allowed(&bob(), "sentry__secret://key", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_resource_legacy_deny_default() {
+        let acl = AclConfig::legacy(AclPolicy::Deny, vec![]);
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "issue://123",
+        };
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        assert!(!d.allowed);
+        assert_eq!(d.matched_rule, MatchedRule::LegacyDefault);
+    }
+
+    #[test]
+    fn test_resource_legacy_allow_default() {
+        let acl = AclConfig::legacy(AclPolicy::Allow, vec![]);
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "issue://123",
+        };
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn test_resource_no_server_escalation() {
+        let acl = rbac_with_resource_grants();
+        // bob has reader on sentry, not on github
+        let ctx = ResourceContext {
+            server_alias: "github",
+            resource_uri: "issue://123",
+        };
+        let d = is_resource_allowed(&bob(), "github__issue://123", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_resource_write_only_grant_denies_read() {
+        let json = serde_json::json!({
+            "default": "deny",
+            "roles": {
+                "writer": [
+                    {
+                        "server": "sentry",
+                        "access": "write",
+                        "resources": ["issue://*"]
+                    }
+                ]
+            },
+            "subjects": {
+                "bob": { "roles": ["writer"] }
+            }
+        });
+        let acl: AclConfig = serde_json::from_value(json).unwrap();
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "issue://123",
+        };
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        // write-only grant should NOT cover read access for resources
+        assert!(!d.allowed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompt ACL tests
+    // -----------------------------------------------------------------------
+
+    fn rbac_with_prompt_grants() -> AclConfig {
+        let json = serde_json::json!({
+            "default": "deny",
+            "roles": {
+                "prompter": [
+                    {
+                        "server": "ai",
+                        "access": "read",
+                        "prompts": ["summarize*"]
+                    }
+                ]
+            },
+            "subjects": {
+                "bob": { "roles": ["prompter"] }
+            }
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_prompt_allowed_rbac_matching_grant() {
+        let acl = rbac_with_prompt_grants();
+        let ctx = PromptContext {
+            server_alias: "ai",
+            prompt_name: "summarize",
+        };
+        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx));
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_allowed_rbac_glob_match() {
+        let acl = rbac_with_prompt_grants();
+        let ctx = PromptContext {
+            server_alias: "ai",
+            prompt_name: "summarize_long",
+        };
+        let d = is_prompt_allowed(&bob(), "ai__summarize_long", &acl, Some(&ctx));
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_denied_rbac_non_matching() {
+        let acl = rbac_with_prompt_grants();
+        let ctx = PromptContext {
+            server_alias: "ai",
+            prompt_name: "translate",
+        };
+        let d = is_prompt_allowed(&bob(), "ai__translate", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_denied_rbac_wrong_server() {
+        let acl = rbac_with_prompt_grants();
+        let ctx = PromptContext {
+            server_alias: "other",
+            prompt_name: "summarize",
+        };
+        let d = is_prompt_allowed(&bob(), "other__summarize", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_deny_grant_wins() {
+        let json = serde_json::json!({
+            "default": "allow",
+            "roles": {
+                "restricted": [
+                    {
+                        "server": "ai",
+                        "access": "read",
+                        "prompts": ["dangerous*"],
+                        "deny": true
+                    },
+                    {
+                        "server": "ai",
+                        "access": "read"
+                    }
+                ]
+            },
+            "subjects": {
+                "bob": { "roles": ["restricted"] }
+            }
+        });
+        let acl: AclConfig = serde_json::from_value(json).unwrap();
+        let ctx = PromptContext {
+            server_alias: "ai",
+            prompt_name: "dangerous_prompt",
+        };
+        let d = is_prompt_allowed(&bob(), "ai__dangerous_prompt", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_legacy_deny_default() {
+        let acl = AclConfig::legacy(AclPolicy::Deny, vec![]);
+        let ctx = PromptContext {
+            server_alias: "ai",
+            prompt_name: "summarize",
+        };
+        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_legacy_allow_default() {
+        let acl = AclConfig::legacy(AclPolicy::Allow, vec![]);
+        let ctx = PromptContext {
+            server_alias: "ai",
+            prompt_name: "summarize",
+        };
+        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx));
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_no_server_escalation() {
+        let acl = rbac_with_prompt_grants();
+        let ctx = PromptContext {
+            server_alias: "other",
+            prompt_name: "summarize",
+        };
+        let d = is_prompt_allowed(&bob(), "other__summarize", &acl, Some(&ctx));
+        assert!(!d.allowed);
+    }
+
+    #[test]
+    fn test_grant_covers_read_access_levels() {
+        let mut grant = Grant {
+            server: ServerPattern::Single("x".to_string()),
+            access: AccessLevel::Read,
+            tools: vec![],
+            resources: vec![],
+            prompts: vec![],
+            deny: false,
+        };
+        assert!(grant_covers_read(&grant));
+        grant.access = AccessLevel::All;
+        assert!(grant_covers_read(&grant));
+        grant.access = AccessLevel::Write;
+        assert!(!grant_covers_read(&grant));
     }
 }

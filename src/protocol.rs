@@ -185,6 +185,95 @@ pub struct Content {
     pub mime_type: Option<String>,
 }
 
+// --- MCP Resources ---
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Resource {
+    pub uri: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResourcesListResult {
+    pub resources: Vec<Resource>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResourceReadParams {
+    pub uri: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ResourceContent {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ResourceReadResult {
+    pub contents: Vec<ResourceContent>,
+}
+
+// --- MCP Prompts ---
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Prompt {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<PromptArgument>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptsListResult {
+    pub prompts: Vec<Prompt>,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptGetParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PromptMessage {
+    pub role: String,
+    pub content: Content,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PromptGetResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub messages: Vec<PromptMessage>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

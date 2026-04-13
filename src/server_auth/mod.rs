@@ -2,7 +2,7 @@ mod acl;
 mod providers;
 
 pub(crate) use acl::glob_match;
-pub use acl::{AclConfig, Decision, MatchedRule, ToolContext};
+pub use acl::{AclConfig, Decision, MatchedRule, PromptContext, ResourceContext, ToolContext};
 pub use providers::{BearerTokenAuth, ForwardedUserAuth, NoAuth};
 
 // Re-exported for tests in other modules (serve.rs)
@@ -130,6 +130,46 @@ pub fn build_auth_provider(config: &ServerAuthConfig) -> Result<Arc<dyn AuthProv
             Ok(Arc::new(ForwardedUserAuth::new(header, groups_header)))
         }
         other => anyhow::bail!("unknown auth provider: {other}"),
+    }
+}
+
+/// Check if a resource is allowed for the given identity.
+pub fn is_resource_allowed(
+    identity: &AuthIdentity,
+    resource_uri: &str,
+    acl: &Option<AclConfig>,
+    ctx: Option<&acl::ResourceContext>,
+) -> Decision {
+    match acl {
+        Some(acl) => acl::is_resource_allowed(identity, resource_uri, acl, ctx),
+        None => Decision {
+            allowed: true,
+            matched_rule: MatchedRule::NoAcl,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+            access_evaluated: None,
+        },
+    }
+}
+
+/// Check if a prompt is allowed for the given identity.
+pub fn is_prompt_allowed(
+    identity: &AuthIdentity,
+    prompt_name: &str,
+    acl: &Option<AclConfig>,
+    ctx: Option<&acl::PromptContext>,
+) -> Decision {
+    match acl {
+        Some(acl) => acl::is_prompt_allowed(identity, prompt_name, acl, ctx),
+        None => Decision {
+            allowed: true,
+            matched_rule: MatchedRule::NoAcl,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+            access_evaluated: None,
+        },
     }
 }
 

@@ -56,7 +56,11 @@ fn print_usage() {
     eprintln!("  mcp acl classify --server <alias>   Classify tools for one backend");
     eprintln!("  mcp acl classify --format json      Emit classification as JSON");
     eprintln!("  mcp acl check --subject <name> --server <alias> --tool <name>");
-    eprintln!("                                      Check ACL decision for a request");
+    eprintln!("                                      Check ACL decision for a tool request");
+    eprintln!("  mcp acl check --subject <name> --server <alias> --resource <uri>");
+    eprintln!("                                      Check ACL decision for a resource");
+    eprintln!("  mcp acl check --subject <name> --server <alias> --prompt <name>");
+    eprintln!("                                      Check ACL decision for a prompt");
     eprintln!("  mcp acl check --role <name> --server <alias> --all-tools");
     eprintln!("                                      Check all tools for a role");
     eprintln!("  mcp healthcheck [url]               HTTP health probe (for containers)");
@@ -360,7 +364,7 @@ async fn handle_acl_command(
 ) -> Result<()> {
     let sub = args.first().map(String::as_str).ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: mcp acl <classify|check> [flags]\n  mcp acl classify [--server <alias>]\n  mcp acl check --subject <name> --server <alias> --tool <name>"
+            "usage: mcp acl <classify|check> [flags]\n  mcp acl classify [--server <alias>]\n  mcp acl check --subject <name> --server <alias> --tool <name>|--resource <uri>|--prompt <name>"
         )
     })?;
     match sub {
@@ -527,11 +531,14 @@ async fn handle_acl_check(
     use server_auth::{AclConfig, Decision, ToolContext};
 
     let usage = "usage: mcp acl check --subject <name> --server <alias> --tool <name> \
-                 [--access read|write] [--role <name>] [--all-tools] [--format json|table]";
+                 [--access read|write] [--role <name>] [--all-tools] [--resource <uri>] \
+                 [--prompt <name>] [--format json|table]";
 
     let mut subject: Option<String> = None;
     let mut server_alias: Option<String> = None;
     let mut tool_name: Option<String> = None;
+    let mut resource_uri: Option<String> = None;
+    let mut prompt_name: Option<String> = None;
     let mut access_override: Option<String> = None;
     let mut role_override: Option<String> = None;
     let mut all_tools = false;
@@ -588,6 +595,24 @@ async fn handle_acl_check(
                 );
                 i += 2;
             }
+            "--resource" => {
+                resource_uri = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--prompt" => {
+                prompt_name = Some(
+                    args.get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| anyhow::anyhow!("{usage}"))?
+                        .clone(),
+                );
+                i += 2;
+            }
             "--all-tools" => {
                 all_tools = true;
                 i += 1;
@@ -616,8 +641,20 @@ async fn handle_acl_check(
     if subject.is_none() && role_override.is_none() {
         bail!("--subject or --role is required\n{usage}");
     }
-    if tool_name.is_none() && !all_tools {
-        bail!("--tool or --all-tools is required\n{usage}");
+    let target_count = [
+        tool_name.is_some(),
+        resource_uri.is_some(),
+        prompt_name.is_some(),
+        all_tools,
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+    if target_count == 0 {
+        bail!("one of --tool, --resource, --prompt, or --all-tools is required\n{usage}");
+    }
+    if target_count > 1 {
+        bail!("--tool, --resource, --prompt, and --all-tools are mutually exclusive\n{usage}");
     }
 
     // Verify server exists in config.
@@ -779,6 +816,26 @@ async fn handle_acl_check(
 
         let d = server_auth::is_tool_allowed(&identity, &namespaced, acl_config, Some(&ctx));
         results.push(decision_to_result(&tool, &d));
+    }
+
+    if let Some(ref uri) = resource_uri {
+        let namespaced = format!("{server}__{uri}");
+        let ctx = server_auth::ResourceContext {
+            server_alias: &server,
+            resource_uri: uri,
+        };
+        let d = server_auth::is_resource_allowed(&identity, &namespaced, acl_config, Some(&ctx));
+        results.push(decision_to_result(uri, &d));
+    }
+
+    if let Some(ref name) = prompt_name {
+        let namespaced = format!("{server}__{name}");
+        let ctx = server_auth::PromptContext {
+            server_alias: &server,
+            prompt_name: name,
+        };
+        let d = server_auth::is_prompt_allowed(&identity, &namespaced, acl_config, Some(&ctx));
+        results.push(decision_to_result(name, &d));
     }
 
     // Sort results for stable output.

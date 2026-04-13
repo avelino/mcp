@@ -12,7 +12,7 @@ use crate::classifier::{classify, Kind, ToolClassification};
 use crate::classifier_cache::{cache_key, ClassifierCache};
 use crate::client::McpClient;
 use crate::config::{parse_duration_str, Config, IdleTimeoutPolicy, ServerConfig};
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, Tool, PROTOCOL_VERSION};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, Prompt, Resource, Tool, PROTOCOL_VERSION};
 use crate::server_auth::{self, AclConfig, AuthIdentity, AuthProvider, Credentials};
 
 const SEPARATOR: &str = "__";
@@ -138,12 +138,31 @@ type ResolveResult = std::result::Result<
     (String, String, Value, server_auth::Decision),
     (Option<server_auth::Decision>, JsonRpcResponse),
 >;
+/// Resolved resource read: (server, original_uri, client, decision).
+type ResolvedResourceRead = (
+    String,
+    String,
+    Option<Arc<McpClient>>,
+    server_auth::Decision,
+);
+/// Resolved prompt get: (server, original_name, arguments, client, decision).
+type ResolvedPromptGet = (
+    String,
+    String,
+    Option<Value>,
+    Option<Arc<McpClient>>,
+    server_auth::Decision,
+);
 
 struct ProxyServer {
     configs: HashMap<String, ServerConfig>,
     backends: HashMap<String, BackendState>,
     tool_map: HashMap<String, (String, String)>, // namespaced -> (server, original_name)
     tools: Vec<Tool>,
+    resource_map: HashMap<String, (String, String)>, // namespaced_uri -> (server, original_uri)
+    resources: Vec<Resource>,
+    prompt_map: HashMap<String, (String, String)>, // namespaced_name -> (server, original_name)
+    prompts: Vec<Prompt>,
     /// Per-tool read/write classification, keyed by namespaced tool name.
     /// Populated after each successful `tools/list` from an upstream and
     /// consumed by future ACL enforcement (issue #54 only produces it).
@@ -186,6 +205,10 @@ impl ProxyServer {
             backends: HashMap::new(),
             tool_map: HashMap::new(),
             tools: Vec::new(),
+            resource_map: HashMap::new(),
+            resources: Vec::new(),
+            prompt_map: HashMap::new(),
+            prompts: Vec::new(),
             classifications: HashMap::new(),
             classifier_cache: ClassifierCache::load(),
             audit,
@@ -267,6 +290,58 @@ impl ProxyServer {
         self.tools.retain(|t| !t.name.starts_with(&prefix));
         self.tool_map.retain(|k, _| !k.starts_with(&prefix));
         self.classifications.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    fn register_resources(&mut self, server_name: &str, resources: &[Resource]) {
+        for r in resources {
+            let namespaced_uri = format!("{server_name}{SEPARATOR}{}", r.uri);
+            let description = r
+                .description
+                .as_ref()
+                .map(|d| format!("[{server_name}] {d}"));
+            self.resource_map.insert(
+                namespaced_uri.clone(),
+                (server_name.to_string(), r.uri.clone()),
+            );
+            self.resources.push(Resource {
+                uri: namespaced_uri,
+                name: format!("{server_name}{SEPARATOR}{}", r.name),
+                description,
+                mime_type: r.mime_type.clone(),
+                annotations: r.annotations.clone(),
+            });
+        }
+    }
+
+    fn unregister_resources(&mut self, server_name: &str) {
+        let prefix = format!("{server_name}{SEPARATOR}");
+        self.resources.retain(|r| !r.uri.starts_with(&prefix));
+        self.resource_map.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    fn register_prompts(&mut self, server_name: &str, prompts: &[Prompt]) {
+        for p in prompts {
+            let namespaced_name = format!("{server_name}{SEPARATOR}{}", p.name);
+            let description = p
+                .description
+                .as_ref()
+                .map(|d| format!("[{server_name}] {d}"));
+            self.prompt_map.insert(
+                namespaced_name.clone(),
+                (server_name.to_string(), p.name.clone()),
+            );
+            self.prompts.push(Prompt {
+                name: namespaced_name,
+                description,
+                arguments: p.arguments.clone(),
+            });
+        }
+    }
+
+    fn unregister_prompts(&mut self, server_name: &str) {
+        let prefix = format!("{server_name}{SEPARATOR}");
+        self.prompts.retain(|p| !p.name.starts_with(&prefix));
+        self.prompt_map.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Collect cached tools for a server from the current tool list (for storing in Disconnected state).
@@ -407,6 +482,8 @@ impl ProxyServer {
         server_name: &str,
         client: Arc<McpClient>,
         tools: &[Tool],
+        resources: &[Resource],
+        prompts: &[Prompt],
     ) -> Option<Arc<McpClient>> {
         let (mut stats, prev) = match self.backends.remove(server_name) {
             Some(BackendState::Disconnected { usage_stats, .. }) => (usage_stats, None),
@@ -420,9 +497,15 @@ impl ProxyServer {
 
         self.unregister_tools(server_name);
         self.register_tools(server_name, tools);
+        self.unregister_resources(server_name);
+        self.register_resources(server_name, resources);
+        self.unregister_prompts(server_name);
+        self.register_prompts(server_name, prompts);
         eprintln!(
-            "[serve] {server_name}: {} tool(s) (reconnected)",
-            tools.len()
+            "[serve] {server_name}: {} tool(s), {} resource(s), {} prompt(s) (reconnected)",
+            tools.len(),
+            resources.len(),
+            prompts.len()
         );
 
         self.discovered_backends.insert(server_name.to_string());
@@ -512,7 +595,9 @@ impl ProxyServer {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {
-                    "tools": {}
+                    "tools": {},
+                    "resources": {},
+                    "prompts": {}
                 },
                 "serverInfo": {
                     "name": "mcp-proxy",
@@ -668,15 +753,19 @@ async fn discover_pending_backends(proxy: &SharedProxy) {
     let discovery_timeout = Duration::from_secs(30);
 
     // Fire all discoveries in parallel WITHOUT the proxy lock held.
-    type DiscoveryOutcome =
-        std::result::Result<Result<(McpClient, Vec<Tool>)>, tokio::time::error::Elapsed>;
+    type DiscoveryOutcome = std::result::Result<
+        Result<(McpClient, Vec<Tool>, Vec<Resource>, Vec<Prompt>)>,
+        tokio::time::error::Elapsed,
+    >;
     let mut joinset: tokio::task::JoinSet<(String, DiscoveryOutcome)> = tokio::task::JoinSet::new();
     for (name, server_config) in pending {
         joinset.spawn(async move {
             let result = tokio::time::timeout(discovery_timeout, async {
                 let client = McpClient::connect(&server_config).await?;
                 let tools = client.list_tools().await?;
-                Ok::<_, anyhow::Error>((client, tools))
+                let resources = client.list_resources().await.unwrap_or_default();
+                let prompts = client.list_prompts().await.unwrap_or_default();
+                Ok::<_, anyhow::Error>((client, tools, resources, prompts))
             })
             .await;
             (name, result)
@@ -695,15 +784,22 @@ async fn discover_pending_backends(proxy: &SharedProxy) {
             }
         };
         match result {
-            Ok(Ok((client, tools))) => {
+            Ok(Ok((client, tools, resources, prompts))) => {
                 let mut p = proxy.lock().await;
                 if p.discovered_backends.contains(&name) {
                     // Lost the race — discard our client; kill_on_drop reaps it.
                     drop(client);
                     continue;
                 }
-                eprintln!("[serve] {name}: {} tool(s)", tools.len());
+                eprintln!(
+                    "[serve] {name}: {} tool(s), {} resource(s), {} prompt(s)",
+                    tools.len(),
+                    resources.len(),
+                    prompts.len()
+                );
                 p.register_tools(&name, &tools);
+                p.register_resources(&name, &resources);
+                p.register_prompts(&name, &prompts);
                 p.backends.insert(
                     name.clone(),
                     BackendState::Connected {
@@ -777,9 +873,11 @@ async fn discover_pending_backends(proxy: &SharedProxy) {
     let (cache_entries, cache_store) = {
         let p = proxy.lock().await;
         eprintln!(
-            "[serve] ready — {} backend(s), {} tool(s)",
+            "[serve] ready — {} backend(s), {} tool(s), {} resource(s), {} prompt(s)",
             p.backends.len(),
-            p.tools.len()
+            p.tools.len(),
+            p.resources.len(),
+            p.prompts.len()
         );
         (p.snapshot_cache_entries(), p.cache_store.clone())
     };
@@ -969,6 +1067,331 @@ async fn dispatch_request(
                 }
             }
         }
+        "resources/list" => {
+            let needs_discovery = {
+                let p = proxy.lock().await;
+                audit_logger = Arc::clone(&p.audit);
+                p.resources.is_empty() && p.has_undiscovered_backends()
+            };
+            if needs_discovery {
+                discover_pending_backends(proxy).await;
+            }
+            let (resources_snap, resource_map_snap, list_audit) = {
+                let p = proxy.lock().await;
+                (
+                    p.resources.clone(),
+                    p.resource_map.clone(),
+                    Arc::clone(&p.audit),
+                )
+            };
+            let mut resources_allowed: Vec<Value> = Vec::new();
+            for r in &resources_snap {
+                let ctx = resource_map_snap.get(&r.uri).map(|(server, orig)| {
+                    server_auth::ResourceContext {
+                        server_alias: server.as_str(),
+                        resource_uri: orig.as_str(),
+                    }
+                });
+                let decision =
+                    server_auth::is_resource_allowed(identity, &r.uri, acl, ctx.as_ref());
+                if decision.allowed {
+                    resources_allowed.push(serde_json::to_value(r).unwrap());
+                } else {
+                    let srv = resource_map_snap.get(&r.uri).map(|(s, _)| s.clone());
+                    list_audit.log(AuditEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        source: source.to_string(),
+                        method: "resources/list:filtered".to_string(),
+                        tool_name: Some(r.uri.clone()),
+                        server_name: srv,
+                        identity: identity.subject.clone(),
+                        duration_ms: 0,
+                        success: true,
+                        error_message: None,
+                        arguments: None,
+                        acl_decision: Some("deny".to_string()),
+                        acl_matched_rule: Some(decision.matched_rule.to_string()),
+                        acl_access_kind: decision
+                            .access_evaluated
+                            .as_ref()
+                            .map(|a| a.as_str().to_string()),
+                        classification_kind: None,
+                        classification_source: None,
+                        classification_confidence: None,
+                    });
+                }
+            }
+            JsonRpcResponse::success(id, json!({ "resources": resources_allowed }))
+        }
+        "resources/read" => {
+            let uri = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("uri"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let uri = match uri {
+                Some(u) => u,
+                None => {
+                    let p = proxy.lock().await;
+                    audit_logger = Arc::clone(&p.audit);
+                    return finish_audit(
+                        AuditCtx {
+                            audit: audit_logger,
+                            source,
+                            method,
+                            tool_name: None,
+                            server_name: None,
+                            identity,
+                            start,
+                            decision: None,
+                        },
+                        JsonRpcResponse::error(id, -32602, "missing required parameter: uri"),
+                    );
+                }
+            };
+
+            tool_name_for_audit = Some(uri.clone());
+
+            let needs_discovery = {
+                let p = proxy.lock().await;
+                audit_logger = Arc::clone(&p.audit);
+                !p.resource_map.contains_key(&uri) && p.has_undiscovered_backends()
+            };
+            if needs_discovery {
+                discover_pending_backends(proxy).await;
+            }
+
+            // Resolve: lookup resource_map, check ACL.
+            let resolved: std::result::Result<ResolvedResourceRead, JsonRpcResponse> = {
+                let mut p = proxy.lock().await;
+                match p.resource_map.get(&uri) {
+                    Some((server, original_uri)) => {
+                        let ctx = server_auth::ResourceContext {
+                            server_alias: server.as_str(),
+                            resource_uri: original_uri.as_str(),
+                        };
+                        let decision =
+                            server_auth::is_resource_allowed(identity, &uri, acl, Some(&ctx));
+                        if !decision.allowed {
+                            decision_for_audit = Some(decision.clone());
+                            server_name_for_audit = Some(server.clone());
+                            Err(JsonRpcResponse::error(
+                                id.clone(),
+                                -32603,
+                                &format!(
+                                    "access denied: resource '{}' on server '{}'",
+                                    original_uri, server
+                                ),
+                            ))
+                        } else {
+                            let server = server.clone();
+                            let original = original_uri.clone();
+                            let client = p.try_get_client(&server);
+                            server_name_for_audit = Some(server.clone());
+                            Ok((server, original, client, decision))
+                        }
+                    }
+                    None => Err(JsonRpcResponse::error(
+                        id.clone(),
+                        -32602,
+                        &format!("unknown resource: {uri}"),
+                    )),
+                }
+            };
+
+            match resolved {
+                Err(resp) => resp,
+                Ok((server, original_uri, maybe_client, acl_decision)) => {
+                    decision_for_audit = Some(acl_decision);
+                    let client_result: Result<Arc<McpClient>> = match maybe_client {
+                        Some(c) => Ok(c),
+                        None => connect_backend(proxy, &server).await,
+                    };
+                    match client_result {
+                        Err(e) => JsonRpcResponse::error(
+                            id,
+                            -32603,
+                            &format!("failed to connect to backend '{server}': {e:#}"),
+                        ),
+                        Ok(client) => match client.read_resource(&original_uri).await {
+                            Ok(result) => {
+                                JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap())
+                            }
+                            Err(e) => {
+                                JsonRpcResponse::error(id, -32603, &format!("[{server}] {e:#}"))
+                            }
+                        },
+                    }
+                }
+            }
+        }
+        "prompts/list" => {
+            let needs_discovery = {
+                let p = proxy.lock().await;
+                audit_logger = Arc::clone(&p.audit);
+                p.prompts.is_empty() && p.has_undiscovered_backends()
+            };
+            if needs_discovery {
+                discover_pending_backends(proxy).await;
+            }
+            let (prompts_snap, prompt_map_snap, list_audit) = {
+                let p = proxy.lock().await;
+                (
+                    p.prompts.clone(),
+                    p.prompt_map.clone(),
+                    Arc::clone(&p.audit),
+                )
+            };
+            let mut prompts_allowed: Vec<Value> = Vec::new();
+            for pr in &prompts_snap {
+                let ctx = prompt_map_snap.get(&pr.name).map(|(server, orig)| {
+                    server_auth::PromptContext {
+                        server_alias: server.as_str(),
+                        prompt_name: orig.as_str(),
+                    }
+                });
+                let decision =
+                    server_auth::is_prompt_allowed(identity, &pr.name, acl, ctx.as_ref());
+                if decision.allowed {
+                    prompts_allowed.push(serde_json::to_value(pr).unwrap());
+                } else {
+                    let srv = prompt_map_snap.get(&pr.name).map(|(s, _)| s.clone());
+                    list_audit.log(AuditEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        source: source.to_string(),
+                        method: "prompts/list:filtered".to_string(),
+                        tool_name: Some(pr.name.clone()),
+                        server_name: srv,
+                        identity: identity.subject.clone(),
+                        duration_ms: 0,
+                        success: true,
+                        error_message: None,
+                        arguments: None,
+                        acl_decision: Some("deny".to_string()),
+                        acl_matched_rule: Some(decision.matched_rule.to_string()),
+                        acl_access_kind: decision
+                            .access_evaluated
+                            .as_ref()
+                            .map(|a| a.as_str().to_string()),
+                        classification_kind: None,
+                        classification_source: None,
+                        classification_confidence: None,
+                    });
+                }
+            }
+            JsonRpcResponse::success(id, json!({ "prompts": prompts_allowed }))
+        }
+        "prompts/get" => {
+            let name = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let prompt_name = match name {
+                Some(n) => n,
+                None => {
+                    let p = proxy.lock().await;
+                    audit_logger = Arc::clone(&p.audit);
+                    return finish_audit(
+                        AuditCtx {
+                            audit: audit_logger,
+                            source,
+                            method,
+                            tool_name: None,
+                            server_name: None,
+                            identity,
+                            start,
+                            decision: None,
+                        },
+                        JsonRpcResponse::error(id, -32602, "missing required parameter: name"),
+                    );
+                }
+            };
+
+            let arguments = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("arguments"))
+                .cloned();
+
+            tool_name_for_audit = Some(prompt_name.clone());
+
+            let needs_discovery = {
+                let p = proxy.lock().await;
+                audit_logger = Arc::clone(&p.audit);
+                !p.prompt_map.contains_key(&prompt_name) && p.has_undiscovered_backends()
+            };
+            if needs_discovery {
+                discover_pending_backends(proxy).await;
+            }
+
+            let resolved: std::result::Result<ResolvedPromptGet, JsonRpcResponse> = {
+                let mut p = proxy.lock().await;
+                match p.prompt_map.get(&prompt_name) {
+                    Some((server, original_name)) => {
+                        let ctx = server_auth::PromptContext {
+                            server_alias: server.as_str(),
+                            prompt_name: original_name.as_str(),
+                        };
+                        let decision =
+                            server_auth::is_prompt_allowed(identity, &prompt_name, acl, Some(&ctx));
+                        if !decision.allowed {
+                            decision_for_audit = Some(decision.clone());
+                            server_name_for_audit = Some(server.clone());
+                            Err(JsonRpcResponse::error(
+                                id.clone(),
+                                -32603,
+                                &format!(
+                                    "access denied: prompt '{}' on server '{}'",
+                                    original_name, server
+                                ),
+                            ))
+                        } else {
+                            let server = server.clone();
+                            let original = original_name.clone();
+                            let client = p.try_get_client(&server);
+                            server_name_for_audit = Some(server.clone());
+                            Ok((server, original, arguments, client, decision))
+                        }
+                    }
+                    None => Err(JsonRpcResponse::error(
+                        id.clone(),
+                        -32602,
+                        &format!("unknown prompt: {prompt_name}"),
+                    )),
+                }
+            };
+
+            match resolved {
+                Err(resp) => resp,
+                Ok((server, original_name, args, maybe_client, acl_decision)) => {
+                    decision_for_audit = Some(acl_decision);
+                    let client_result: Result<Arc<McpClient>> = match maybe_client {
+                        Some(c) => Ok(c),
+                        None => connect_backend(proxy, &server).await,
+                    };
+                    match client_result {
+                        Err(e) => JsonRpcResponse::error(
+                            id,
+                            -32603,
+                            &format!("failed to connect to backend '{server}': {e:#}"),
+                        ),
+                        Ok(client) => match client.get_prompt(&original_name, args).await {
+                            Ok(result) => {
+                                JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap())
+                            }
+                            Err(e) => {
+                                JsonRpcResponse::error(id, -32603, &format!("[{server}] {e:#}"))
+                            }
+                        },
+                    }
+                }
+            }
+        }
         _ => {
             let p = proxy.lock().await;
             audit_logger = Arc::clone(&p.audit);
@@ -1071,11 +1494,19 @@ async fn connect_backend(proxy: &SharedProxy, server_name: &str) -> Result<Arc<M
     eprintln!("[serve] connecting to {server_name}...");
     let client = McpClient::connect(&config).await?;
     let tools = client.list_tools().await?;
+    let resources = client.list_resources().await.unwrap_or_default();
+    let prompts = client.list_prompts().await.unwrap_or_default();
     let client = Arc::new(client);
 
     let prev = {
         let mut p = proxy.lock().await;
-        let prev = p.install_client(server_name, Arc::clone(&client), &tools);
+        let prev = p.install_client(
+            server_name,
+            Arc::clone(&client),
+            &tools,
+            &resources,
+            &prompts,
+        );
         // Persist new classifications from register_tools.
         p.classifier_cache.save();
         prev
@@ -2275,5 +2706,292 @@ mod tests {
 
         let cached_unknown = server.collect_cached_tools("unknown");
         assert!(cached_unknown.is_empty());
+    }
+
+    // --- Resources dispatch tests ---
+
+    #[tokio::test]
+    async fn test_resources_list_returns_registered_resources() {
+        let mut server = test_server();
+        server.register_resources(
+            "sentry",
+            &[Resource {
+                uri: "issue://123".to_string(),
+                name: "Issue 123".to_string(),
+                description: Some("A bug".to_string()),
+                mime_type: None,
+                annotations: None,
+            }],
+        );
+
+        let req = JsonRpcRequest::new(10, "resources/list", None);
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        let result = resp.result.unwrap();
+        let resources = result["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "sentry__issue://123");
+        assert_eq!(resources[0]["name"], "sentry__Issue 123");
+    }
+
+    #[tokio::test]
+    async fn test_resources_list_filtered_by_acl() {
+        use crate::server_auth::{AclPolicy, AclRule};
+
+        let mut server = test_server();
+        server.register_resources(
+            "sentry",
+            &[Resource {
+                uri: "issue://1".to_string(),
+                name: "Issue 1".to_string(),
+                description: None,
+                mime_type: None,
+                annotations: None,
+            }],
+        );
+        server.register_resources(
+            "slack",
+            &[Resource {
+                uri: "channel://general".to_string(),
+                name: "General".to_string(),
+                description: None,
+                mime_type: None,
+                annotations: None,
+            }],
+        );
+
+        let acl = Some(AclConfig::legacy(
+            AclPolicy::Allow,
+            vec![AclRule {
+                subjects: vec!["bob".to_string()],
+                roles: vec![],
+                tools: vec!["sentry__*".to_string()],
+                policy: AclPolicy::Deny,
+            }],
+        ));
+
+        // Legacy ACL with default=allow → resources allowed (legacy doesn't
+        // have resource-specific rules; our implementation uses default).
+        let bob = AuthIdentity::new("bob", vec![]);
+        let req = JsonRpcRequest::new(10, "resources/list", None);
+        let resp = dispatch(server, req, &bob, &acl).await;
+        let result = resp.result.unwrap();
+        let resources = result["resources"].as_array().unwrap();
+        // Legacy default=allow → all resources pass
+        assert_eq!(resources.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_resources_read_unknown_returns_error() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(
+            10,
+            "resources/read",
+            Some(serde_json::json!({"uri": "sentry__issue://999"})),
+        );
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("unknown resource"));
+    }
+
+    #[tokio::test]
+    async fn test_resources_read_missing_uri_param() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(10, "resources/read", Some(serde_json::json!({})));
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("missing required parameter: uri"));
+    }
+
+    #[tokio::test]
+    async fn test_resources_read_denied_by_acl() {
+        use crate::server_auth::AclPolicy;
+
+        let mut server = test_server();
+        server.resource_map.insert(
+            "sentry__issue://123".to_string(),
+            ("sentry".to_string(), "issue://123".to_string()),
+        );
+
+        let acl = Some(AclConfig::legacy(AclPolicy::Deny, vec![]));
+
+        let bob = AuthIdentity::new("bob", vec![]);
+        let req = JsonRpcRequest::new(
+            11,
+            "resources/read",
+            Some(serde_json::json!({"uri": "sentry__issue://123"})),
+        );
+        let resp = dispatch(server, req, &bob, &acl).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("access denied"));
+    }
+
+    // --- Prompts dispatch tests ---
+
+    #[tokio::test]
+    async fn test_prompts_list_returns_registered_prompts() {
+        let mut server = test_server();
+        server.register_prompts(
+            "ai",
+            &[Prompt {
+                name: "summarize".to_string(),
+                description: Some("Summarize text".to_string()),
+                arguments: None,
+            }],
+        );
+
+        let req = JsonRpcRequest::new(10, "prompts/list", None);
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        let result = resp.result.unwrap();
+        let prompts = result["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["name"], "ai__summarize");
+    }
+
+    #[tokio::test]
+    async fn test_prompts_list_filtered_by_acl() {
+        use crate::server_auth::AclPolicy;
+
+        let mut server = test_server();
+        server.register_prompts(
+            "ai",
+            &[Prompt {
+                name: "summarize".to_string(),
+                description: None,
+                arguments: None,
+            }],
+        );
+
+        let acl = Some(AclConfig::legacy(AclPolicy::Deny, vec![]));
+
+        let bob = AuthIdentity::new("bob", vec![]);
+        let req = JsonRpcRequest::new(10, "prompts/list", None);
+        let resp = dispatch(server, req, &bob, &acl).await;
+        let result = resp.result.unwrap();
+        let prompts = result["prompts"].as_array().unwrap();
+        // Legacy default=deny → prompts filtered out
+        assert_eq!(prompts.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prompts_get_unknown_returns_error() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(
+            10,
+            "prompts/get",
+            Some(serde_json::json!({"name": "ai__unknown"})),
+        );
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("unknown prompt"));
+    }
+
+    #[tokio::test]
+    async fn test_prompts_get_missing_name_param() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(10, "prompts/get", Some(serde_json::json!({})));
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("missing required parameter: name"));
+    }
+
+    #[tokio::test]
+    async fn test_prompts_get_denied_by_acl() {
+        use crate::server_auth::AclPolicy;
+
+        let mut server = test_server();
+        server.prompt_map.insert(
+            "ai__summarize".to_string(),
+            ("ai".to_string(), "summarize".to_string()),
+        );
+
+        let acl = Some(AclConfig::legacy(AclPolicy::Deny, vec![]));
+
+        let bob = AuthIdentity::new("bob", vec![]);
+        let req = JsonRpcRequest::new(
+            11,
+            "prompts/get",
+            Some(serde_json::json!({"name": "ai__summarize"})),
+        );
+        let resp = dispatch(server, req, &bob, &acl).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert!(err.message.contains("access denied"));
+    }
+
+    // --- Registration tests ---
+
+    #[test]
+    fn test_register_unregister_resources() {
+        let mut server = test_server();
+        server.register_resources(
+            "sentry",
+            &[
+                Resource {
+                    uri: "issue://1".to_string(),
+                    name: "Issue 1".to_string(),
+                    description: Some("First".to_string()),
+                    mime_type: None,
+                    annotations: None,
+                },
+                Resource {
+                    uri: "issue://2".to_string(),
+                    name: "Issue 2".to_string(),
+                    description: None,
+                    mime_type: None,
+                    annotations: None,
+                },
+            ],
+        );
+        assert_eq!(server.resources.len(), 2);
+        assert_eq!(server.resource_map.len(), 2);
+        assert!(server.resource_map.contains_key("sentry__issue://1"));
+        assert_eq!(server.resources[0].uri, "sentry__issue://1");
+        assert_eq!(
+            server.resources[0].description.as_deref(),
+            Some("[sentry] First")
+        );
+
+        server.unregister_resources("sentry");
+        assert!(server.resources.is_empty());
+        assert!(server.resource_map.is_empty());
+    }
+
+    #[test]
+    fn test_register_unregister_prompts() {
+        let mut server = test_server();
+        server.register_prompts(
+            "ai",
+            &[Prompt {
+                name: "summarize".to_string(),
+                description: Some("Summarize text".to_string()),
+                arguments: None,
+            }],
+        );
+        assert_eq!(server.prompts.len(), 1);
+        assert_eq!(server.prompt_map.len(), 1);
+        assert!(server.prompt_map.contains_key("ai__summarize"));
+        assert_eq!(server.prompts[0].name, "ai__summarize");
+        assert_eq!(
+            server.prompts[0].description.as_deref(),
+            Some("[ai] Summarize text")
+        );
+
+        server.unregister_prompts("ai");
+        assert!(server.prompts.is_empty());
+        assert!(server.prompt_map.is_empty());
+    }
+
+    #[test]
+    fn test_initialize_includes_resources_and_prompts_capabilities() {
+        let server = test_server();
+        let resp = server.handle_initialize(Value::from(1));
+        let result = resp.result.unwrap();
+        assert!(result["capabilities"]["resources"].is_object());
+        assert!(result["capabilities"]["prompts"].is_object());
     }
 }
