@@ -33,7 +33,7 @@ services:
           "mcpServers": {
             "example": {
               "url": "https://example.com/mcp",
-              "headers": {"Authorization": "Bearer ${EXAMPLE_TOKEN}"}
+              "headers": {"Authorization": "Bearer $${EXAMPLE_TOKEN}"}
             }
           },
           "serverAuth": {
