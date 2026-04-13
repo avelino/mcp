@@ -133,6 +133,11 @@ type ResolvedCall = (
     Option<Arc<McpClient>>,
     server_auth::Decision,
 );
+/// Ok: (server, tool, args, decision). Err: (optional decision for audit, error response).
+type ResolveResult = std::result::Result<
+    (String, String, Value, server_auth::Decision),
+    (Option<server_auth::Decision>, JsonRpcResponse),
+>;
 
 struct ProxyServer {
     configs: HashMap<String, ServerConfig>,
@@ -526,14 +531,13 @@ impl ProxyServer {
         params: Option<Value>,
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
-    ) -> std::result::Result<(String, String, Value, server_auth::Decision), JsonRpcResponse> {
+    ) -> ResolveResult {
         let params = match params {
             Some(p) => p,
             None => {
-                return Err(JsonRpcResponse::error(
-                    id.clone(),
-                    -32602,
-                    "missing params for tools/call",
+                return Err((
+                    None,
+                    JsonRpcResponse::error(id.clone(), -32602, "missing params for tools/call"),
                 ));
             }
         };
@@ -541,10 +545,13 @@ impl ProxyServer {
         let tool_name = match params.get("name").and_then(|n| n.as_str()) {
             Some(n) => n.to_string(),
             None => {
-                return Err(JsonRpcResponse::error(
-                    id.clone(),
-                    -32602,
-                    "missing 'name' in tools/call params",
+                return Err((
+                    None,
+                    JsonRpcResponse::error(
+                        id.clone(),
+                        -32602,
+                        "missing 'name' in tools/call params",
+                    ),
                 ));
             }
         };
@@ -554,10 +561,13 @@ impl ProxyServer {
         let (server_name, original_name) = match self.tool_map.get(&tool_name) {
             Some(mapping) => mapping.clone(),
             None => {
-                return Err(JsonRpcResponse::error(
-                    id.clone(),
-                    -32602,
-                    &format!("unknown tool: {tool_name}"),
+                return Err((
+                    None,
+                    JsonRpcResponse::error(
+                        id.clone(),
+                        -32602,
+                        &format!("unknown tool: {tool_name}"),
+                    ),
                 ));
             }
         };
@@ -571,12 +581,15 @@ impl ProxyServer {
 
         let decision = server_auth::is_tool_allowed(identity, &tool_name, acl, Some(&ctx));
         if !decision.allowed {
-            return Err(JsonRpcResponse::error(
-                id.clone(),
-                -32603,
-                &format!(
-                    "access denied: '{}' cannot use tool '{tool_name}'",
-                    identity.subject
+            return Err((
+                Some(decision),
+                JsonRpcResponse::error(
+                    id.clone(),
+                    -32603,
+                    &format!(
+                        "access denied: '{}' cannot use tool '{tool_name}'",
+                        identity.subject
+                    ),
                 ),
             ));
         }
@@ -824,59 +837,60 @@ async fn dispatch_request(
             if needs_discovery {
                 discover_pending_backends(proxy).await;
             }
-            let tools_snapshot: Vec<Value> = {
+            // Snapshot tools + metadata under a brief lock, then release
+            // before ACL evaluation/serialization/logging.
+            let (tools_snap, tool_map_snap, cls_snap, list_audit) = {
                 let p = proxy.lock().await;
-                let mut allowed = Vec::new();
-                for t in &p.tools {
-                    let ctx =
-                        p.tool_map
-                            .get(&t.name)
-                            .map(|(server, orig)| server_auth::ToolContext {
-                                server_alias: server.as_str(),
-                                tool_name: orig.as_str(),
-                                classification: p.classifications.get(&t.name),
-                            });
-                    let decision =
-                        server_auth::is_tool_allowed(identity, &t.name, acl, ctx.as_ref());
-                    if decision.allowed {
-                        allowed.push(serde_json::to_value(t).unwrap());
-                    } else {
-                        // Log each filtered-out tool so operators can see
-                        // what was hidden from a given identity.
-                        let (server_name, _) = p
-                            .tool_map
-                            .get(&t.name)
-                            .map(|(s, _)| (Some(s.clone()), ()))
-                            .unwrap_or((None, ()));
-                        p.audit.log(AuditEntry {
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            source: source.to_string(),
-                            method: "tools/list:filtered".to_string(),
-                            tool_name: Some(t.name.clone()),
-                            server_name,
-                            identity: identity.subject.clone(),
-                            duration_ms: 0,
-                            success: true,
-                            error_message: None,
-                            arguments: None,
-                            acl_decision: Some("deny".to_string()),
-                            acl_matched_rule: Some(decision.matched_rule.to_string()),
-                            acl_access_kind: decision
-                                .access_evaluated
-                                .as_ref()
-                                .map(|a| a.as_str().to_string()),
-                            classification_kind: decision
-                                .classification_kind
-                                .map(|k| k.as_str().to_string()),
-                            classification_source: decision
-                                .classification_source
-                                .map(|s| s.as_str().to_string()),
-                            classification_confidence: decision.classification_confidence,
-                        });
-                    }
-                }
-                allowed
+                (
+                    p.tools.clone(),
+                    p.tool_map.clone(),
+                    p.classifications.clone(),
+                    Arc::clone(&p.audit),
+                )
             };
+            let mut tools_allowed: Vec<Value> = Vec::new();
+            for t in &tools_snap {
+                let ctx =
+                    tool_map_snap
+                        .get(&t.name)
+                        .map(|(server, orig)| server_auth::ToolContext {
+                            server_alias: server.as_str(),
+                            tool_name: orig.as_str(),
+                            classification: cls_snap.get(&t.name),
+                        });
+                let decision = server_auth::is_tool_allowed(identity, &t.name, acl, ctx.as_ref());
+                if decision.allowed {
+                    tools_allowed.push(serde_json::to_value(t).unwrap());
+                } else {
+                    let srv = tool_map_snap.get(&t.name).map(|(s, _)| s.clone());
+                    list_audit.log(AuditEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        source: source.to_string(),
+                        method: "tools/list:filtered".to_string(),
+                        tool_name: Some(t.name.clone()),
+                        server_name: srv,
+                        identity: identity.subject.clone(),
+                        duration_ms: 0,
+                        success: true,
+                        error_message: None,
+                        arguments: None,
+                        acl_decision: Some("deny".to_string()),
+                        acl_matched_rule: Some(decision.matched_rule.to_string()),
+                        acl_access_kind: decision
+                            .access_evaluated
+                            .as_ref()
+                            .map(|a| a.as_str().to_string()),
+                        classification_kind: decision
+                            .classification_kind
+                            .map(|k| k.as_str().to_string()),
+                        classification_source: decision
+                            .classification_source
+                            .map(|s| s.as_str().to_string()),
+                        classification_confidence: decision.classification_confidence,
+                    });
+                }
+            }
+            let tools_snapshot = tools_allowed;
             JsonRpcResponse::success(id, json!({ "tools": tools_snapshot }))
         }
         "tools/call" => {
@@ -915,7 +929,10 @@ async fn dispatch_request(
                         server_name_for_audit = Some(server.clone());
                         Ok((server, orig, args, client, decision))
                     }
-                    Err(resp) => Err(resp),
+                    Err((maybe_decision, resp)) => {
+                        decision_for_audit = maybe_decision;
+                        Err(resp)
+                    }
                 }
             };
 
@@ -1219,33 +1236,34 @@ async fn authenticate_request(
     source: &str,
 ) -> Result<AuthIdentity, (StatusCode, Json<Value>)> {
     let creds = extract_credentials(headers);
-    state.auth_provider.authenticate(&creds).await.map_err(|e| {
-        // Log the authentication failure to audit.
-        // Use blocking_lock since we're inside a sync closure (map_err).
-        // This is safe — the proxy lock is never held long enough to cause issues.
-        let audit = Arc::clone(&state.proxy.blocking_lock().audit);
-        audit.log(AuditEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            source: source.to_string(),
-            method: "auth/failure".to_string(),
-            tool_name: None,
-            server_name: None,
-            identity: "anonymous".to_string(),
-            duration_ms: 0,
-            success: false,
-            error_message: Some(format!("authentication failed: {e}")),
-            arguments: None,
-            acl_decision: None,
-            acl_matched_rule: None,
-            acl_access_kind: None,
-            classification_kind: None,
-            classification_source: None,
-            classification_confidence: None,
-        });
-        let err =
-            JsonRpcResponse::error(Value::Null, -32000, &format!("authentication failed: {e}"));
-        (StatusCode::UNAUTHORIZED, Json(json!(err)))
-    })
+    match state.auth_provider.authenticate(&creds).await {
+        Ok(identity) => Ok(identity),
+        Err(e) => {
+            // Log auth failure using async lock (safe in async context).
+            let audit = Arc::clone(&state.proxy.lock().await.audit);
+            audit.log(AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                source: source.to_string(),
+                method: "auth/failure".to_string(),
+                tool_name: None,
+                server_name: None,
+                identity: "anonymous".to_string(),
+                duration_ms: 0,
+                success: false,
+                error_message: Some(format!("authentication failed: {e}")),
+                arguments: None,
+                acl_decision: None,
+                acl_matched_rule: None,
+                acl_access_kind: None,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+            });
+            let err =
+                JsonRpcResponse::error(Value::Null, -32000, &format!("authentication failed: {e}"));
+            Err((StatusCode::UNAUTHORIZED, Json(json!(err))))
+        }
+    }
 }
 
 /// Bind a TCP listener with TCP keepalive enabled. Short keepalive intervals
