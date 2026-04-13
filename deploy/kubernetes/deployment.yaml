@@ -114,9 +114,11 @@ spec:
               memory: 256Mi
 
           securityContext:
-            # The scratch base image has no /etc/passwd, so the process runs
-            # as UID 0. This is a static binary with no shell — minimal
-            # attack surface regardless of UID.
+            # Runs as UID 0 by default (no USER in Dockerfile). The scratch
+            # base is a static binary with no shell — minimal attack surface.
+            # To satisfy runAsNonRoot policies, set runAsUser to a numeric UID
+            # and ensure mounted volumes (/tmp, /data) are writable for that UID
+            # (via fsGroup or an initContainer).
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             capabilities:
