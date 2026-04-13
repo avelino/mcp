@@ -30,6 +30,9 @@ pub struct AuthStore {
 }
 
 pub fn auth_store_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("MCP_AUTH_PATH") {
+        return Ok(PathBuf::from(path));
+    }
     Ok(config::config_dir()?.join("auth.json"))
 }
 

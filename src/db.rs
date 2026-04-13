@@ -48,7 +48,13 @@ impl DbPool {
 
 /// Creates a shared DbPool using ChronDB's native idle timeout.
 /// Uses audit config path overrides if set, otherwise falls back to the shared db paths.
+/// Returns a disabled pool when audit is disabled (e.g. container with read-only fs).
 pub fn create_pool(audit_config: &AuditConfig) -> Result<Arc<DbPool>> {
+    if !audit_config.enabled {
+        eprintln!("[db] audit disabled, skipping database initialization");
+        return Ok(Arc::new(DbPool::disabled()));
+    }
+
     let data_path = match audit_config.data_path_override() {
         Some(p) => p.to_string(),
         None => config::db_data_path()?,

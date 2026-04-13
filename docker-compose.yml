@@ -1,8 +1,15 @@
 # MCP Proxy Server — Docker Compose example
 #
-# Usage:
-#   cp servers.example.json servers.json   # edit with your backends and tokens
+# Option A — Inline config (no file mount):
+#   Edit the MCP_SERVERS_CONFIG value below, then:
 #   docker compose up --build
+#
+#   Tip: load from file with shell substitution:
+#     MCP_SERVERS_CONFIG="$(cat servers.json)" docker compose up --build
+#
+# Option B — File mount (traditional):
+#   cp servers.example.json servers.json   # edit with your backends and tokens
+#   docker compose --profile file-mount up --build
 #
 # Test:
 #   curl http://localhost:8080/health
@@ -12,7 +19,39 @@
 #     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 services:
+  # Option A: inline config via environment variable
   mcp-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
+    ports:
+      - "8080:8080"
+    environment:
+      MCP_SERVERS_CONFIG: |
+        {
+          "mcpServers": {
+            "example": {
+              "url": "https://example.com/mcp",
+              "headers": {"Authorization": "Bearer ${EXAMPLE_TOKEN}"}
+            }
+          },
+          "serverAuth": {
+            "provider": "bearer",
+            "tokens": ["change-me-alice"]
+          }
+        }
+      # EXAMPLE_TOKEN: "your-token-here"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mcp", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Option B: file-mounted config (activate with --profile file-mount)
+  mcp-proxy-file:
+    profiles: ["file-mount"]
     build:
       context: .
       dockerfile: Dockerfile

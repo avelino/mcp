@@ -27,6 +27,39 @@ docker run --rm ghcr.io/avelino/mcp search github
 
 ## Using your config
 
+There are two ways to provide configuration: **file mount** (traditional) or **inline JSON** (container-friendly).
+
+### Option A: Inline config (recommended for containers)
+
+Pass the entire config as an environment variable — no file mounts needed:
+
+```bash
+docker run --rm \
+  -e MCP_SERVERS_CONFIG='{
+    "mcpServers": {
+      "sentry": {
+        "url": "https://mcp.sentry.dev/sse",
+        "headers": {"Authorization": "Bearer ${SENTRY_TOKEN}"}
+      }
+    }
+  }' \
+  -e SENTRY_TOKEN \
+  ghcr.io/avelino/mcp sentry search_issues '{"query": "is:unresolved"}'
+```
+
+You can also read the JSON from an existing file with `$(cat ...)`:
+
+```bash
+docker run --rm \
+  -e MCP_SERVERS_CONFIG="$(cat servers.json)" \
+  -e SENTRY_TOKEN \
+  ghcr.io/avelino/mcp sentry search_issues '{"query": "is:unresolved"}'
+```
+
+This is ideal for Docker Compose, Kubernetes, and CI/CD — the config lives in the orchestrator, not the filesystem.
+
+### Option B: File mount
+
 Mount your local config directory so the container can access your server definitions:
 
 ```bash
@@ -41,9 +74,8 @@ Servers that need API tokens or other secrets require environment variables. Pas
 
 ```bash
 docker run --rm \
-  -v ~/.config/mcp:/root/.config/mcp \
+  -e MCP_SERVERS_CONFIG='{"mcpServers":{"github":{"url":"https://api.github.com/mcp","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}"}}}}' \
   -e GITHUB_TOKEN \
-  -e SLACK_TOKEN \
   ghcr.io/avelino/mcp github list_repositories '{"query": "mcp"}'
 ```
 
@@ -53,13 +85,124 @@ You can also use an env file:
 # .env
 GITHUB_TOKEN=ghp_xxxx
 SLACK_TOKEN=xoxb-xxxx
+MCP_SERVERS_CONFIG={"mcpServers":{"github":{"url":"https://api.github.com/mcp","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}"}}}}
 ```
 
 ```bash
 docker run --rm \
-  -v ~/.config/mcp:/root/.config/mcp \
   --env-file .env \
-  ghcr.io/avelino/mcp sentry search_issues '{"query": "is:unresolved"}'
+  ghcr.io/avelino/mcp github list_repositories '{"query": "mcp"}'
+```
+
+## Proxy mode (long-running)
+
+Run the MCP proxy as a long-running service:
+
+```bash
+docker run -d \
+  -e MCP_SERVERS_CONFIG='{
+    "mcpServers": {
+      "sentry": {"url": "https://mcp.sentry.dev/sse"}
+    },
+    "serverAuth": {
+      "provider": "bearer",
+      "tokens": ["my-secret-token"]
+    }
+  }' \
+  -p 8080:8080 \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080 --insecure
+```
+
+### With audit logging
+
+The default image disables audit logging (`MCP_AUDIT_ENABLED=false`) because `scratch` images have no writable filesystem. To enable it, mount a volume and override:
+
+```bash
+docker run -d \
+  -e MCP_SERVERS_CONFIG='{"mcpServers":{...}}' \
+  -e MCP_AUDIT_ENABLED=true \
+  -e MCP_AUDIT_PATH=/data/audit/data \
+  -e MCP_AUDIT_INDEX_PATH=/data/audit/index \
+  -v audit-data:/data/audit \
+  -p 8080:8080 \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080 --insecure
+```
+
+## Container environment variables
+
+These variables are especially useful for container deployments. See the full list in the [environment variables reference](../reference/environment-variables.md).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCP_SERVERS_CONFIG` | — | Inline JSON config, no file mount needed |
+| `MCP_CONFIG_DIR` | `~/.config/mcp` | Override config directory |
+| `MCP_AUDIT_ENABLED` | `false` (in Docker image) | Disable audit for read-only fs |
+| `MCP_AUDIT_PATH` | `~/.config/mcp/db/data` | Override audit data path |
+| `MCP_AUDIT_INDEX_PATH` | `~/.config/mcp/db/index` | Override audit index path |
+| `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override OAuth token storage |
+| `MCP_CLASSIFIER_CACHE` | `~/.config/mcp/tool-classification.json` | Override classifier cache |
+
+## Kubernetes
+
+Use `MCP_SERVERS_CONFIG` to inject config via ConfigMap or Secret — no file mount needed:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-proxy
+  template:
+    metadata:
+      labels:
+        app: mcp-proxy
+    spec:
+      containers:
+        - name: mcp
+          image: ghcr.io/avelino/mcp:latest
+          args: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MCP_SERVERS_CONFIG
+              valueFrom:
+                configMapKeyRef:
+                  name: mcp-config
+                  key: servers.json
+            - name: SENTRY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-secrets
+                  key: sentry-token
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-config
+data:
+  servers.json: |
+    {
+      "mcpServers": {
+        "sentry": {
+          "url": "https://mcp.sentry.dev/sse",
+          "headers": {"Authorization": "Bearer ${SENTRY_TOKEN}"}
+        }
+      }
+    }
 ```
 
 ## Shell alias
@@ -88,7 +231,7 @@ Pipe input via stdin with `-i` (Docker's interactive flag):
 
 ```bash
 echo '{"query": "is:unresolved"}' | docker run --rm -i \
-  -v ~/.config/mcp:/root/.config/mcp \
+  -e MCP_SERVERS_CONFIG='{"mcpServers":{"sentry":{"url":"https://mcp.sentry.dev/sse"}}}' \
   ghcr.io/avelino/mcp sentry search_issues
 ```
 
@@ -103,4 +246,5 @@ docker run --rm ghcr.io/avelino/mcp:0.1.0 --help
 ## Limitations
 
 - **Stdio servers only work if the runtime is available inside the container.** The default image includes only the `mcp` binary and `ca-certificates`. Servers that require `npx`, `python`, or other runtimes won't work unless you build a custom image. HTTP servers (configured with `url`) work out of the box.
-- **OAuth browser flow doesn't work in Docker.** For HTTP servers that need OAuth, run `mcp add <server>` on your host first to complete authentication, then mount the config directory (which includes `auth.json`).
+- **OAuth browser flow doesn't work in Docker.** For HTTP servers that need OAuth, run `mcp add <server>` on your host first to complete authentication, then mount the config directory (which includes `auth.json`), or set `MCP_AUTH_PATH` to a mounted volume.
+- **Audit logging is disabled by default** in the Docker image because `scratch` images have no writable filesystem. Enable it with `MCP_AUDIT_ENABLED=true` and mount a volume for the data.
