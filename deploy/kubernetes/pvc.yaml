@@ -1,0 +1,19 @@
+# Optional: persistent audit log storage.
+# Only needed if you set MCP_AUDIT_ENABLED=true in the Deployment.
+#
+# To use: uncomment the persistentVolumeClaim reference in deployment.yaml
+# and replace the emptyDir volume for "data".
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mcp-audit-data
+  namespace: mcp
+  labels:
+    app.kubernetes.io/name: mcp-proxy
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

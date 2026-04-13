@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-config
+  namespace: mcp
+  labels:
+    app.kubernetes.io/name: mcp-proxy
+    app.kubernetes.io/component: config
+data:
+  # MCP proxy configuration. This is the same format as servers.json.
+  # Tokens should use ${ENV_VAR} placeholders — the proxy resolves them
+  # at startup from environment variables injected via the Secret below.
+  #
+  # See: https://github.com/avelino/mcp/blob/main/docs/reference/config-file.md
+  servers.json: |
+    {
+      "mcpServers": {
+        "sentry": {
+          "url": "https://mcp.sentry.dev/sse",
+          "headers": {
+            "Authorization": "Bearer ${SENTRY_TOKEN}"
+          }
+        }
+      }
+    }

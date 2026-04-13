@@ -144,65 +144,12 @@ These variables are especially useful for container deployments. See the full li
 
 ## Kubernetes
 
-Use `MCP_SERVERS_CONFIG` to inject config via ConfigMap or Secret — no file mount needed:
+See the dedicated [Kubernetes deployment guide](./kubernetes.md) for complete manifests with probes, security context, audit logging, and operational guidance.
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mcp-proxy
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mcp-proxy
-  template:
-    metadata:
-      labels:
-        app: mcp-proxy
-    spec:
-      containers:
-        - name: mcp
-          image: ghcr.io/avelino/mcp:latest
-          args: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
-          ports:
-            - containerPort: 8080
-          env:
-            - name: MCP_SERVERS_CONFIG
-              valueFrom:
-                configMapKeyRef:
-                  name: mcp-config
-                  key: servers.json
-            - name: SENTRY_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-secrets
-                  key: sentry-token
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8080
-            periodSeconds: 30
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8080
-            periodSeconds: 10
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mcp-config
-data:
-  servers.json: |
-    {
-      "mcpServers": {
-        "sentry": {
-          "url": "https://mcp.sentry.dev/sse",
-          "headers": {"Authorization": "Bearer ${SENTRY_TOKEN}"}
-        }
-      }
-    }
+Quick start:
+
+```bash
+kubectl apply -k deploy/kubernetes/
 ```
 
 ## Shell alias
