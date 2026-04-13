@@ -39,9 +39,9 @@ graph LR
     Proxy --> N["server N<br/>(stdio/http)"]
 ```
 
-1. Client sends `initialize` — the proxy responds immediately with capabilities
-2. Client calls `tools/list` — the proxy returns tools instantly from persistent cache (if available), while refreshing from real backends in the background. On first run, it connects to all backends to discover their tool lists.
-3. Client calls `tools/call` — the proxy reconnects the target backend on demand (if it was shut down), routes the request, and tracks usage for adaptive timeout
+1. Client sends `initialize` — the proxy responds immediately with capabilities (tools, resources, prompts)
+2. Client calls `tools/list`, `resources/list`, or `prompts/list` — the proxy returns items instantly from persistent cache (tools) or discovery (resources/prompts), aggregated across all backends. Each item is namespaced with `{server}__` prefix.
+3. Client calls `tools/call`, `resources/read`, or `prompts/get` — the proxy reconnects the target backend on demand (if it was shut down), routes the request, and tracks usage for adaptive timeout
 
 ## Concurrency model
 
@@ -90,19 +90,19 @@ graph LR
     style P fill:#4a9,color:#fff
 ```
 
-## Tool namespacing
+## Namespacing
 
-Tools are prefixed with the server name using double underscore (`__`) as separator:
+Tools, resources, and prompts are prefixed with the server name using double underscore (`__`) as separator:
 
-| Server | Original tool | Namespaced tool |
-|--------|--------------|-----------------|
-| sentry | `search_issues` | `sentry__search_issues` |
-| slack | `send_message` | `slack__send_message` |
-| github | `list_repos` | `github__list_repos` |
+| Category | Server | Original | Namespaced |
+|----------|--------|----------|------------|
+| Tool | sentry | `search_issues` | `sentry__search_issues` |
+| Resource | sentry | `issue://123` | `sentry__issue://123` |
+| Prompt | slack | `summarize` | `slack__summarize` |
 
 Descriptions are also prefixed: `[sentry] Search for issues in Sentry`.
 
-This prevents collisions when two servers expose a tool with the same name.
+This prevents collisions when two servers expose items with the same name or URI.
 
 ## Stdio mode (default)
 
@@ -550,8 +550,8 @@ Define reusable roles with server-aware, read/write-aware grants:
 | `server` | string or string[] | Server alias(es) to match. `"*"` matches any server. |
 | `access` | `"read"` \| `"write"` \| `"*"` | Access level (see below) |
 | `tools` | string[] | Optional tool name globs to narrow the grant. Empty = all tools. |
-| `resources` | string[] | Optional (parsed, not enforced yet) |
-| `prompts` | string[] | Optional (parsed, not enforced yet) |
+| `resources` | string[] | Optional resource URI globs to narrow the grant. Empty = all resources. Enforced on `resources/list` (filtering) and `resources/read` (gating). |
+| `prompts` | string[] | Optional prompt name globs to narrow the grant. Empty = all prompts. Enforced on `prompts/list` (filtering) and `prompts/get` (gating). |
 | `deny` | bool | If `true`, turns this into an explicit deny that always wins over allows |
 
 **Access expansion:**
@@ -621,12 +621,18 @@ Both `subjects` and `roles` must match for a rule to apply. Empty `subjects` or 
 
 ### ACL enforcement points
 
-The ACL is enforced at two points in the proxy:
+The ACL is enforced at every dispatch point in the proxy:
 
 1. **`tools/list`** — The response is **filtered** to only include tools the identity is allowed to call. A tool the identity cannot reach is invisible in the listing.
 2. **`tools/call`** — The request is checked against the ACL before it reaches the backend. Denied requests return a JSON-RPC error (`-32603`) with the subject and tool name.
+3. **`resources/list`** — Filtered to only include resources matching the identity's grants.
+4. **`resources/read`** — Checked against the ACL before forwarding to the backend.
+5. **`prompts/list`** — Filtered to only include prompts matching the identity's grants.
+6. **`prompts/get`** — Checked against the ACL before forwarding to the backend.
 
-This dual enforcement means an unauthorized identity can't discover tool names via `tools/list` and can't bypass the filter by guessing tool names in `tools/call`.
+This dual enforcement (listing filter + request gate) applies to all three categories. An unauthorized identity can't discover names via listing and can't bypass the filter by guessing names.
+
+**Legacy schema behavior for resources/prompts:** Listing is always allowed regardless of the `default` policy. Only `resources/read` and `prompts/get` respect `default: deny`. This ensures legacy users migrating from tools-only configs don't lose visibility into what's available.
 
 ### Request timeout
 

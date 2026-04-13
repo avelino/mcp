@@ -76,7 +76,15 @@ Tokens are stored per server URL (normalized, trailing slash stripped). Refresh 
 - `tools/list` → Returns available tools (with pagination via cursor)
 - `tools/call` → Execute a tool with arguments, get results
 
-That's all the CLI needs. It doesn't implement resources, prompts, sampling, or other MCP features — just tools.
+**Resource operations:**
+- `resources/list` → Returns available resources, aggregated across upstreams
+- `resources/read` → Read a specific resource by URI
+
+**Prompt operations:**
+- `prompts/list` → Returns available prompts, aggregated across upstreams
+- `prompts/get` → Get a specific prompt by name (with optional arguments)
+
+All three categories use the same `{server}__{name}` aliasing to keep items from different upstreams distinguishable. Sampling and other MCP features are not implemented.
 
 Responses follow the MCP content model: an array of content items, each with a type (`text`, `image`) and corresponding data. The `isError` flag indicates tool-level errors (distinct from protocol errors).
 

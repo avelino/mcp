@@ -353,8 +353,8 @@ Optional. Controls which users can access which tools. Supports two schemas: **r
 | `server` | string or string[] | *required* | Server alias(es) to match (`"*"` = any) |
 | `access` | `"read"` \| `"write"` \| `"*"` | *required* | Access level |
 | `tools` | string[] | `[]` (all tools) | Tool name globs to narrow the grant |
-| `resources` | string[] | `[]` | Parsed but not enforced yet |
-| `prompts` | string[] | `[]` | Parsed but not enforced yet |
+| `resources` | string[] | `[]` (all resources) | Resource URI globs to narrow the grant. Same `*` syntax as tools. |
+| `prompts` | string[] | `[]` (all prompts) | Prompt name globs to narrow the grant. Same `*` syntax as tools. |
 | `deny` | bool | `false` | Turns grant into explicit deny (always wins over allows) |
 
 #### Subject config

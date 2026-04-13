@@ -365,16 +365,22 @@ mcp acl check --subject alice --server grafana --tool query_prometheus
 mcp acl check --subject bob --server databricks --tool execute_sql --access write
 mcp acl check --role dev --server github --all-tools
 mcp acl check --subject alice --server github --all-tools --format json
+mcp acl check --subject alice --server sentry --resource "issue://123"
+mcp acl check --subject bob --server ai --prompt summarize
 ```
 
 **Flags:**
 - `--subject <name>` — subject to check (looks up roles from `subjects` map in ACL config)
 - `--server <alias>` — backend server alias (required)
-- `--tool <name>` — single tool to check (required unless `--all-tools`)
-- `--access read|write` — override the tool classification (if omitted, the CLI connects to the backend to classify the tool automatically)
+- `--tool <name>` — single tool to check
+- `--resource <uri>` — resource URI to check (mutually exclusive with `--tool` and `--prompt`)
+- `--prompt <name>` — prompt name to check (mutually exclusive with `--tool` and `--resource`)
+- `--access read|write` — override the tool classification (if omitted, the CLI connects to the backend to classify the tool automatically; not applicable to resources/prompts)
 - `--role <name>` — check a hypothetical role (creates a synthetic identity)
 - `--all-tools` — connect to the backend, list all tools, and check each one
 - `--format table|json` — override the auto-detected output format
+
+One of `--tool`, `--resource`, `--prompt`, or `--all-tools` is required.
 
 **Single-tool output:**
 
