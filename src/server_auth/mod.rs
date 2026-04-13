@@ -139,9 +139,10 @@ pub fn is_resource_allowed(
     resource_uri: &str,
     acl: &Option<AclConfig>,
     ctx: Option<&acl::ResourceContext>,
+    is_list: bool,
 ) -> Decision {
     match acl {
-        Some(acl) => acl::is_resource_allowed(identity, resource_uri, acl, ctx),
+        Some(acl) => acl::is_resource_allowed(identity, resource_uri, acl, ctx, is_list),
         None => Decision {
             allowed: true,
             matched_rule: MatchedRule::NoAcl,
@@ -159,9 +160,10 @@ pub fn is_prompt_allowed(
     prompt_name: &str,
     acl: &Option<AclConfig>,
     ctx: Option<&acl::PromptContext>,
+    is_list: bool,
 ) -> Decision {
     match acl {
-        Some(acl) => acl::is_prompt_allowed(identity, prompt_name, acl, ctx),
+        Some(acl) => acl::is_prompt_allowed(identity, prompt_name, acl, ctx, is_list),
         None => Decision {
             allowed: true,
             matched_rule: MatchedRule::NoAcl,

@@ -210,20 +210,26 @@ pub(super) fn grant_covers_read(grant: &Grant) -> bool {
     matches!(grant.access, AccessLevel::All | AccessLevel::Read)
 }
 
-/// Check if a tool is allowed for the given identity.
-/// Legacy schema uses first-match-wins; role-based uses union evaluation.
-/// Returns a structured `Decision` with provenance information.
+/// Check if a resource is allowed for the given identity.
+/// For legacy schemas, `is_list` controls behavior: listing is always allowed,
+/// but read requires `default: allow`.
 pub(super) fn is_resource_allowed(
     identity: &AuthIdentity,
     _resource_uri: &str,
     acl: &super::AclConfig,
     ctx: Option<&ResourceContext>,
+    is_list: bool,
 ) -> Decision {
     match acl {
         super::AclConfig::Legacy(legacy) => {
-            // Legacy: deny read unless default is allow.
+            // Legacy: allow list unconditionally; deny read unless default is allow.
+            let allowed = if is_list {
+                true
+            } else {
+                legacy.default == AclPolicy::Allow
+            };
             Decision {
-                allowed: legacy.default == AclPolicy::Allow,
+                allowed,
                 matched_rule: MatchedRule::LegacyDefault,
                 classification_kind: None,
                 classification_source: None,
@@ -245,17 +251,26 @@ pub(super) fn is_resource_allowed(
     }
 }
 
+/// Check if a prompt is allowed for the given identity.
+/// For legacy schemas, `is_list` controls behavior: listing is always allowed,
+/// but get requires `default: allow`.
 pub(super) fn is_prompt_allowed(
     identity: &AuthIdentity,
     _prompt_name: &str,
     acl: &super::AclConfig,
     ctx: Option<&PromptContext>,
+    is_list: bool,
 ) -> Decision {
     match acl {
         super::AclConfig::Legacy(legacy) => {
-            // Legacy: deny get unless default is allow.
+            // Legacy: allow list unconditionally; deny get unless default is allow.
+            let allowed = if is_list {
+                true
+            } else {
+                legacy.default == AclPolicy::Allow
+            };
             Decision {
-                allowed: legacy.default == AclPolicy::Allow,
+                allowed,
                 matched_rule: MatchedRule::LegacyDefault,
                 classification_kind: None,
                 classification_source: None,
@@ -1838,7 +1853,7 @@ mod tests {
             server_alias: "sentry",
             resource_uri: "issue://123",
         };
-        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx), false);
         assert!(d.allowed);
     }
 
@@ -1849,7 +1864,7 @@ mod tests {
             server_alias: "sentry",
             resource_uri: "project://foo",
         };
-        let d = is_resource_allowed(&bob(), "sentry__project://foo", &acl, Some(&ctx));
+        let d = is_resource_allowed(&bob(), "sentry__project://foo", &acl, Some(&ctx), false);
         assert!(!d.allowed);
         assert_eq!(d.matched_rule, MatchedRule::RbacDefault);
     }
@@ -1861,7 +1876,7 @@ mod tests {
             server_alias: "sentry",
             resource_uri: "project://foo",
         };
-        let d = is_resource_allowed(&alice(), "sentry__project://foo", &acl, Some(&ctx));
+        let d = is_resource_allowed(&alice(), "sentry__project://foo", &acl, Some(&ctx), false);
         assert!(d.allowed);
     }
 
@@ -1873,7 +1888,7 @@ mod tests {
             resource_uri: "issue://123",
         };
         let unknown = AuthIdentity::new("charlie", vec![]);
-        let d = is_resource_allowed(&unknown, "sentry__issue://123", &acl, Some(&ctx));
+        let d = is_resource_allowed(&unknown, "sentry__issue://123", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -1904,7 +1919,7 @@ mod tests {
             server_alias: "sentry",
             resource_uri: "secret://key",
         };
-        let d = is_resource_allowed(&bob(), "sentry__secret://key", &acl, Some(&ctx));
+        let d = is_resource_allowed(&bob(), "sentry__secret://key", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -1915,7 +1930,7 @@ mod tests {
             server_alias: "sentry",
             resource_uri: "issue://123",
         };
-        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx), false);
         assert!(!d.allowed);
         assert_eq!(d.matched_rule, MatchedRule::LegacyDefault);
     }
@@ -1927,7 +1942,7 @@ mod tests {
             server_alias: "sentry",
             resource_uri: "issue://123",
         };
-        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx), false);
         assert!(d.allowed);
     }
 
@@ -1939,7 +1954,7 @@ mod tests {
             server_alias: "github",
             resource_uri: "issue://123",
         };
-        let d = is_resource_allowed(&bob(), "github__issue://123", &acl, Some(&ctx));
+        let d = is_resource_allowed(&bob(), "github__issue://123", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -1965,7 +1980,7 @@ mod tests {
             server_alias: "sentry",
             resource_uri: "issue://123",
         };
-        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx));
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx), false);
         // write-only grant should NOT cover read access for resources
         assert!(!d.allowed);
     }
@@ -2000,7 +2015,7 @@ mod tests {
             server_alias: "ai",
             prompt_name: "summarize",
         };
-        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx), false);
         assert!(d.allowed);
     }
 
@@ -2011,7 +2026,7 @@ mod tests {
             server_alias: "ai",
             prompt_name: "summarize_long",
         };
-        let d = is_prompt_allowed(&bob(), "ai__summarize_long", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "ai__summarize_long", &acl, Some(&ctx), false);
         assert!(d.allowed);
     }
 
@@ -2022,7 +2037,7 @@ mod tests {
             server_alias: "ai",
             prompt_name: "translate",
         };
-        let d = is_prompt_allowed(&bob(), "ai__translate", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "ai__translate", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -2033,7 +2048,7 @@ mod tests {
             server_alias: "other",
             prompt_name: "summarize",
         };
-        let d = is_prompt_allowed(&bob(), "other__summarize", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "other__summarize", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -2064,7 +2079,7 @@ mod tests {
             server_alias: "ai",
             prompt_name: "dangerous_prompt",
         };
-        let d = is_prompt_allowed(&bob(), "ai__dangerous_prompt", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "ai__dangerous_prompt", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -2075,7 +2090,7 @@ mod tests {
             server_alias: "ai",
             prompt_name: "summarize",
         };
-        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -2086,7 +2101,7 @@ mod tests {
             server_alias: "ai",
             prompt_name: "summarize",
         };
-        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx), false);
         assert!(d.allowed);
     }
 
@@ -2097,7 +2112,7 @@ mod tests {
             server_alias: "other",
             prompt_name: "summarize",
         };
-        let d = is_prompt_allowed(&bob(), "other__summarize", &acl, Some(&ctx));
+        let d = is_prompt_allowed(&bob(), "other__summarize", &acl, Some(&ctx), false);
         assert!(!d.allowed);
     }
 
@@ -2116,5 +2131,33 @@ mod tests {
         assert!(grant_covers_read(&grant));
         grant.access = AccessLevel::Write;
         assert!(!grant_covers_read(&grant));
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy list vs read/get distinction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resource_legacy_deny_default_allows_list() {
+        let acl = super::super::AclConfig::legacy(AclPolicy::Deny, vec![]);
+        let ctx = ResourceContext {
+            server_alias: "sentry",
+            resource_uri: "issue://123",
+        };
+        // List is always allowed in legacy, even with default=deny
+        let d = is_resource_allowed(&bob(), "sentry__issue://123", &acl, Some(&ctx), true);
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn test_prompt_legacy_deny_default_allows_list() {
+        let acl = super::super::AclConfig::legacy(AclPolicy::Deny, vec![]);
+        let ctx = PromptContext {
+            server_alias: "ai",
+            prompt_name: "summarize",
+        };
+        // List is always allowed in legacy, even with default=deny
+        let d = is_prompt_allowed(&bob(), "ai__summarize", &acl, Some(&ctx), true);
+        assert!(d.allowed);
     }
 }

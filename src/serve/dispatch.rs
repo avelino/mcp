@@ -211,7 +211,7 @@ pub(crate) async fn dispatch_request(
                     }
                 });
                 let decision =
-                    server_auth::is_resource_allowed(identity, &r.uri, acl, ctx.as_ref());
+                    server_auth::is_resource_allowed(identity, &r.uri, acl, ctx.as_ref(), true);
                 if decision.allowed {
                     resources_allowed.push(serde_json::to_value(r).unwrap());
                 } else {
@@ -290,8 +290,13 @@ pub(crate) async fn dispatch_request(
                             server_alias: server.as_str(),
                             resource_uri: original_uri.as_str(),
                         };
-                        let decision =
-                            server_auth::is_resource_allowed(identity, &uri, acl, Some(&ctx));
+                        let decision = server_auth::is_resource_allowed(
+                            identity,
+                            &uri,
+                            acl,
+                            Some(&ctx),
+                            false,
+                        );
                         if !decision.allowed {
                             decision_for_audit = Some(decision.clone());
                             server_name_for_audit = Some(server.clone());
@@ -334,7 +339,15 @@ pub(crate) async fn dispatch_request(
                             &format!("failed to connect to backend '{server}': {e:#}"),
                         ),
                         Ok(client) => match client.read_resource(&original_uri).await {
-                            Ok(result) => {
+                            Ok(mut result) => {
+                                // Rewrite content URIs to namespaced form so the
+                                // client sees the same URI it requested.
+                                let namespaced_uri = format!("{server}{SEPARATOR}{original_uri}");
+                                for content in &mut result.contents {
+                                    if content.uri == original_uri {
+                                        content.uri = namespaced_uri.clone();
+                                    }
+                                }
                                 JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap())
                             }
                             Err(e) => {
@@ -371,7 +384,7 @@ pub(crate) async fn dispatch_request(
                     }
                 });
                 let decision =
-                    server_auth::is_prompt_allowed(identity, &pr.name, acl, ctx.as_ref());
+                    server_auth::is_prompt_allowed(identity, &pr.name, acl, ctx.as_ref(), true);
                 if decision.allowed {
                     prompts_allowed.push(serde_json::to_value(pr).unwrap());
                 } else {
@@ -455,8 +468,13 @@ pub(crate) async fn dispatch_request(
                             server_alias: server.as_str(),
                             prompt_name: original_name.as_str(),
                         };
-                        let decision =
-                            server_auth::is_prompt_allowed(identity, &prompt_name, acl, Some(&ctx));
+                        let decision = server_auth::is_prompt_allowed(
+                            identity,
+                            &prompt_name,
+                            acl,
+                            Some(&ctx),
+                            false,
+                        );
                         if !decision.allowed {
                             decision_for_audit = Some(decision.clone());
                             server_name_for_audit = Some(server.clone());
@@ -998,8 +1016,8 @@ mod tests {
         let resp = dispatch(server, req, &bob, &acl).await;
         let result = resp.result.unwrap();
         let prompts = result["prompts"].as_array().unwrap();
-        // Legacy default=deny → prompts filtered out
-        assert_eq!(prompts.len(), 0);
+        // Legacy default=deny → listing still allowed (only read/get denied)
+        assert_eq!(prompts.len(), 1);
     }
 
     #[tokio::test]
