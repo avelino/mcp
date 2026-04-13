@@ -15,11 +15,19 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
 COPY src/ src/
 RUN touch src/main.rs && cargo build --release
 
-# --- Runtime stage (scratch = only binary + CA certs) ---
-FROM scratch
+# --- CA certs (lightweight source for release stage) ---
+FROM alpine:latest AS certs
 
+# --- Release stage (pre-built binary, used by CI/CD with --target release) ---
+FROM scratch AS release
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --chmod=755 mcp /usr/local/bin/mcp
+EXPOSE 8080
+ENTRYPOINT ["mcp"]
+
+# --- Default stage (build from source) ---
+FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/target/release/mcp /usr/local/bin/mcp
-
 EXPOSE 8080
 ENTRYPOINT ["mcp"]

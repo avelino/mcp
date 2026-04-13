@@ -171,6 +171,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: docker-amd64
+          target: release
           platforms: linux/amd64
           push: true
           tags: ghcr.io/avelino/mcp:${{ steps.prep.outputs.tag }}-amd64
@@ -180,6 +181,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: docker-arm64
+          target: release
           platforms: linux/arm64
           push: true
           tags: ghcr.io/avelino/mcp:${{ steps.prep.outputs.tag }}-arm64
