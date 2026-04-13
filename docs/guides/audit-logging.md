@@ -50,7 +50,7 @@ Everything:
 | `mcp <server> --list` | `tools/list` |
 | `mcp <server> --info` | `tools/info` |
 | `mcp <server> <tool>` | `tools/call` |
-| Proxy: any JSON-RPC request | `initialize`, `tools/list`, `tools/call` |
+| Proxy: any JSON-RPC request | `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, `prompts/get` |
 
 The only command that doesn't log itself is `mcp logs` (that would be recursive).
 
