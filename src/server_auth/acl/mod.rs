@@ -103,8 +103,9 @@ pub fn is_resource_allowed(
     resource_uri: &str,
     acl: &AclConfig,
     ctx: Option<&ResourceContext>,
+    is_list: bool,
 ) -> Decision {
-    eval::is_resource_allowed(identity, resource_uri, acl, ctx)
+    eval::is_resource_allowed(identity, resource_uri, acl, ctx, is_list)
 }
 
 pub fn is_prompt_allowed(
@@ -112,6 +113,7 @@ pub fn is_prompt_allowed(
     prompt_name: &str,
     acl: &AclConfig,
     ctx: Option<&PromptContext>,
+    is_list: bool,
 ) -> Decision {
-    eval::is_prompt_allowed(identity, prompt_name, acl, ctx)
+    eval::is_prompt_allowed(identity, prompt_name, acl, ctx, is_list)
 }

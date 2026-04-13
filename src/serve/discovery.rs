@@ -50,8 +50,20 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
             let result = tokio::time::timeout(discovery_timeout, async {
                 let client = McpClient::connect(&server_config).await?;
                 let tools = client.list_tools().await?;
-                let resources = client.list_resources().await.unwrap_or_default();
-                let prompts = client.list_prompts().await.unwrap_or_default();
+                let resources = match client.list_resources().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[serve] {name}: resources/list not supported or failed: {e:#}");
+                        vec![]
+                    }
+                };
+                let prompts = match client.list_prompts().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[serve] {name}: prompts/list not supported or failed: {e:#}");
+                        vec![]
+                    }
+                };
                 Ok::<_, anyhow::Error>((client, tools, resources, prompts))
             })
             .await;
@@ -216,8 +228,20 @@ pub(crate) async fn connect_backend(
     eprintln!("[serve] connecting to {server_name}...");
     let client = McpClient::connect(&config).await?;
     let tools = client.list_tools().await?;
-    let resources = client.list_resources().await.unwrap_or_default();
-    let prompts = client.list_prompts().await.unwrap_or_default();
+    let resources = match client.list_resources().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[serve] {server_name}: resources/list not supported or failed: {e:#}");
+            vec![]
+        }
+    };
+    let prompts = match client.list_prompts().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[serve] {server_name}: prompts/list not supported or failed: {e:#}");
+            vec![]
+        }
+    };
     let client = Arc::new(client);
 
     let prev = {

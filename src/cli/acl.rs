@@ -482,7 +482,8 @@ pub async fn handle_acl_check(
             server_alias: &server,
             resource_uri: uri,
         };
-        let d = server_auth::is_resource_allowed(&identity, &namespaced, acl_config, Some(&ctx));
+        let d =
+            server_auth::is_resource_allowed(&identity, &namespaced, acl_config, Some(&ctx), false);
         results.push(decision_to_result(uri, &d));
     }
 
@@ -492,7 +493,8 @@ pub async fn handle_acl_check(
             server_alias: &server,
             prompt_name: name,
         };
-        let d = server_auth::is_prompt_allowed(&identity, &namespaced, acl_config, Some(&ctx));
+        let d =
+            server_auth::is_prompt_allowed(&identity, &namespaced, acl_config, Some(&ctx), false);
         results.push(decision_to_result(name, &d));
     }
 
