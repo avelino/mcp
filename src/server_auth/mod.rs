@@ -2,7 +2,7 @@ mod acl;
 mod providers;
 
 pub(crate) use acl::glob_match;
-pub use acl::{AclConfig, ToolContext};
+pub use acl::{AclConfig, Decision, MatchedRule, ToolContext};
 pub use providers::{BearerTokenAuth, ForwardedUserAuth, NoAuth};
 
 // Re-exported for tests in other modules (serve.rs)
@@ -139,10 +139,17 @@ pub fn is_tool_allowed(
     tool_name: &str,
     acl: &Option<AclConfig>,
     ctx: Option<&acl::ToolContext>,
-) -> bool {
+) -> Decision {
     match acl {
         Some(acl) => acl::is_tool_allowed(identity, tool_name, acl, ctx),
-        None => true,
+        None => Decision {
+            allowed: true,
+            matched_rule: MatchedRule::NoAcl,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
+            access_evaluated: None,
+        },
     }
 }
 

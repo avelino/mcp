@@ -56,6 +56,19 @@ pub struct AuditEntry {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Value>,
+    // -- ACL decision fields (added by issue #56) --
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl_matched_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl_access_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_confidence: Option<f32>,
 }
 
 impl AuditEntry {
@@ -362,6 +375,12 @@ mod tests {
             success: true,
             error_message: None,
             arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         }
     }
 
@@ -377,6 +396,12 @@ mod tests {
             success: false,
             error_message: Some("connection timeout".to_string()),
             arguments: None,
+            acl_decision: None,
+            acl_matched_rule: None,
+            acl_access_kind: None,
+            classification_kind: None,
+            classification_source: None,
+            classification_confidence: None,
         }
     }
 
@@ -685,5 +710,63 @@ mod tests {
         let obj = Value::Object(map);
         let entries = parse_entries_from_list(&obj, 10).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    // --- ACL enrichment tests (issue #56) ---
+
+    #[test]
+    fn test_audit_acl_fields_serialized_when_set() {
+        let mut entry = sample_entry();
+        entry.acl_decision = Some("deny".to_string());
+        entry.acl_matched_rule = Some("dev[1]".to_string());
+        entry.acl_access_kind = Some("write".to_string());
+        entry.classification_kind = Some("write".to_string());
+        entry.classification_source = Some("classifier".to_string());
+        entry.classification_confidence = Some(0.81);
+
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["acl_decision"], "deny");
+        assert_eq!(json["acl_matched_rule"], "dev[1]");
+        assert_eq!(json["acl_access_kind"], "write");
+        assert_eq!(json["classification_kind"], "write");
+        assert_eq!(json["classification_source"], "classifier");
+        assert!((json["classification_confidence"].as_f64().unwrap() - 0.81).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_audit_acl_fields_omitted_when_none() {
+        let entry = sample_entry();
+        let json = serde_json::to_value(&entry).unwrap();
+        let obj = json.as_object().unwrap();
+        // ACL fields should be absent (not null) when None
+        assert!(!obj.contains_key("acl_decision"));
+        assert!(!obj.contains_key("acl_matched_rule"));
+        assert!(!obj.contains_key("acl_access_kind"));
+        assert!(!obj.contains_key("classification_kind"));
+        assert!(!obj.contains_key("classification_source"));
+        assert!(!obj.contains_key("classification_confidence"));
+    }
+
+    #[test]
+    fn test_audit_backwards_compat_deser() {
+        // Old JSON without ACL fields should deserialize with None values
+        let old_json = json!({
+            "timestamp": "2026-03-16T18:30:00Z",
+            "source": "serve:http",
+            "method": "tools/call",
+            "tool_name": "sentry__search_issues",
+            "server_name": "sentry",
+            "identity": "alice",
+            "duration_ms": 142,
+            "success": true,
+            "error_message": null
+        });
+        let entry: AuditEntry = serde_json::from_value(old_json).unwrap();
+        assert!(entry.acl_decision.is_none());
+        assert!(entry.acl_matched_rule.is_none());
+        assert!(entry.acl_access_kind.is_none());
+        assert!(entry.classification_kind.is_none());
+        assert!(entry.classification_source.is_none());
+        assert!(entry.classification_confidence.is_none());
     }
 }

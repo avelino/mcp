@@ -354,3 +354,51 @@ mcp acl classify --server databricks --format json | jq '.[] | {tool, kind}'
 The JSON form is an array of `{server, tool, kind, confidence, source, reasons}` objects, suitable for scripting or diffing across config changes.
 
 See [Tool ACL overrides](./config-file.md#tool-acl-overrides) for how to pin tools manually, and [`docs/acl-redesign-plan.md`](../acl-redesign-plan.md) for the full redesign context.
+
+### `mcp acl check`
+
+Test an ACL decision without starting the proxy. Useful for validating
+policy changes before rolling them out.
+
+```bash
+mcp acl check --subject alice --server grafana --tool query_prometheus
+mcp acl check --subject bob --server databricks --tool execute_sql --access write
+mcp acl check --role dev --server github --all-tools
+mcp acl check --subject alice --server github --all-tools --format json
+```
+
+**Flags:**
+- `--subject <name>` — subject to check (looks up roles from `subjects` map in ACL config)
+- `--server <alias>` — backend server alias (required)
+- `--tool <name>` — single tool to check (required unless `--all-tools`)
+- `--access read|write` — override the tool classification for single-tool checks
+- `--role <name>` — check a hypothetical role (creates a synthetic identity)
+- `--all-tools` — connect to the backend, list all tools, and check each one
+- `--format table|json` — override the auto-detected output format
+
+**Single-tool output:**
+
+```
+ALLOW  via dev[0]  access=read  classification=classifier:read (confidence 0.72)
+```
+
+**Multi-tool output (`--all-tools`):**
+
+```
+TOOL                                     DECISION RULE                      ACCESS KIND       SOURCE      CONF
+query_prometheus                         ALLOW  dev[0]                    read   read       classifier  0.72
+update_dashboard                         DENY   default                   -      write      classifier  0.81
+```
+
+**Exit code:** `0` for allow, `1` for deny (single-tool mode only).
+`--all-tools` always exits `0` since mixed results are expected.
+
+**Examples:**
+
+```bash
+# CI pre-deploy check: ensure dev role can read grafana
+mcp acl check --role dev --server grafana --tool query_prometheus || echo "BLOCKED"
+
+# Audit what a role can reach on a server
+mcp acl check --role dev --server github --all-tools --format json | jq '.[] | select(.decision=="DENY")'
+```

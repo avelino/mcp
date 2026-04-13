@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use serde::Deserialize;
 
 use super::AuthIdentity;
-use crate::classifier::{Kind, ToolClassification};
+use crate::classifier::{Kind, Source, ToolClassification};
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -62,6 +63,16 @@ pub enum AccessLevel {
     Write,
     #[serde(rename = "*")]
     All,
+}
+
+impl AccessLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AccessLevel::Read => "read",
+            AccessLevel::Write => "write",
+            AccessLevel::All => "*",
+        }
+    }
 }
 
 /// A single grant entry within a role definition or a subject's `extra` list.
@@ -171,22 +182,91 @@ pub struct ToolContext<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Decision — structured result from ACL evaluation
+// ---------------------------------------------------------------------------
+
+/// Stable identifier for the rule that determined the access decision.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchedRule {
+    /// Legacy schema: rule at index N matched.
+    Legacy(usize),
+    /// Legacy schema default policy.
+    LegacyDefault,
+    /// RBAC: grant from role at grant-index within that role.
+    RoleGrant { role: String, index: usize },
+    /// RBAC: extra grant on a subject.
+    SubjectExtra { subject: String, index: usize },
+    /// RBAC default policy.
+    RbacDefault,
+    /// No ACL configured.
+    NoAcl,
+}
+
+impl fmt::Display for MatchedRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MatchedRule::Legacy(i) => write!(f, "legacy[{i}]"),
+            MatchedRule::LegacyDefault => write!(f, "legacy:default"),
+            MatchedRule::RoleGrant { role, index } => write!(f, "{role}[{index}]"),
+            MatchedRule::SubjectExtra { subject, index } => {
+                write!(f, "{subject}.extra[{index}]")
+            }
+            MatchedRule::RbacDefault => write!(f, "default"),
+            MatchedRule::NoAcl => write!(f, "no-acl"),
+        }
+    }
+}
+
+/// Structured result from ACL evaluation, carrying the decision and its provenance.
+#[derive(Debug, Clone)]
+pub struct Decision {
+    pub allowed: bool,
+    pub matched_rule: MatchedRule,
+    pub classification_kind: Option<Kind>,
+    pub classification_source: Option<Source>,
+    pub classification_confidence: Option<f32>,
+    pub access_evaluated: Option<AccessLevel>,
+}
+
+impl Decision {
+    fn from_ctx(allowed: bool, matched_rule: MatchedRule, ctx: Option<&ToolContext>) -> Self {
+        let (kind, source, confidence) = match ctx.and_then(|c| c.classification) {
+            Some(cls) => (Some(cls.kind), Some(cls.source), Some(cls.confidence)),
+            None => (None, None, None),
+        };
+        Self {
+            allowed,
+            matched_rule,
+            classification_kind: kind,
+            classification_source: source,
+            classification_confidence: confidence,
+            access_evaluated: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unified dispatcher
 // ---------------------------------------------------------------------------
 
 /// Check if a tool is allowed for the given identity.
 /// Legacy schema uses first-match-wins; role-based uses union evaluation.
+/// Returns a structured `Decision` with provenance information.
 pub fn is_tool_allowed(
     identity: &AuthIdentity,
     tool_name: &str,
     acl: &AclConfig,
     ctx: Option<&ToolContext>,
-) -> bool {
+) -> Decision {
     match acl {
-        AclConfig::Legacy(legacy) => legacy_is_tool_allowed(identity, tool_name, legacy),
+        AclConfig::Legacy(legacy) => legacy_is_tool_allowed(identity, tool_name, legacy, ctx),
         AclConfig::RoleBased(rbac) => match ctx {
             Some(c) => is_tool_allowed_rbac(identity, c, rbac),
-            None => rbac.default == AclPolicy::Allow,
+            None => Decision::from_ctx(
+                rbac.default == AclPolicy::Allow,
+                MatchedRule::RbacDefault,
+                None,
+            ),
         },
     }
 }
@@ -195,17 +275,26 @@ pub fn is_tool_allowed(
 // Legacy evaluator (first-match-wins, unchanged logic)
 // ---------------------------------------------------------------------------
 
-fn legacy_is_tool_allowed(identity: &AuthIdentity, tool_name: &str, acl: &LegacyAclConfig) -> bool {
-    for rule in &acl.rules {
+fn legacy_is_tool_allowed(
+    identity: &AuthIdentity,
+    tool_name: &str,
+    acl: &LegacyAclConfig,
+    ctx: Option<&ToolContext>,
+) -> Decision {
+    for (i, rule) in acl.rules.iter().enumerate() {
         if !matches_identity(identity, rule) {
             continue;
         }
         if !matches_tool(tool_name, &rule.tools) {
             continue;
         }
-        return rule.policy == AclPolicy::Allow;
+        return Decision::from_ctx(rule.policy == AclPolicy::Allow, MatchedRule::Legacy(i), ctx);
     }
-    acl.default == AclPolicy::Allow
+    Decision::from_ctx(
+        acl.default == AclPolicy::Allow,
+        MatchedRule::LegacyDefault,
+        ctx,
+    )
 }
 
 fn matches_identity(identity: &AuthIdentity, rule: &AclRule) -> bool {
@@ -234,48 +323,99 @@ fn matches_tool(tool_name: &str, patterns: &[String]) -> bool {
 // Role-based evaluator (union semantics)
 // ---------------------------------------------------------------------------
 
+/// A grant tagged with its provenance (which role/subject it came from).
+struct TaggedGrant<'a> {
+    grant: &'a Grant,
+    origin: MatchedRule,
+}
+
 fn is_tool_allowed_rbac(
     identity: &AuthIdentity,
     ctx: &ToolContext,
     acl: &RoleBasedAclConfig,
-) -> bool {
+) -> Decision {
     let (role_names, extra_grants) = resolve_subject(identity, acl);
 
-    // Collect all grants from matched roles + extra.
-    let mut all_grants: Vec<&Grant> = Vec::new();
+    let (cls_kind, cls_source, cls_confidence) = match ctx.classification {
+        Some(cls) => (Some(cls.kind), Some(cls.source), Some(cls.confidence)),
+        None => (None, None, None),
+    };
+
+    // Collect all grants tagged with provenance.
+    let mut all_grants: Vec<TaggedGrant> = Vec::new();
     for role_name in &role_names {
         if let Some(grants) = acl.roles.get(role_name) {
-            all_grants.extend(grants.iter());
+            for (i, grant) in grants.iter().enumerate() {
+                all_grants.push(TaggedGrant {
+                    grant,
+                    origin: MatchedRule::RoleGrant {
+                        role: role_name.clone(),
+                        index: i,
+                    },
+                });
+            }
         }
     }
-    all_grants.extend(extra_grants);
+    for (i, grant) in extra_grants.iter().enumerate() {
+        all_grants.push(TaggedGrant {
+            grant,
+            origin: MatchedRule::SubjectExtra {
+                subject: identity.subject.clone(),
+                index: i,
+            },
+        });
+    }
 
     // Filter to grants that match server + tool.
-    let matching: Vec<&Grant> = all_grants
-        .into_iter()
-        .filter(|g| matches_server(g, ctx.server_alias) && matches_tool_grant(g, ctx.tool_name))
+    let matching: Vec<&TaggedGrant> = all_grants
+        .iter()
+        .filter(|tg| {
+            matches_server(tg.grant, ctx.server_alias)
+                && matches_tool_grant(tg.grant, ctx.tool_name)
+        })
         .collect();
 
     let kind = ctx.classification.map(|c| c.kind);
 
     // Union evaluation: deny always wins, but only for grants that also
     // cover the current access classification.
-    if matching
+    if let Some(tg) = matching
         .iter()
-        .any(|g| g.deny && deny_covers_access(g, kind, acl.strict_classification))
+        .find(|tg| tg.grant.deny && deny_covers_access(tg.grant, kind, acl.strict_classification))
     {
-        return false;
+        return Decision {
+            allowed: false,
+            matched_rule: tg.origin.clone(),
+            classification_kind: cls_kind,
+            classification_source: cls_source,
+            classification_confidence: cls_confidence,
+            access_evaluated: Some(tg.grant.access.clone()),
+        };
     }
 
-    if matching
+    if let Some(tg) = matching
         .iter()
-        .any(|g| grant_covers_access(g, kind, acl.strict_classification))
+        .find(|tg| grant_covers_access(tg.grant, kind, acl.strict_classification))
     {
-        return true;
+        return Decision {
+            allowed: true,
+            matched_rule: tg.origin.clone(),
+            classification_kind: cls_kind,
+            classification_source: cls_source,
+            classification_confidence: cls_confidence,
+            access_evaluated: Some(tg.grant.access.clone()),
+        };
     }
 
     // No matching grant -> fall back to default.
-    acl.default == AclPolicy::Allow
+    Decision {
+        allowed: acl.default == AclPolicy::Allow,
+        matched_rule: MatchedRule::RbacDefault,
+        classification_kind: cls_kind,
+        classification_source: cls_source,
+        classification_confidence: cls_confidence,
+        access_evaluated: None,
+    }
 }
 
 /// Resolve roles and extra grants for an identity.
@@ -453,6 +593,16 @@ mod tests {
         AuthIdentity::anonymous()
     }
 
+    /// Shorthand: call is_tool_allowed and return just the bool.
+    fn is_tool_allowed_bool(
+        identity: &AuthIdentity,
+        tool_name: &str,
+        acl: &AclConfig,
+        ctx: Option<&ToolContext>,
+    ) -> bool {
+        is_tool_allowed(identity, tool_name, acl, ctx).allowed
+    }
+
     fn make_classification(kind: Kind) -> ToolClassification {
         ToolClassification {
             kind,
@@ -469,14 +619,14 @@ mod tests {
     #[test]
     fn test_default_allow_no_rules() {
         let acl = AclConfig::legacy(AclPolicy::Allow, vec![]);
-        assert!(is_tool_allowed(&alice(), "any_tool", &acl, None));
-        assert!(is_tool_allowed(&anon(), "any_tool", &acl, None));
+        assert!(is_tool_allowed_bool(&alice(), "any_tool", &acl, None));
+        assert!(is_tool_allowed_bool(&anon(), "any_tool", &acl, None));
     }
 
     #[test]
     fn test_default_deny_no_rules() {
         let acl = AclConfig::legacy(AclPolicy::Deny, vec![]);
-        assert!(!is_tool_allowed(&alice(), "any_tool", &acl, None));
+        assert!(!is_tool_allowed_bool(&alice(), "any_tool", &acl, None));
     }
 
     #[test]
@@ -491,14 +641,19 @@ mod tests {
             }],
         );
 
-        assert!(!is_tool_allowed(
+        assert!(!is_tool_allowed_bool(
             &bob(),
             "sentry__search_issues",
             &acl,
             None
         ));
-        assert!(is_tool_allowed(&bob(), "slack__send_message", &acl, None));
-        assert!(is_tool_allowed(
+        assert!(is_tool_allowed_bool(
+            &bob(),
+            "slack__send_message",
+            &acl,
+            None
+        ));
+        assert!(is_tool_allowed_bool(
             &alice(),
             "sentry__search_issues",
             &acl,
@@ -518,8 +673,8 @@ mod tests {
             }],
         );
 
-        assert!(is_tool_allowed(&alice(), "anything", &acl, None));
-        assert!(!is_tool_allowed(&bob(), "anything", &acl, None));
+        assert!(is_tool_allowed_bool(&alice(), "anything", &acl, None));
+        assert!(!is_tool_allowed_bool(&bob(), "anything", &acl, None));
     }
 
     #[test]
@@ -542,8 +697,13 @@ mod tests {
             ],
         );
 
-        assert!(is_tool_allowed(&bob(), "sentry__search_issues", &acl, None));
-        assert!(!is_tool_allowed(
+        assert!(is_tool_allowed_bool(
+            &bob(),
+            "sentry__search_issues",
+            &acl,
+            None
+        ));
+        assert!(!is_tool_allowed_bool(
             &bob(),
             "sentry__delete_project",
             &acl,
@@ -587,10 +747,15 @@ mod tests {
             }],
         );
 
-        assert!(is_tool_allowed(&alice(), "health__check", &acl, None));
-        assert!(is_tool_allowed(&bob(), "health__check", &acl, None));
-        assert!(is_tool_allowed(&anon(), "health__check", &acl, None));
-        assert!(!is_tool_allowed(&alice(), "sentry__search", &acl, None));
+        assert!(is_tool_allowed_bool(&alice(), "health__check", &acl, None));
+        assert!(is_tool_allowed_bool(&bob(), "health__check", &acl, None));
+        assert!(is_tool_allowed_bool(&anon(), "health__check", &acl, None));
+        assert!(!is_tool_allowed_bool(
+            &alice(),
+            "sentry__search",
+            &acl,
+            None
+        ));
     }
 
     #[test]
@@ -605,10 +770,15 @@ mod tests {
             }],
         );
 
-        assert!(is_tool_allowed(&bob(), "dangerous__delete", &acl, None));
+        assert!(is_tool_allowed_bool(
+            &bob(),
+            "dangerous__delete",
+            &acl,
+            None
+        ));
 
         let bob_admin = AuthIdentity::new("bob", vec!["admin".to_string()]);
-        assert!(!is_tool_allowed(
+        assert!(!is_tool_allowed_bool(
             &bob_admin,
             "dangerous__delete",
             &acl,
@@ -689,10 +859,15 @@ mod tests {
             }],
         );
 
-        assert!(!is_tool_allowed(&bob(), "admin_panel", &acl, None));
-        assert!(!is_tool_allowed(&bob(), "user_admin_panel", &acl, None));
-        assert!(is_tool_allowed(&bob(), "user_panel", &acl, None));
-        assert!(is_tool_allowed(&alice(), "admin_panel", &acl, None));
+        assert!(!is_tool_allowed_bool(&bob(), "admin_panel", &acl, None));
+        assert!(!is_tool_allowed_bool(
+            &bob(),
+            "user_admin_panel",
+            &acl,
+            None
+        ));
+        assert!(is_tool_allowed_bool(&bob(), "user_panel", &acl, None));
+        assert!(is_tool_allowed_bool(&alice(), "admin_panel", &acl, None));
     }
 
     #[test]
@@ -957,7 +1132,7 @@ mod tests {
             tool_name: "query_prometheus",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -985,7 +1160,7 @@ mod tests {
             tool_name: "update_dashboard",
             classification: Some(&write_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1013,7 +1188,7 @@ mod tests {
             tool_name: "execute_sql",
             classification: Some(&amb_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1041,7 +1216,7 @@ mod tests {
             tool_name: "gh_pr",
             classification: Some(&write_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1069,7 +1244,7 @@ mod tests {
             tool_name: "execute_sql",
             classification: Some(&amb_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1097,7 +1272,7 @@ mod tests {
             tool_name: "execute_sql",
             classification: Some(&amb_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1125,7 +1300,7 @@ mod tests {
             tool_name: "gh_status",
             classification: Some(&read_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1156,7 +1331,7 @@ mod tests {
                 classification: Some(&cls),
             };
             assert!(
-                is_tool_allowed_rbac(&identity, &ctx, &acl),
+                is_tool_allowed_rbac(&identity, &ctx, &acl).allowed,
                 "access=* non-strict should allow Kind::{kind:?}"
             );
         }
@@ -1191,7 +1366,7 @@ mod tests {
                 classification: Some(&cls),
             };
             assert!(
-                is_tool_allowed_rbac(&identity, &ctx, &acl),
+                is_tool_allowed_rbac(&identity, &ctx, &acl).allowed,
                 "access=* strict should allow Kind::{kind:?}"
             );
         }
@@ -1204,7 +1379,7 @@ mod tests {
             classification: Some(&cls),
         };
         assert!(
-            !is_tool_allowed_rbac(&identity, &ctx, &acl),
+            !is_tool_allowed_rbac(&identity, &ctx, &acl).allowed,
             "access=* strict should block Kind::Ambiguous"
         );
     }
@@ -1253,14 +1428,14 @@ mod tests {
             tool_name: "list_repos",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx_read, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx_read, &acl).allowed);
 
         let ctx_write = ToolContext {
             server_alias: "github",
             tool_name: "create_pr",
             classification: Some(&write_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx_write, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx_write, &acl).allowed);
     }
 
     #[test]
@@ -1299,14 +1474,14 @@ mod tests {
             tool_name: "gh_pr",
             classification: Some(&write_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx_pr, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx_pr, &acl).allowed);
 
         let ctx_delete = ToolContext {
             server_alias: "github",
             tool_name: "gh_repo_delete",
             classification: Some(&write_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx_delete, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx_delete, &acl).allowed);
     }
 
     #[test]
@@ -1349,7 +1524,7 @@ mod tests {
             tool_name: "list_repos",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx_gh, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx_gh, &acl).allowed);
 
         // Can read sentry via extra
         let ctx_sentry = ToolContext {
@@ -1357,7 +1532,7 @@ mod tests {
             tool_name: "search_issues",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx_sentry, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx_sentry, &acl).allowed);
 
         // Cannot read grafana (no grant)
         let ctx_grafana = ToolContext {
@@ -1365,7 +1540,7 @@ mod tests {
             tool_name: "query_prometheus",
             classification: Some(&read_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx_grafana, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx_grafana, &acl).allowed);
     }
 
     #[test]
@@ -1383,7 +1558,7 @@ mod tests {
             tool_name: "anything",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1401,7 +1576,7 @@ mod tests {
             tool_name: "anything",
             classification: Some(&read_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1436,7 +1611,7 @@ mod tests {
             tool_name: "anything",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1476,7 +1651,7 @@ mod tests {
             tool_name: "list_repos",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx_gh, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx_gh, &acl).allowed);
 
         // Sentry is fully blocked by deny
         let ctx_sentry = ToolContext {
@@ -1484,7 +1659,7 @@ mod tests {
             tool_name: "search_issues",
             classification: Some(&read_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx_sentry, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx_sentry, &acl).allowed);
     }
 
     #[test]
@@ -1517,7 +1692,7 @@ mod tests {
                 tool_name: "some_tool",
                 classification: Some(&read_cls),
             };
-            assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+            assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
         }
 
         let ctx_sentry = ToolContext {
@@ -1525,7 +1700,7 @@ mod tests {
             tool_name: "some_tool",
             classification: Some(&read_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx_sentry, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx_sentry, &acl).allowed);
     }
 
     #[test]
@@ -1569,7 +1744,7 @@ mod tests {
             tool_name: "query_prometheus",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
 
         // Cannot write grafana
         let ctx = ToolContext {
@@ -1577,7 +1752,7 @@ mod tests {
             tool_name: "update_dashboard",
             classification: Some(&write_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
 
         // Can write gh_pr on github
         let ctx = ToolContext {
@@ -1585,7 +1760,7 @@ mod tests {
             tool_name: "gh_pr",
             classification: Some(&write_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
 
         // Cannot write gh_repo on github (not in tools list)
         let ctx = ToolContext {
@@ -1593,7 +1768,7 @@ mod tests {
             tool_name: "gh_repo",
             classification: Some(&write_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
 
         // Can read gh_repo on github (read grant covers all tools)
         let ctx = ToolContext {
@@ -1601,7 +1776,7 @@ mod tests {
             tool_name: "gh_repo",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     // -----------------------------------------------------------------------
@@ -1648,7 +1823,7 @@ mod tests {
             tool_name: "gh_secret_tool",
             classification: Some(&read_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
 
         // Write is NOT denied — the deny grant only covers read
         let ctx = ToolContext {
@@ -1656,7 +1831,7 @@ mod tests {
             tool_name: "gh_secret_tool",
             classification: Some(&write_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1697,7 +1872,7 @@ mod tests {
             tool_name: "gh_repo_delete",
             classification: Some(&write_cls),
         };
-        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(!is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
 
         // Read is NOT denied — the deny grant only covers write
         let ctx = ToolContext {
@@ -1705,7 +1880,7 @@ mod tests {
             tool_name: "gh_repo_delete",
             classification: Some(&read_cls),
         };
-        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl));
+        assert!(is_tool_allowed_rbac(&identity, &ctx, &acl).allowed);
     }
 
     #[test]
@@ -1746,5 +1921,285 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown role"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Decision provenance tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matched_rule_display() {
+        assert_eq!(MatchedRule::Legacy(0).to_string(), "legacy[0]");
+        assert_eq!(MatchedRule::Legacy(3).to_string(), "legacy[3]");
+        assert_eq!(MatchedRule::LegacyDefault.to_string(), "legacy:default");
+        assert_eq!(
+            MatchedRule::RoleGrant {
+                role: "dev".to_string(),
+                index: 1
+            }
+            .to_string(),
+            "dev[1]"
+        );
+        assert_eq!(
+            MatchedRule::SubjectExtra {
+                subject: "alice".to_string(),
+                index: 0
+            }
+            .to_string(),
+            "alice.extra[0]"
+        );
+        assert_eq!(MatchedRule::RbacDefault.to_string(), "default");
+        assert_eq!(MatchedRule::NoAcl.to_string(), "no-acl");
+    }
+
+    #[test]
+    fn test_decision_legacy_first_rule_match() {
+        let acl = AclConfig::legacy(
+            AclPolicy::Allow,
+            vec![AclRule {
+                subjects: vec!["bob".to_string()],
+                roles: vec![],
+                tools: vec!["sentry__*".to_string()],
+                policy: AclPolicy::Deny,
+            }],
+        );
+        let d = is_tool_allowed(&bob(), "sentry__search_issues", &acl, None);
+        assert!(!d.allowed);
+        assert_eq!(d.matched_rule, MatchedRule::Legacy(0));
+    }
+
+    #[test]
+    fn test_decision_legacy_second_rule_match() {
+        let acl = AclConfig::legacy(
+            AclPolicy::Allow,
+            vec![
+                AclRule {
+                    subjects: vec!["alice".to_string()],
+                    roles: vec![],
+                    tools: vec!["*".to_string()],
+                    policy: AclPolicy::Allow,
+                },
+                AclRule {
+                    subjects: vec!["bob".to_string()],
+                    roles: vec![],
+                    tools: vec!["sentry__*".to_string()],
+                    policy: AclPolicy::Deny,
+                },
+            ],
+        );
+        let d = is_tool_allowed(&bob(), "sentry__delete", &acl, None);
+        assert!(!d.allowed);
+        assert_eq!(d.matched_rule, MatchedRule::Legacy(1));
+    }
+
+    #[test]
+    fn test_decision_legacy_default_fallback() {
+        let acl = AclConfig::legacy(
+            AclPolicy::Deny,
+            vec![AclRule {
+                subjects: vec!["alice".to_string()],
+                roles: vec![],
+                tools: vec!["*".to_string()],
+                policy: AclPolicy::Allow,
+            }],
+        );
+        let d = is_tool_allowed(&bob(), "anything", &acl, None);
+        assert!(!d.allowed);
+        assert_eq!(d.matched_rule, MatchedRule::LegacyDefault);
+    }
+
+    #[test]
+    fn test_decision_rbac_role_grant_index() {
+        let read_cls = make_classification(Kind::Read);
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Deny,
+            strict_classification: false,
+            roles: HashMap::from([(
+                "dev".to_string(),
+                vec![
+                    Grant {
+                        server: ServerPattern::Single("github".to_string()),
+                        access: AccessLevel::Write,
+                        tools: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: false,
+                    },
+                    Grant {
+                        server: ServerPattern::Single("grafana".to_string()),
+                        access: AccessLevel::Read,
+                        tools: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: false,
+                    },
+                ],
+            )]),
+            subjects: HashMap::new(),
+        };
+        let identity = AuthIdentity::new("bob", vec!["dev".to_string()]);
+        let ctx = ToolContext {
+            server_alias: "grafana",
+            tool_name: "query_prometheus",
+            classification: Some(&read_cls),
+        };
+        let d = is_tool_allowed_rbac(&identity, &ctx, &acl);
+        assert!(d.allowed);
+        assert_eq!(
+            d.matched_rule,
+            MatchedRule::RoleGrant {
+                role: "dev".to_string(),
+                index: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_decision_rbac_subject_extra() {
+        let read_cls = make_classification(Kind::Read);
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Deny,
+            strict_classification: false,
+            roles: HashMap::from([(
+                "readonly".to_string(),
+                vec![Grant {
+                    server: ServerPattern::Single("github".to_string()),
+                    access: AccessLevel::Read,
+                    tools: vec![],
+                    resources: vec![],
+                    prompts: vec![],
+                    deny: false,
+                }],
+            )]),
+            subjects: HashMap::from([(
+                "charlie".to_string(),
+                SubjectConfig {
+                    roles: vec!["readonly".to_string()],
+                    extra: vec![Grant {
+                        server: ServerPattern::Single("sentry".to_string()),
+                        access: AccessLevel::Read,
+                        tools: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: false,
+                    }],
+                },
+            )]),
+        };
+        let identity = AuthIdentity::new("charlie", vec![]);
+        let ctx = ToolContext {
+            server_alias: "sentry",
+            tool_name: "search_issues",
+            classification: Some(&read_cls),
+        };
+        let d = is_tool_allowed_rbac(&identity, &ctx, &acl);
+        assert!(d.allowed);
+        assert_eq!(
+            d.matched_rule,
+            MatchedRule::SubjectExtra {
+                subject: "charlie".to_string(),
+                index: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_decision_rbac_deny_provenance() {
+        let write_cls = make_classification(Kind::Write);
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Deny,
+            strict_classification: false,
+            roles: HashMap::from([(
+                "dev".to_string(),
+                vec![
+                    Grant {
+                        server: ServerPattern::Single("github".to_string()),
+                        access: AccessLevel::All,
+                        tools: vec![],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: false,
+                    },
+                    Grant {
+                        server: ServerPattern::Single("github".to_string()),
+                        access: AccessLevel::Write,
+                        tools: vec!["gh_repo_delete".to_string()],
+                        resources: vec![],
+                        prompts: vec![],
+                        deny: true,
+                    },
+                ],
+            )]),
+            subjects: HashMap::new(),
+        };
+        let identity = AuthIdentity::new("bob", vec!["dev".to_string()]);
+        let ctx = ToolContext {
+            server_alias: "github",
+            tool_name: "gh_repo_delete",
+            classification: Some(&write_cls),
+        };
+        let d = is_tool_allowed_rbac(&identity, &ctx, &acl);
+        assert!(!d.allowed);
+        assert_eq!(
+            d.matched_rule,
+            MatchedRule::RoleGrant {
+                role: "dev".to_string(),
+                index: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_decision_rbac_default() {
+        let read_cls = make_classification(Kind::Read);
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Deny,
+            strict_classification: false,
+            roles: HashMap::new(),
+            subjects: HashMap::new(),
+        };
+        let identity = AuthIdentity::new("unknown", vec![]);
+        let ctx = ToolContext {
+            server_alias: "github",
+            tool_name: "anything",
+            classification: Some(&read_cls),
+        };
+        let d = is_tool_allowed_rbac(&identity, &ctx, &acl);
+        assert!(!d.allowed);
+        assert_eq!(d.matched_rule, MatchedRule::RbacDefault);
+    }
+
+    #[test]
+    fn test_decision_classification_populated() {
+        let cls = ToolClassification {
+            kind: Kind::Read,
+            confidence: 0.72,
+            source: Source::Classifier,
+            reasons: vec!["test".to_string()],
+        };
+        let acl = RoleBasedAclConfig {
+            default: AclPolicy::Allow,
+            strict_classification: false,
+            roles: HashMap::new(),
+            subjects: HashMap::new(),
+        };
+        let identity = AuthIdentity::new("bob", vec![]);
+        let ctx = ToolContext {
+            server_alias: "grafana",
+            tool_name: "query_prometheus",
+            classification: Some(&cls),
+        };
+        let d = is_tool_allowed_rbac(&identity, &ctx, &acl);
+        assert!(d.allowed);
+        assert_eq!(d.classification_kind, Some(Kind::Read));
+        assert_eq!(d.classification_source, Some(Source::Classifier));
+        assert!((d.classification_confidence.unwrap() - 0.72).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_decision_access_level_as_str() {
+        assert_eq!(AccessLevel::Read.as_str(), "read");
+        assert_eq!(AccessLevel::Write.as_str(), "write");
+        assert_eq!(AccessLevel::All.as_str(), "*");
     }
 }
