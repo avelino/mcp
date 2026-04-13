@@ -5,10 +5,15 @@ Reference manifests for running the MCP proxy in a Kubernetes cluster.
 ## Quick start
 
 ```bash
-# Review and customize the manifests
-ls deploy/kubernetes/
+# 1. Edit the ConfigMap with your server configuration
+vim deploy/kubernetes/configmap.yaml
 
-# Apply everything
+# 2. Create the Secret with your API tokens (not included in kustomize)
+kubectl create namespace mcp
+kubectl -n mcp create secret generic mcp-secrets \
+  --from-literal=sentry-token=sntrys_...
+
+# 3. Apply the manifests
 kubectl apply -k deploy/kubernetes/
 ```
 
@@ -18,7 +23,8 @@ This creates:
 - `mcp-proxy` Deployment (1 replica)
 - `mcp-proxy` ClusterIP Service on port 8080
 - `mcp-config` ConfigMap with your server configuration
-- `mcp-secrets` Secret for API tokens
+
+The Secret must be created separately (step 2) to avoid committing real tokens to the repo.
 
 ## Configuration
 
@@ -159,9 +165,17 @@ securityContext:
     drop: ["ALL"]
 ```
 
-The image is based on `scratch` — a static binary with no shell, no package manager, no libc. The process runs as UID 0 because scratch has no `/etc/passwd` to define other users. Despite running as root, the attack surface is minimal: no shell to exec into, no tools to exploit, read-only filesystem.
+The image is based on `scratch` — a static binary with no shell, no package manager, no libc. The process runs as UID 0 by default (the Dockerfile doesn't set `USER`), but `scratch` itself does not require root. The attack surface is minimal regardless of UID: no shell to exec into, no tools to exploit, read-only filesystem.
 
-If your cluster policy requires `runAsNonRoot: true`, you'd need a non-scratch base image with a dedicated user.
+If your cluster policy requires `runAsNonRoot: true`, set a numeric `runAsUser` and ensure mounted volumes (`/tmp`, `/data`) are writable for that UID — either via `fsGroup` or an initContainer:
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+```
 
 ## Scaling
 
@@ -188,14 +202,14 @@ When Kubernetes sends `SIGTERM` (during rolling updates or scale-down):
 
 ## Environment variables reference
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MCP_SERVERS_CONFIG` | — | Inline JSON config (highest priority) |
-| `MCP_PROXY_REQUEST_TIMEOUT` | `120` | Max seconds per JSON-RPC request |
-| `MCP_AUDIT_ENABLED` | `false` (in Docker) | Enable audit logging |
-| `MCP_AUDIT_PATH` | `/data/audit/data` | Audit data directory |
-| `MCP_AUDIT_INDEX_PATH` | `/data/audit/index` | Audit index directory |
-| `MCP_CLASSIFIER_CACHE` | `/tmp/tool-classification.json` | Tool classification cache |
+| Variable | Manifest value | Description |
+|----------|----------------|-------------|
+| `MCP_SERVERS_CONFIG` | (from ConfigMap) | Inline JSON config (highest priority) |
+| `MCP_PROXY_REQUEST_TIMEOUT` | `120` (app default) | Max seconds per JSON-RPC request |
+| `MCP_AUDIT_ENABLED` | `false` | Enable audit logging |
+| `MCP_AUDIT_PATH` | `/data/audit/data` | Audit data directory (app default: `~/.config/mcp/db/data`) |
+| `MCP_AUDIT_INDEX_PATH` | `/data/audit/index` | Audit index directory (app default: `~/.config/mcp/db/index`) |
+| `MCP_CLASSIFIER_CACHE` | `/tmp/tool-classification.json` | Tool classification cache (app default: `~/.config/mcp/tool-classification.json`) |
 
 Full reference: [Environment variables](../reference/environment-variables.md)
 
@@ -259,7 +273,7 @@ startupProbe:
 
 ### Token not resolving
 
-Ensure the Secret key matches what the Deployment env references, and that the `${VAR_NAME}` in the ConfigMap matches the env var name exactly. The proxy logs a warning if a placeholder can't be resolved.
+Ensure the Secret key matches what the Deployment env references, and that the `${VAR_NAME}` in the ConfigMap matches the env var name exactly. If a referenced env var is missing, the placeholder is replaced with an empty string silently — verify the resolved config by checking the proxy logs for authentication failures on backend connections.
 
 ### Read-only filesystem errors
 

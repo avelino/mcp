@@ -6,16 +6,13 @@ namespace: mcp
 resources:
   - namespace.yaml
   - configmap.yaml
-  - secret.yaml
   - deployment.yaml
   - service.yaml
+  # Create the Secret separately before applying (see secret.yaml for template):
+  #   kubectl -n mcp create secret generic mcp-secrets --from-literal=sentry-token=sntrys_...
   # Uncomment to enable persistent audit logging:
   # - pvc.yaml
 
 labels:
   - pairs:
       app.kubernetes.io/part-of: mcp
-
-images:
-  - name: ghcr.io/avelino/mcp
-    newTag: latest
