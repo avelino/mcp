@@ -393,19 +393,29 @@ fn parse_config_content(content: &str, source: PathBuf) -> Result<Config> {
     })
 }
 
+/// Returns the trimmed value of an env var, or `None` if unset or empty/whitespace.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
 /// Applies environment variable overrides to `AuditConfig`.
 /// Container deployments can use these to disable audit or redirect paths
 /// without modifying the config JSON.
 fn apply_audit_env_overrides(mut audit: AuditConfig) -> AuditConfig {
     if let Ok(v) = std::env::var("MCP_AUDIT_ENABLED") {
-        if v.eq_ignore_ascii_case("false") || v == "0" {
-            audit.enabled = false;
+        match v.trim() {
+            s if s.eq_ignore_ascii_case("false") || s == "0" => audit.enabled = false,
+            s if s.eq_ignore_ascii_case("true") || s == "1" => audit.enabled = true,
+            _ => {}
         }
     }
-    if let Ok(v) = std::env::var("MCP_AUDIT_PATH") {
+    if let Some(v) = non_empty_env("MCP_AUDIT_PATH") {
         audit.path = Some(v);
     }
-    if let Ok(v) = std::env::var("MCP_AUDIT_INDEX_PATH") {
+    if let Some(v) = non_empty_env("MCP_AUDIT_INDEX_PATH") {
         audit.index_path = Some(v);
     }
     audit
@@ -754,6 +764,11 @@ mod tests {
 
     #[test]
     fn test_parse_audit_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
         let config = config_from_json(
             r#"{
                 "mcpServers": {},
@@ -773,6 +788,11 @@ mod tests {
 
     #[test]
     fn test_parse_config_without_audit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
         let config = config_from_json(r#"{"mcpServers": {}}"#).unwrap();
         assert!(config.audit.enabled); // default
         assert!(!config.audit.log_arguments); // default
@@ -1031,5 +1051,59 @@ mod tests {
         assert_eq!(config.audit.path.as_deref(), Some("/env/data"));
 
         std::env::remove_var("MCP_AUDIT_PATH");
+    }
+
+    #[test]
+    fn test_audit_force_enabled_via_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MCP_AUDIT_ENABLED", "true");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        // JSON disables audit, but env override force-enables it
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {},
+                "audit": {"enabled": false}
+            }"#,
+        )
+        .unwrap();
+        assert!(config.audit.enabled);
+
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+    }
+
+    #[test]
+    fn test_audit_force_enabled_via_env_one() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("MCP_AUDIT_ENABLED", "1");
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
+
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {},
+                "audit": {"enabled": false}
+            }"#,
+        )
+        .unwrap();
+        assert!(config.audit.enabled);
+
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+    }
+
+    #[test]
+    fn test_empty_audit_path_env_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MCP_AUDIT_ENABLED");
+        std::env::set_var("MCP_AUDIT_PATH", "");
+        std::env::set_var("MCP_AUDIT_INDEX_PATH", "  ");
+
+        let config = config_from_json(r#"{"mcpServers": {}}"#).unwrap();
+        assert!(config.audit.path.is_none());
+        assert!(config.audit.index_path.is_none());
+
+        std::env::remove_var("MCP_AUDIT_PATH");
+        std::env::remove_var("MCP_AUDIT_INDEX_PATH");
     }
 }
