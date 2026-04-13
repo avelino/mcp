@@ -24,6 +24,7 @@
 ## How-to
 
 * [Docker](howto/docker.md)
+* [Kubernetes](howto/kubernetes.md)
 * [Supported services](howto/services.md)
 * [Troubleshooting](howto/troubleshooting.md)
 

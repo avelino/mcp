@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-proxy
+  namespace: mcp
+  labels:
+    app.kubernetes.io/name: mcp-proxy
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: 1
+  # Each replica runs its own backend pool — there is no shared state or
+  # leader election. Scaling to N replicas means N independent instances
+  # of every configured MCP server. This is safe but multiplies backend
+  # connections and resource usage proportionally.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mcp-proxy
+        app.kubernetes.io/component: proxy
+    spec:
+      # The proxy handles SIGTERM with a graceful drain:
+      #   1. Stops accepting new connections
+      #   2. Finishes in-flight requests
+      #   3. Shuts down backend clients in parallel (5s timeout each)
+      #   4. Total cleanup bounded to ~10s internally
+      # 30s gives enough headroom for the internal shutdown to complete.
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: mcp
+          image: ghcr.io/avelino/mcp:latest
+          args: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
+          # --insecure is required because the pod binds 0.0.0.0 (non-loopback).
+          # TLS termination should happen at the Ingress or load balancer.
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # Inject config inline — no file mount needed.
+            # The proxy resolves ${VAR} placeholders in the config from
+            # environment variables, so tokens stay in the Secret.
+            - name: MCP_SERVERS_CONFIG
+              valueFrom:
+                configMapKeyRef:
+                  name: mcp-config
+                  key: servers.json
+
+            # Token injected as env var, referenced as ${SENTRY_TOKEN} in config.
+            - name: SENTRY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-secrets
+                  key: sentry-token
+
+            # Audit logging. Set to "true" and mount a PVC at /data to persist
+            # logs across restarts. The scratch image has no writable filesystem
+            # by default, so this needs a volume.
+            - name: MCP_AUDIT_ENABLED
+              value: "false"
+            - name: MCP_AUDIT_PATH
+              value: "/data/audit/data"
+            - name: MCP_AUDIT_INDEX_PATH
+              value: "/data/audit/index"
+
+            # Classifier cache (ephemeral, rebuilt on startup).
+            - name: MCP_CLASSIFIER_CACHE
+              value: "/tmp/tool-classification.json"
+
+          # --- Probes ---
+          #
+          # GET /health returns JSON with backend connectivity status.
+          # The proxy lazy-connects to backends, so 0 connected backends at
+          # startup is normal — probes should NOT fail just because backends
+          # haven't been reached yet.
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            # Give 30s for the process to start and initial discovery.
+            failureThreshold: 6
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            # Only checks that the process responds to HTTP.
+            # Backend failures are degraded state, not liveness failure.
+            periodSeconds: 30
+            timeoutSeconds: 5
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            # Same endpoint. The proxy is ready to serve immediately since
+            # it lazy-connects backends on first request.
+            periodSeconds: 10
+            timeoutSeconds: 5
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+
+          securityContext:
+            # The scratch base image has no /etc/passwd, so the process runs
+            # as UID 0. This is a static binary with no shell — minimal
+            # attack surface regardless of UID.
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            # Writable tmp for classifier cache and other ephemeral files.
+            - name: tmp
+              mountPath: /tmp
+            # Audit data (only needed if MCP_AUDIT_ENABLED=true).
+            # Swap emptyDir for a PVC reference to persist across restarts.
+            - name: data
+              mountPath: /data
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 10Mi
+        # For persistent audit logs, replace with:
+        #   persistentVolumeClaim:
+        #     claimName: mcp-audit-data
+        - name: data
+          emptyDir:
+            sizeLimit: 100Mi

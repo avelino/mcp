@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mcp
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - deployment.yaml
+  - service.yaml
+  # Uncomment to enable persistent audit logging:
+  # - pvc.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: mcp
+
+images:
+  - name: ghcr.io/avelino/mcp
+    newTag: latest
