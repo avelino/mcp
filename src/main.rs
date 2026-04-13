@@ -59,6 +59,7 @@ fn print_usage() {
     eprintln!("                                      Check ACL decision for a request");
     eprintln!("  mcp acl check --role <name> --server <alias> --all-tools");
     eprintln!("                                      Check all tools for a role");
+    eprintln!("  mcp healthcheck [url]               HTTP health probe (for containers)");
     eprintln!();
     eprintln!("Flags:");
     eprintln!("  --json                              Force JSON output");
@@ -88,6 +89,32 @@ async fn run() -> Result<()> {
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         print_usage();
         return Ok(());
+    }
+
+    // Built-in HTTP health probe for container health checks (scratch/distroless
+    // images have no curl/wget). Exits 0 if the endpoint returns 2xx, 1 otherwise.
+    if args[0] == "healthcheck" {
+        let url = args
+            .get(1)
+            .map(|s| s.as_str())
+            .unwrap_or("http://localhost:8080/health");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let resp = client.get(url).send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                std::process::exit(0);
+            }
+            Ok(r) => {
+                eprintln!("healthcheck failed: HTTP {}", r.status());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("healthcheck failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // `serve` manages its own db pool — handle it before creating the shared one.
