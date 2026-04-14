@@ -115,7 +115,21 @@ docker run -d \
 
 ### With audit logging
 
-The default image disables audit logging (`MCP_AUDIT_ENABLED=false`) because `scratch` images have no writable filesystem. To enable it, mount a volume and override:
+The default image disables audit logging (`MCP_AUDIT_ENABLED=false`) because `scratch` images have no writable filesystem. You have two options:
+
+**Option A: Stream to stdout (no volume needed)**
+
+```bash
+docker run -d \
+  -e MCP_SERVERS_CONFIG='{"mcpServers":{...}}' \
+  -e MCP_AUDIT_OUTPUT=stdout \
+  -p 8080:8080 \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080 --insecure
+```
+
+Audit entries are emitted as JSON lines to stdout, captured by your container log driver (CloudWatch, Datadog, etc.).
+
+**Option B: Persist to a volume**
 
 ```bash
 docker run -d \
@@ -136,7 +150,10 @@ These variables are especially useful for container deployments. See the full li
 |---|---|---|
 | `MCP_SERVERS_CONFIG` | — | Inline JSON config, no file mount needed |
 | `MCP_CONFIG_DIR` | `~/.config/mcp` | Override config directory |
+| `MCP_LOG_LEVEL` | `info` | Log verbosity: `trace`, `debug`, `info`, `warn`, `error` |
+| `MCP_LOG_FORMAT` | `text` | Log format: `text` or `json` (structured, for log drivers) |
 | `MCP_AUDIT_ENABLED` | `false` (in Docker image) | Disable audit for read-only fs |
+| `MCP_AUDIT_OUTPUT` | `file` | `stdout`/`stderr` for container log drivers, `none` to disable |
 | `MCP_AUDIT_PATH` | `~/.config/mcp/db/data` | Override audit data path |
 | `MCP_AUDIT_INDEX_PATH` | `~/.config/mcp/db/index` | Override audit index path |
 | `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override OAuth token storage |
@@ -194,4 +211,4 @@ docker run --rm ghcr.io/avelino/mcp:0.1.0 --help
 
 - **Stdio servers only work if the runtime is available inside the container.** The default image includes only the `mcp` binary and `ca-certificates`. Servers that require `npx`, `python`, or other runtimes won't work unless you build a custom image. HTTP servers (configured with `url`) work out of the box.
 - **OAuth browser flow doesn't work in Docker.** For HTTP servers that need OAuth, run `mcp add <server>` on your host first to complete authentication, then mount the config directory (which includes `auth.json`), or set `MCP_AUTH_PATH` to a mounted volume.
-- **Audit logging is disabled by default** in the Docker image because `scratch` images have no writable filesystem. Enable it with `MCP_AUDIT_ENABLED=true` and mount a volume for the data.
+- **Audit logging is disabled by default** in the Docker image because `scratch` images have no writable filesystem. Use `MCP_AUDIT_OUTPUT=stdout` to stream to the container log driver, or mount a volume and set `MCP_AUDIT_ENABLED=true`.

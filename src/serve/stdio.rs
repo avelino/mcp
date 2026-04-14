@@ -16,7 +16,7 @@ use super::proxy::{shutdown_clients_in_parallel, ProxyServer, SharedProxy};
 
 pub async fn run_stdio(config: Config) -> Result<()> {
     let pool = crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
-        eprintln!("warning: failed to create db pool: {e:#}");
+        tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
         Arc::new(crate::db::DbPool::disabled())
     });
     let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
@@ -63,7 +63,7 @@ pub async fn run_stdio(config: Config) -> Result<()> {
         });
     }
 
-    eprintln!("[serve] waiting for MCP client...");
+    tracing::info!("waiting for MCP client");
 
     loop {
         let mut line = String::new();
@@ -103,6 +103,6 @@ pub async fn run_stdio(config: Config) -> Result<()> {
         p.drain_connected()
     };
     shutdown_clients_in_parallel(drained).await;
-    eprintln!("[serve] shutting down");
+    tracing::info!("shutting down");
     Ok(())
 }

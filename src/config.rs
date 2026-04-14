@@ -10,7 +10,16 @@ use crate::audit::AuditConfig;
 use crate::server_auth::ServerAuthConfig;
 
 const RESERVED_NAMES: &[&str] = &[
-    "search", "add", "remove", "list", "help", "version", "serve", "logs",
+    "search",
+    "add",
+    "remove",
+    "list",
+    "help",
+    "version",
+    "serve",
+    "logs",
+    "config",
+    "completions",
 ];
 
 #[derive(Debug, Default, Deserialize, Clone, PartialEq)]
@@ -201,7 +210,7 @@ pub fn config_dir() -> Result<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         return Ok(home.join(".config").join("mcp"));
     }
-    eprintln!("warning: HOME not set, using /tmp/mcp as config directory");
+    tracing::warn!("HOME not set, using /tmp/mcp as config directory");
     Ok(PathBuf::from("/tmp/mcp"))
 }
 
@@ -409,6 +418,15 @@ fn apply_audit_env_overrides(mut audit: AuditConfig) -> AuditConfig {
         match v.trim() {
             s if s.eq_ignore_ascii_case("false") || s == "0" => audit.enabled = false,
             s if s.eq_ignore_ascii_case("true") || s == "1" => audit.enabled = true,
+            _ => {}
+        }
+    }
+    if let Some(v) = non_empty_env("MCP_AUDIT_OUTPUT") {
+        match v.to_lowercase().as_str() {
+            "file" => audit.output = crate::audit::AuditOutput::File,
+            "stdout" => audit.output = crate::audit::AuditOutput::Stdout,
+            "stderr" => audit.output = crate::audit::AuditOutput::Stderr,
+            "none" => audit.output = crate::audit::AuditOutput::None,
             _ => {}
         }
     }

@@ -36,7 +36,7 @@ Your browser opens, you authorize the app, and the token is saved. Next time, it
 3. Registers as a client using [Dynamic Client Registration](https://datatracker.ietf.org/doc/rfc7591/) if supported
 4. Generates a PKCE challenge (S256) for security
 5. Opens your browser to the authorization URL
-6. Listens on a local port (`localhost:8085-8099`) for the callback
+6. Listens on a local port for the callback (default range `localhost:8085-8099`, configurable via `MCP_OAUTH_CALLBACK_PORT`)
 7. Exchanges the authorization code for tokens
 8. Saves tokens to `~/.config/mcp/auth.json`
 

@@ -32,7 +32,7 @@ impl DbPool {
             .idle_timeout(idle_timeout)
             .open()
             .map_err(|e| anyhow::anyhow!("failed to open db: {e:?}"))?;
-        eprintln!("[db] database opened (idle timeout {:?})", idle_timeout);
+        tracing::info!(idle_timeout = ?idle_timeout, "database opened");
         Ok(Self {
             db: Some(Arc::new(db)),
         })
@@ -51,7 +51,7 @@ impl DbPool {
 /// Returns a disabled pool when audit is disabled (e.g. container with read-only fs).
 pub fn create_pool(audit_config: &AuditConfig) -> Result<Arc<DbPool>> {
     if !audit_config.enabled {
-        eprintln!("[db] audit disabled, skipping database initialization");
+        tracing::info!("audit disabled, skipping database initialization");
         return Ok(Arc::new(DbPool::disabled()));
     }
 

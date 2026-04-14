@@ -124,7 +124,11 @@ The proxy exposes `GET /health` returning:
 
 By default, audit logging is disabled (`MCP_AUDIT_ENABLED=false`) because the scratch-based image has no writable filesystem.
 
-To enable:
+**Option A: Stream to stdout (no PVC needed)**
+
+Set `MCP_AUDIT_OUTPUT=stdout` in the Deployment env. Audit entries are emitted as JSON lines to stdout and captured by your cluster's log pipeline (Fluentd, Loki, CloudWatch, etc.). No persistent storage required.
+
+**Option B: Persist to a PVC**
 
 1. Set `MCP_AUDIT_ENABLED=true` in the Deployment env
 2. Mount persistent storage at `/data`:
@@ -207,6 +211,7 @@ When Kubernetes sends `SIGTERM` (during rolling updates or scale-down):
 | `MCP_SERVERS_CONFIG` | (from ConfigMap) | Inline JSON config (highest priority) |
 | `MCP_PROXY_REQUEST_TIMEOUT` | `120` (app default) | Max seconds per JSON-RPC request |
 | `MCP_AUDIT_ENABLED` | `false` | Enable audit logging |
+| `MCP_AUDIT_OUTPUT` | `file` | `stdout` for cluster log pipeline, `file` for PVC, `none` to disable |
 | `MCP_AUDIT_PATH` | `/data/audit/data` | Audit data directory (app default: `~/.config/mcp/db/data`) |
 | `MCP_AUDIT_INDEX_PATH` | `/data/audit/index` | Audit index directory (app default: `~/.config/mcp/db/index`) |
 | `MCP_CLASSIFIER_CACHE` | `/tmp/tool-classification.json` | Tool classification cache (app default: `~/.config/mcp/tool-classification.json`) |

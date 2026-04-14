@@ -8,6 +8,7 @@ mod cli_discovery;
 mod client;
 mod config;
 mod db;
+mod logging;
 mod manager;
 mod output;
 mod protocol;
@@ -24,8 +25,9 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
+    logging::init();
     if let Err(e) = run().await {
-        eprintln!("error: {e:#}");
+        tracing::error!(error = format!("{e:#}"), "fatal error");
         std::process::exit(1);
     }
 }
@@ -64,6 +66,9 @@ fn print_usage() {
     eprintln!("                                      Check ACL decision for a prompt");
     eprintln!("  mcp acl check --role <name> --server <alias> --all-tools");
     eprintln!("                                      Check all tools for a role");
+    eprintln!("  mcp config path                     Show config file path");
+    eprintln!("  mcp config edit                     Open config in $EDITOR");
+    eprintln!("  mcp completions <shell>             Generate shell completions (bash, zsh, fish)");
     eprintln!("  mcp healthcheck [url]               HTTP health probe (for containers)");
     eprintln!();
     eprintln!("Flags:");
@@ -84,10 +89,10 @@ async fn run() -> Result<()> {
     let cfg = config::load_config()?;
     let conflicts = config::validate_server_names(&cfg);
     for name in &conflicts {
-        eprintln!("warning: server \"{name}\" conflicts with a reserved command name");
-        eprintln!(
-            "  → rename it in {} to avoid unexpected behavior",
-            cfg.path.display()
+        tracing::warn!(
+            server = %name,
+            config = %cfg.path.display(),
+            "server name conflicts with a reserved command name — rename it to avoid unexpected behavior"
         );
     }
 
@@ -139,11 +144,16 @@ async fn run() -> Result<()> {
         return serve::run(cfg, http_addr.as_deref(), insecure).await;
     }
 
-    // Shared database pool for audit logging and tool cache
-    let db_pool = db::create_pool(&cfg.audit).unwrap_or_else(|e| {
-        eprintln!("warning: failed to create db pool: {e:#}");
+    // Shared database pool for audit logging and tool cache.
+    // Skip heavy DB init when audit output goes to stdout/stderr/none.
+    let db_pool = if cfg.audit.output == audit::AuditOutput::File {
+        db::create_pool(&cfg.audit).unwrap_or_else(|e| {
+            tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
+            Arc::new(db::DbPool::disabled())
+        })
+    } else {
         Arc::new(db::DbPool::disabled())
-    });
+    };
 
     // Audit logger shared across all commands
     let audit = Arc::new(
@@ -279,6 +289,12 @@ async fn run() -> Result<()> {
         }
         "acl" => {
             return cli::handle_acl_command(&args[1..], &cfg, fmt, &audit).await;
+        }
+        "config" => {
+            return cli::handle_config_command(&args[1..], fmt);
+        }
+        "completions" => {
+            return cli::handle_completions_command(&args[1..]);
         }
         _ => {}
     }

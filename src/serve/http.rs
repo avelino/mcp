@@ -137,7 +137,7 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let acl = config.server_auth.acl.clone();
 
     let pool = crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
-        eprintln!("warning: failed to create db pool: {e:#}");
+        tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
         Arc::new(crate::db::DbPool::disabled())
     });
     let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
@@ -202,14 +202,14 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     // Log all incoming requests for debugging
     let request_logger = axum::middleware::from_fn(
         |req: axum::extract::Request, next: axum::middleware::Next| async move {
-            eprintln!(
-                "[serve] {} {} {}",
-                req.method(),
-                req.uri(),
-                req.headers()
+            tracing::debug!(
+                method = %req.method(),
+                uri = %req.uri(),
+                accept = req.headers()
                     .get("accept")
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or("-")
+                    .unwrap_or("-"),
+                "incoming request"
             );
             next.run(req).await
         },
@@ -222,14 +222,10 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         .fallback(|req: axum::extract::Request| async move {
             let path = req.uri().path().to_string();
             let method = req.method().clone();
-            eprintln!(
-                "[serve] UNHANDLED {} {} (headers: {:?})",
-                method,
-                path,
-                req.headers()
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("?")))
-                    .collect::<Vec<_>>()
+            tracing::debug!(
+                method = %method,
+                path = %path,
+                "unhandled request"
             );
             // OAuth/OIDC discovery endpoints: return 404 with valid JSON
             // so clients that probe for auth don't crash on empty bodies
@@ -244,11 +240,11 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         .layer(request_logger)
         .with_state(state.clone());
 
-    eprintln!("[serve] HTTP server listening on {sock_addr}");
+    tracing::info!(addr = %sock_addr, "HTTP server listening");
     if sock_addr.ip().is_loopback() {
-        eprintln!("[serve] bound to loopback — local access only");
+        tracing::info!("bound to loopback — local access only");
     } else {
-        eprintln!("[serve] WARNING: bound to non-loopback address without TLS");
+        tracing::warn!("bound to non-loopback address without TLS");
     }
 
     let listener = bind_listener_with_keepalive(sock_addr)?;
@@ -270,7 +266,7 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         {
             ctrl_c.await.ok();
         }
-        eprintln!("\n[serve] shutdown signal received");
+        tracing::info!("shutdown signal received");
         let _ = shutdown_tx.send(true);
     };
 
@@ -291,9 +287,9 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         .await
         .is_err()
     {
-        eprintln!("[serve] shutdown timed out — forcing exit");
+        tracing::warn!("shutdown timed out — forcing exit");
     }
-    eprintln!("[serve] shutting down");
+    tracing::info!("shutting down");
 
     Ok(())
 }
@@ -419,8 +415,9 @@ async fn mcp_handler(
                 Ok(Err(_)) | Err(_) => {
                     // Receiver gone or buffer wedged → evict the session.
                     state.sessions.lock().await.remove(session_id);
-                    eprintln!(
-                        "[serve] sse session {session_id} evicted: stream send timed out or closed"
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "sse session evicted: stream send timed out or closed"
                     );
                 }
             }
@@ -497,8 +494,9 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
                             // After ~1 minute (4 × 15s intervals) of full
                             // buffer, treat the session as wedged and evict.
                             if consecutive_send_failures >= 4 {
-                                eprintln!(
-                                    "[serve] sse session {session_id_clone} evicted: ping buffer full"
+                                tracing::debug!(
+                                    session_id = %session_id_clone,
+                                    "sse session evicted: ping buffer full"
                                 );
                                 break;
                             }

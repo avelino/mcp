@@ -9,14 +9,18 @@ These variables configure `mcp` behavior:
 | `MCP_SERVERS_CONFIG` | — | Inline JSON config (entire `servers.json` content). Highest priority — skips file read entirely. |
 | `MCP_CONFIG_PATH` | `~/.config/mcp/servers.json` | Path to the config file |
 | `MCP_CONFIG_DIR` | `~/.config/mcp` | Config directory. Falls back to `/tmp/mcp` when `HOME` is not set. |
-| `MCP_TIMEOUT` | `60` | Timeout in seconds for stdio server responses |
+| `MCP_TIMEOUT` | `60` | Timeout in seconds for server responses (stdio, CLI, and HTTP transports) |
 | `MCP_MAX_OUTPUT` | `1048576` | Maximum output bytes from CLI server commands |
 | `MCP_PROXY_REQUEST_TIMEOUT` | `120` | (proxy mode) Hard upper bound, in seconds, that any single client request can spend inside `mcp serve` before the proxy returns a JSON-RPC error. Acts as a belt-and-suspenders boundary on top of the per-transport `MCP_TIMEOUT`. |
 | `MCP_CLASSIFIER_CACHE` | `~/.config/mcp/tool-classification.json` | Path to the persistent tool read/write classification cache (see [`mcp acl classify`](./cli.md#mcp-acl-classify)). Override this in CI/containers that cannot write to `$HOME`. |
 | `MCP_DISCOVERY_CONCURRENCY` | `10` | Max parallel `--help` calls during CLI subcommand discovery (see [CLI as MCP](../guides/cli-as-mcp.md)) |
+| `MCP_AUDIT_OUTPUT` | `file` | Audit output destination: `file` (ChronDB, queryable via `mcp logs`), `stdout`, `stderr` (JSON lines for container log drivers), or `none` (disable). |
 | `MCP_AUDIT_ENABLED` | `true` | Set to `false` or `0` to disable audit logging and database initialization. Overrides `audit.enabled` in the config file. |
 | `MCP_AUDIT_PATH` | `~/.config/mcp/db/data` | Override the ChronDB data directory. Overrides `audit.path` in the config file. |
 | `MCP_AUDIT_INDEX_PATH` | `~/.config/mcp/db/index` | Override the ChronDB index directory. Overrides `audit.index_path` in the config file. |
+| `MCP_LOG_LEVEL` | `info` | Log verbosity: `trace`, `debug`, `info`, `warn`, `error`. Uses `tracing` `EnvFilter` syntax — you can also set per-module levels like `mcp=debug,hyper=warn`. |
+| `MCP_LOG_FORMAT` | `text` | Log output format: `text` (human-readable) or `json` (structured, for container log drivers). |
+| `MCP_OAUTH_CALLBACK_PORT` | `8085-8099` | Port or range for the OAuth callback listener. Single port (`9000`), range (`9000-9010`), or `0` for OS-assigned. |
 | `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override the OAuth token storage location |
 
 ### Config loading priority
@@ -75,13 +79,11 @@ When `HOME` is not set (common in `scratch` and `distroless` containers), `mcp` 
 
 ### `MCP_TIMEOUT`
 
-How long to wait for a stdio server to respond, in seconds. Increase this for servers that take a long time to initialize (like some npm packages on first run).
+How long to wait for a server to respond, in seconds. Applies to all transports: stdio, CLI, and HTTP. Increase this for servers that take a long time to initialize (like some npm packages on first run) or slow HTTP backends.
 
 ```bash
 MCP_TIMEOUT=120 mcp slack --list
 ```
-
-Does not affect HTTP servers (they use reqwest's default timeouts).
 
 ### `MCP_MAX_OUTPUT`
 
