@@ -134,7 +134,7 @@ MCP Client  ←stdin/stdout→  mcp serve  ←→  backend 1 (stdio)
                                         ←→  backend N
 ```
 
-Backends are managed lazily with a persistent tool cache. On startup, the proxy loads previously discovered tools from a local [ChronDB](https://chrondb.avelino.run/) database and serves them immediately — no backend connections needed. A background task then connects to all backends to refresh the cache. On first run (no cache), `tools/list` blocks on discovery as a fallback. On `tools/call`, the proxy splits the namespaced name (`server__tool`), ensures the target backend is connected (reconnecting on demand if it was shut down), and forwards the request.
+Backends are managed lazily with a persistent tool cache. On startup, the proxy loads previously discovered tools from a local [ChronDB](https://chrondb.avelino.run/) database and serves them immediately — no backend connections needed. A background task then connects to all backends to refresh the cache. On first run (no cache), `tools/list` blocks on full discovery as a fallback. On `tools/call`, the proxy infers the target backend from the namespaced name (`server__tool`) and discovers **only that backend** if it hasn't been seen yet — other backends are not touched. This means a call to `gh__issue` only waits for the `gh` backend, not for every other server to finish discovery. If the backend cannot be inferred (e.g. a non-namespaced tool name), the proxy falls back to discovering all pending backends.
 
 Cache invalidation is per-backend via SHA-256 hash of the raw config JSON. If a backend's config changes in `servers.json`, its cached tools are discarded and re-discovered. The cache and audit log share a single [ChronDB](https://chrondb.avelino.run/) database (`~/.config/mcp/db/`), separated by key prefix (`cache:tools:*` vs `audit:*`).
 
@@ -162,6 +162,8 @@ Backends are pooled by name in a `HashMap<String, BackendState>` inside `ProxySe
 
 Discovery — the act of connecting to a previously-unseen backend and listing its tools — used to run **under** the proxy lock, which meant a single slow backend (e.g. a 30-second OAuth handshake) could wedge every other client until it returned. That is fixed by a separate `discovery_lock: Arc<Mutex<()>>` on `ProxyServer`. Discovery batches now snapshot the pending set under a brief lock, drop the proxy lock, run all the connect attempts in parallel **without** holding the proxy mutex, and only re-acquire the lock briefly to commit each result. Two callers that both want to discover are serialized on the discovery lock (so they don't double-spawn), but request handlers targeting already-discovered backends fly through with zero contention while a discovery batch is in progress.
 
+For single-item requests (`tools/call`, `resources/read`, `prompts/get`), the proxy uses **per-server lazy discovery**: it infers the target backend from the namespaced name and calls `discover_single_backend` instead of `discover_pending_backends`. This discovers only the needed server under the same `discovery_lock`, so a `tools/call` for `gh__issue` never blocks on kubectl, grafana, or any other backend. Full batch discovery is reserved for listing operations (`tools/list`, `resources/list`, `prompts/list`) where the client expects the complete catalog.
+
 The HTTP+SSE legacy transport has its own backpressure trap: each client session is fed by a bounded `mpsc` channel, and a slow consumer can fill the buffer. The POST handler bounds its `tx.send(...)` with a 5s timeout — on failure or timeout, the session is **evicted** from the session map and the client is expected to reconnect. The SSE keepalive ping background task uses `try_send` instead of `send().await` so a momentarily-full buffer never blocks it; after ~1 minute of consecutive full-buffer pings the session is also evicted as wedged.
 
 Practical consequences:
@@ -169,7 +171,7 @@ Practical consequences:
 - Calls to **different** backends are fully parallel.
 - Calls to the **same** backend are also parallel — they fan out through one shared process via the stdio multiplexer (or through `reqwest`'s native concurrency for HTTP backends). One backend = one OS process, regardless of how many clients are connected.
 - A slow or hung backend only delays the requests targeting it. Other clients keep moving.
-- A slow discovery (e.g. an unreachable backend hitting its 30s timeout) blocks only other callers that also need discovery. Already-discovered backends keep serving requests normally.
+- A slow discovery (e.g. an unreachable backend hitting its 30s timeout) blocks only other callers that also need discovery for the same backend. A `tools/call` for a different backend discovers only its target — it is not delayed by the slow one. Already-discovered backends keep serving requests normally.
 - A dead client only loses its own request. The HTTP listener is bound with TCP keepalive (30s idle / 10s interval) so half-open sockets from crashed clients are detected within ~60s, and `MCP_PROXY_REQUEST_TIMEOUT` (default 120s) is a final hard bound at the proxy boundary.
 - A client request that is cancelled mid-flight cleans up after itself: the future is dropped, any spawned child process is reaped via `kill_on_drop`, and the backend's pending-request map is cleared by the reader task on EOF.
 

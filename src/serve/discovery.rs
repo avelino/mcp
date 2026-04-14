@@ -191,6 +191,170 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
     }
 }
 
+/// Discover a single named backend.  Used by `tools/call`, `resources/read`,
+/// and `prompts/get` when the requested item is unknown but its backend can be
+/// inferred from the namespaced name (`server__tool`).  This avoids blocking
+/// on every other configured backend — only the target server is discovered.
+///
+/// Uses the **same** `discovery_lock` as `discover_pending_backends` so a
+/// concurrent full-discovery batch and a single-backend discovery never race
+/// to spawn duplicate connections for the same server.
+pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &str) {
+    let discovery_lock = {
+        let p = proxy.lock().await;
+        Arc::clone(&p.discovery_lock)
+    };
+    let _guard = discovery_lock.lock().await;
+
+    // Re-check under the lock: another caller may have discovered it while
+    // we were waiting.
+    let config = {
+        let p = proxy.lock().await;
+        if p.discovered_backends.contains(backend_name) {
+            return;
+        }
+        if let Some(failure) = p.discovery_failures.get(backend_name) {
+            if !failure.should_retry() {
+                return;
+            }
+        }
+        match p.configs.get(backend_name) {
+            Some(cfg) => cfg.clone(),
+            None => return,
+        }
+    };
+
+    eprintln!("[serve] discovering tools from {backend_name}...");
+    let discovery_timeout = Duration::from_secs(30);
+    let name = backend_name.to_string();
+
+    let result = tokio::time::timeout(discovery_timeout, async {
+        let client = McpClient::connect(&config).await?;
+        let tools = client.list_tools().await?;
+        let resources = match client.list_resources().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[serve] {name}: resources/list not supported or failed: {e:#}");
+                vec![]
+            }
+        };
+        let prompts = match client.list_prompts().await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[serve] {name}: prompts/list not supported or failed: {e:#}");
+                vec![]
+            }
+        };
+        Ok::<_, anyhow::Error>((client, tools, resources, prompts))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((client, tools, resources, prompts))) => {
+            let mut p = proxy.lock().await;
+            if p.discovered_backends.contains(&name) {
+                drop(client);
+                return;
+            }
+            eprintln!(
+                "[serve] {name}: {} tool(s), {} resource(s), {} prompt(s)",
+                tools.len(),
+                resources.len(),
+                prompts.len()
+            );
+            p.register_tools(&name, &tools);
+            p.register_resources(&name, &resources);
+            p.register_prompts(&name, &prompts);
+            p.backends.insert(
+                name.clone(),
+                BackendState::Connected {
+                    client: Arc::new(client),
+                    usage_stats: UsageStats::new(),
+                },
+            );
+            p.discovered_backends.insert(name.clone());
+            p.discovery_failures.remove(&name);
+        }
+        Ok(Err(e)) => {
+            let mut p = proxy.lock().await;
+            let msg = format!("failed to discover: {e:#}");
+            eprintln!("[serve] {name}: {msg}");
+            p.audit.log(AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                source: "serve:discovery".to_string(),
+                method: "discovery/failure".to_string(),
+                tool_name: None,
+                server_name: Some(name.clone()),
+                identity: "system".to_string(),
+                duration_ms: 0,
+                success: false,
+                error_message: Some(msg),
+                arguments: None,
+                acl_decision: None,
+                acl_matched_rule: None,
+                acl_access_kind: None,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+            });
+            p.discovery_failures
+                .entry(name)
+                .or_insert_with(DiscoveryFailure::new)
+                .record_failure();
+        }
+        Err(_) => {
+            let mut p = proxy.lock().await;
+            let msg = format!("discovery timed out ({}s)", discovery_timeout.as_secs());
+            eprintln!("[serve] {name}: {msg}");
+            p.audit.log(AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                source: "serve:discovery".to_string(),
+                method: "discovery/timeout".to_string(),
+                tool_name: None,
+                server_name: Some(name.clone()),
+                identity: "system".to_string(),
+                duration_ms: discovery_timeout.as_millis() as u64,
+                success: false,
+                error_message: Some(msg),
+                arguments: None,
+                acl_decision: None,
+                acl_matched_rule: None,
+                acl_access_kind: None,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+            });
+            p.discovery_failures
+                .entry(name.clone())
+                .or_insert_with(DiscoveryFailure::new)
+                .record_failure();
+        }
+    }
+
+    // Persist cache for this single backend outside the proxy lock.
+    let (cache_entry, cache_store) = {
+        let p = proxy.lock().await;
+        let entries = p.snapshot_cache_entries();
+        let entry = entries
+            .into_iter()
+            .find(|(n, _)| n == backend_name)
+            .map(|(_, e)| e);
+        (entry, p.cache_store.clone())
+    };
+    if let Some(entry) = cache_entry {
+        let bname = backend_name.to_string();
+        tokio::spawn(async move {
+            cache_store.save_backend(&bname, &entry);
+        });
+    }
+
+    // Persist classifier cache (fresh entries from register_tools).
+    {
+        let mut p = proxy.lock().await;
+        p.classifier_cache.save();
+    }
+}
+
 /// Connect (or reconnect) to a backend, doing the network/spawn I/O **without**
 /// holding the proxy lock. Briefly re-acquires the lock at the end to install
 /// the new client and pick up the previous one (if any) for shutdown outside
