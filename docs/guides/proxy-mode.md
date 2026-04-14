@@ -348,7 +348,7 @@ The proxy caches discovered tools in a local [ChronDB](https://chrondb.avelino.r
 
 On startup, the proxy loads cached tools and serves them immediately. A background task then connects to real backends to refresh the cache. If a backend's configuration changes (detected via SHA-256 hash), its cached entry is invalidated and re-discovered.
 
-First run with no cache falls back to blocking discovery (connecting to all backends before responding).
+First run with no cache: `tools/list` falls back to blocking full discovery (connecting to all backends before responding). However, `tools/call` uses per-server lazy discovery — it infers the target backend from the namespaced tool name and discovers only that server, so a single tool call never blocks on unrelated backends.
 
 ### Cache invalidation
 
@@ -644,7 +644,7 @@ MCP_PROXY_REQUEST_TIMEOUT=300 mcp serve --http
 
 ### Discovery retry with backoff
 
-When a backend fails to connect during discovery, the proxy applies exponential backoff: 30s → 60s → 120s → 240s (capped at 300s). This prevents a flaky backend from repeatedly stealing the discovery lock and blocking healthy backends. After the backoff expires, the proxy retries on the next `tools/call` or discovery cycle. Success clears the backoff.
+When a backend fails to connect during discovery, the proxy applies exponential backoff: 30s → 60s → 120s → 240s (capped at 300s). This prevents a flaky backend from repeatedly stealing the discovery lock and blocking healthy backends. After the backoff expires, the proxy retries on the next `tools/call` or discovery cycle. Success clears the backoff. Backoff is checked per-backend — a `tools/call` targeting a healthy server is never delayed by another server's backoff state.
 
 ## Security considerations
 

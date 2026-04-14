@@ -7,8 +7,18 @@ use crate::client::McpClient;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::server_auth::{self, AclConfig, AuthIdentity};
 
-use super::discovery::{connect_backend, discover_pending_backends};
-use super::proxy::{ResolvedCall, ResolvedPromptGet, ResolvedResourceRead, SharedProxy, SEPARATOR};
+use super::discovery::{connect_backend, discover_pending_backends, discover_single_backend};
+use super::proxy::{
+    infer_backend_name, ResolvedCall, ResolvedPromptGet, ResolvedResourceRead, SharedProxy,
+    SEPARATOR,
+};
+
+/// Whether to discover all pending backends, a single one, or none.
+enum DiscoveryAction {
+    None,
+    Single(String),
+    All,
+}
 
 /// Top-level non-blocking request dispatcher.
 ///
@@ -117,20 +127,34 @@ pub(crate) async fn dispatch_request(
             }
 
             // Decide whether discovery is needed before resolving routing.
-            // Discovery happens **outside** the proxy lock; only its outcome
-            // affects the resolve step.
-            let needs_discovery = {
+            // When the tool name is namespaced (server__tool), we can infer
+            // which backend owns it and discover **only** that backend instead
+            // of blocking on every pending server.
+            let discovery_action = {
                 let p = proxy.lock().await;
                 audit_logger = Arc::clone(&p.audit);
                 match req.params.as_ref().and_then(|v| v.get("name")) {
-                    Some(Value::String(name)) => {
-                        !p.tool_map.contains_key(name) && p.has_undiscovered_backends()
+                    Some(Value::String(name)) if !p.tool_map.contains_key(name) => {
+                        match infer_backend_name(name, &p.configs) {
+                            Some(backend) if p.is_backend_undiscovered(backend) => {
+                                DiscoveryAction::Single(backend.to_string())
+                            }
+                            Some(_) => DiscoveryAction::None,
+                            None if p.has_undiscovered_backends() => DiscoveryAction::All,
+                            None => DiscoveryAction::None,
+                        }
                     }
-                    _ => false,
+                    _ => DiscoveryAction::None,
                 }
             };
-            if needs_discovery {
-                discover_pending_backends(proxy).await;
+            match &discovery_action {
+                DiscoveryAction::Single(backend) => {
+                    discover_single_backend(proxy, backend).await;
+                }
+                DiscoveryAction::All => {
+                    discover_pending_backends(proxy).await;
+                }
+                DiscoveryAction::None => {}
             }
 
             // Phase 1: resolve routing under a brief lock.
@@ -272,13 +296,30 @@ pub(crate) async fn dispatch_request(
 
             tool_name_for_audit = Some(uri.clone());
 
-            let needs_discovery = {
+            let discovery_action = {
                 let p = proxy.lock().await;
                 audit_logger = Arc::clone(&p.audit);
-                !p.resource_map.contains_key(&uri) && p.has_undiscovered_backends()
+                if p.resource_map.contains_key(&uri) {
+                    DiscoveryAction::None
+                } else {
+                    match infer_backend_name(&uri, &p.configs) {
+                        Some(backend) if p.is_backend_undiscovered(backend) => {
+                            DiscoveryAction::Single(backend.to_string())
+                        }
+                        Some(_) => DiscoveryAction::None,
+                        None if p.has_undiscovered_backends() => DiscoveryAction::All,
+                        None => DiscoveryAction::None,
+                    }
+                }
             };
-            if needs_discovery {
-                discover_pending_backends(proxy).await;
+            match &discovery_action {
+                DiscoveryAction::Single(backend) => {
+                    discover_single_backend(proxy, backend).await;
+                }
+                DiscoveryAction::All => {
+                    discover_pending_backends(proxy).await;
+                }
+                DiscoveryAction::None => {}
             }
 
             // Resolve: lookup resource_map, check ACL.
@@ -451,13 +492,30 @@ pub(crate) async fn dispatch_request(
 
             tool_name_for_audit = Some(prompt_name.clone());
 
-            let needs_discovery = {
+            let discovery_action = {
                 let p = proxy.lock().await;
                 audit_logger = Arc::clone(&p.audit);
-                !p.prompt_map.contains_key(&prompt_name) && p.has_undiscovered_backends()
+                if p.prompt_map.contains_key(&prompt_name) {
+                    DiscoveryAction::None
+                } else {
+                    match infer_backend_name(&prompt_name, &p.configs) {
+                        Some(backend) if p.is_backend_undiscovered(backend) => {
+                            DiscoveryAction::Single(backend.to_string())
+                        }
+                        Some(_) => DiscoveryAction::None,
+                        None if p.has_undiscovered_backends() => DiscoveryAction::All,
+                        None => DiscoveryAction::None,
+                    }
+                }
             };
-            if needs_discovery {
-                discover_pending_backends(proxy).await;
+            match &discovery_action {
+                DiscoveryAction::Single(backend) => {
+                    discover_single_backend(proxy, backend).await;
+                }
+                DiscoveryAction::All => {
+                    discover_pending_backends(proxy).await;
+                }
+                DiscoveryAction::None => {}
             }
 
             let resolved: std::result::Result<ResolvedPromptGet, JsonRpcResponse> = {

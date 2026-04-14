@@ -15,6 +15,22 @@ use crate::server_auth::{self, AclConfig, AuthIdentity};
 
 pub(crate) const SEPARATOR: &str = "__";
 
+/// Extract the backend server name from a namespaced identifier (e.g.
+/// `"gh__issue"` → `"gh"`).  Returns `None` when the name contains no
+/// separator or the prefix does not match any configured backend — callers
+/// should fall back to full discovery in that case.
+pub(crate) fn infer_backend_name<'a>(
+    name: &'a str,
+    configs: &HashMap<String, ServerConfig>,
+) -> Option<&'a str> {
+    let (prefix, _) = name.split_once(SEPARATOR)?;
+    if configs.contains_key(prefix) {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
 /// Tracks per-backend usage patterns for adaptive idle timeout.
 #[derive(Debug, Clone)]
 pub(crate) struct UsageStats {
@@ -434,6 +450,24 @@ impl ProxyServer {
                 None => true, // never attempted
             }
         })
+    }
+
+    /// Returns true if a **specific** backend needs discovery: it exists in
+    /// configs, has not been discovered yet, and is eligible for retry
+    /// (respects backoff).  Used by `tools/call` / `resources/read` /
+    /// `prompts/get` to trigger per-server lazy discovery instead of
+    /// discovering every pending backend.
+    pub(crate) fn is_backend_undiscovered(&self, name: &str) -> bool {
+        if !self.configs.contains_key(name) {
+            return false;
+        }
+        if self.discovered_backends.contains(name) {
+            return false;
+        }
+        match self.discovery_failures.get(name) {
+            Some(failure) => failure.should_retry(),
+            None => true,
+        }
     }
 
     /// Snapshot the list of backends that still need discovery, respecting
@@ -1030,5 +1064,99 @@ mod tests {
         let result = resp.result.unwrap();
         assert!(result["capabilities"]["resources"].is_object());
         assert!(result["capabilities"]["prompts"].is_object());
+    }
+
+    // --- infer_backend_name tests ---
+
+    fn make_configs(names: &[&str]) -> HashMap<String, ServerConfig> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    ServerConfig::Stdio {
+                        command: "echo".to_string(),
+                        args: vec![],
+                        env: HashMap::new(),
+                        tool_acl: None,
+                        idle_timeout: crate::config::IdleTimeoutPolicy::default(),
+                        min_idle_timeout: None,
+                        max_idle_timeout: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_infer_backend_name_valid() {
+        let configs = make_configs(&["gh", "sentry", "slack"]);
+        assert_eq!(infer_backend_name("gh__issue", &configs), Some("gh"));
+        assert_eq!(
+            infer_backend_name("sentry__search_issues", &configs),
+            Some("sentry")
+        );
+    }
+
+    #[test]
+    fn test_infer_backend_name_no_separator() {
+        let configs = make_configs(&["gh"]);
+        assert_eq!(infer_backend_name("my_tool", &configs), None);
+        assert_eq!(infer_backend_name("notool", &configs), None);
+    }
+
+    #[test]
+    fn test_infer_backend_name_unknown_prefix() {
+        let configs = make_configs(&["gh"]);
+        assert_eq!(infer_backend_name("fake__tool", &configs), None);
+    }
+
+    #[test]
+    fn test_infer_backend_name_multi_separator() {
+        let configs = make_configs(&["a"]);
+        // split_once gives ("a", "b__c") — prefix "a" is in configs
+        assert_eq!(infer_backend_name("a__b__c", &configs), Some("a"));
+    }
+
+    // --- is_backend_undiscovered tests ---
+
+    fn test_server_with_configs(names: &[&str]) -> ProxyServer {
+        let pool = Arc::new(crate::db::DbPool::disabled());
+        let cache_store = ToolCacheStore::new(pool);
+        ProxyServer::new(
+            Arc::new(AuditLogger::Disabled),
+            make_configs(names),
+            HashMap::new(),
+            cache_store,
+        )
+    }
+
+    #[test]
+    fn test_is_backend_undiscovered_never_seen() {
+        let server = test_server_with_configs(&["gh"]);
+        assert!(server.is_backend_undiscovered("gh"));
+    }
+
+    #[test]
+    fn test_is_backend_undiscovered_already_discovered() {
+        let mut server = test_server_with_configs(&["gh"]);
+        server.discovered_backends.insert("gh".to_string());
+        assert!(!server.is_backend_undiscovered("gh"));
+    }
+
+    #[test]
+    fn test_is_backend_undiscovered_in_backoff() {
+        let mut server = test_server_with_configs(&["gh"]);
+        let mut failure = DiscoveryFailure::new();
+        failure.record_failure();
+        server.discovery_failures.insert("gh".to_string(), failure);
+        // Just failed — backoff blocks retry
+        assert!(!server.is_backend_undiscovered("gh"));
+    }
+
+    #[test]
+    fn test_is_backend_undiscovered_not_in_configs() {
+        let server = test_server_with_configs(&["gh"]);
+        assert!(!server.is_backend_undiscovered("nonexistent"));
     }
 }
