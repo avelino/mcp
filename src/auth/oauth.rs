@@ -12,8 +12,32 @@ use url::Url;
 use super::hints;
 use super::store::{self, to_stored_tokens};
 
-const CALLBACK_PORT_START: u16 = 8085;
-const CALLBACK_PORT_END: u16 = 8099;
+const DEFAULT_CALLBACK_PORT_START: u16 = 8085;
+const DEFAULT_CALLBACK_PORT_END: u16 = 8099;
+
+fn parse_port_spec(val: &str) -> (u16, u16) {
+    if val == "0" {
+        return (0, 0);
+    }
+    if let Some((start, end)) = val.split_once('-') {
+        if let (Ok(s), Ok(e)) = (start.parse::<u16>(), end.parse::<u16>()) {
+            if s <= e {
+                return (s, e);
+            }
+        }
+    }
+    if let Ok(port) = val.parse::<u16>() {
+        return (port, port);
+    }
+    (DEFAULT_CALLBACK_PORT_START, DEFAULT_CALLBACK_PORT_END)
+}
+
+fn callback_port_range() -> (u16, u16) {
+    match std::env::var("MCP_OAUTH_CALLBACK_PORT") {
+        Ok(val) => parse_port_spec(&val),
+        Err(_) => (DEFAULT_CALLBACK_PORT_START, DEFAULT_CALLBACK_PORT_END),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ProtectedResourceMetadata {
@@ -44,14 +68,14 @@ pub struct TokenResponse {
 pub async fn run_oauth_flow(server_url: &str) -> Result<String> {
     let key = store::server_key(server_url);
 
-    eprintln!("Authenticating with {}...", key);
+    tracing::info!(server = %key, "authenticating");
 
     let metadata = discover_auth_server(&key).await?;
 
     let client_id = match get_or_register_client(&key, &metadata).await {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("OAuth registration not available: {e:#}");
+            tracing::warn!(error = format!("{e:#}"), "OAuth registration not available");
             return hints::prompt_for_token(server_url);
         }
     };
@@ -76,13 +100,13 @@ pub async fn run_oauth_flow(server_url: &str) -> Result<String> {
         auth_url.query_pairs_mut().append_pair("scope", &scopes);
     }
 
-    eprintln!("Opening browser for authorization...");
-    eprintln!("If it doesn't open, visit: {auth_url}");
+    tracing::info!("opening browser for authorization");
+    tracing::info!(url = %auth_url, "if browser doesn't open, visit this URL");
     let _ = open::that(auth_url.as_str());
 
     let code = wait_for_callback(listener, &state).await?;
 
-    eprintln!("Exchanging authorization code for tokens...");
+    tracing::info!("exchanging authorization code for tokens");
     let http = reqwest::Client::new();
     let resp = http
         .post(&metadata.token_endpoint)
@@ -113,7 +137,7 @@ pub async fn run_oauth_flow(server_url: &str) -> Result<String> {
     auth_store.tokens.insert(key.clone(), tokens);
     store::save_auth_store(&auth_store)?;
 
-    eprintln!("Authenticated successfully.");
+    tracing::info!("authenticated successfully");
     Ok(access_token)
 }
 
@@ -289,12 +313,18 @@ fn generate_random_string(len: usize) -> String {
 // --- Callback server ---
 
 async fn bind_callback_listener() -> Result<(TcpListener, u16)> {
-    for port in CALLBACK_PORT_START..=CALLBACK_PORT_END {
+    let (start, end) = callback_port_range();
+    if start == 0 {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        return Ok((listener, port));
+    }
+    for port in start..=end {
         if let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{port}")).await {
             return Ok((listener, port));
         }
     }
-    bail!("could not bind to any port in range {CALLBACK_PORT_START}-{CALLBACK_PORT_END}");
+    bail!("could not bind to any port in range {start}-{end}");
 }
 
 async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String> {
@@ -388,6 +418,38 @@ mod tests {
         assert!(s
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
+    }
+
+    #[test]
+    fn test_parse_port_spec_single_port() {
+        assert_eq!(parse_port_spec("9000"), (9000, 9000));
+    }
+
+    #[test]
+    fn test_parse_port_spec_range() {
+        assert_eq!(parse_port_spec("9000-9010"), (9000, 9010));
+    }
+
+    #[test]
+    fn test_parse_port_spec_os_assigned() {
+        assert_eq!(parse_port_spec("0"), (0, 0));
+    }
+
+    #[test]
+    fn test_parse_port_spec_invalid_fallback() {
+        assert_eq!(
+            parse_port_spec("not-a-port"),
+            (DEFAULT_CALLBACK_PORT_START, DEFAULT_CALLBACK_PORT_END)
+        );
+    }
+
+    #[test]
+    fn test_parse_port_spec_inverted_range_fallback() {
+        // end < start should fall back to defaults
+        assert_eq!(
+            parse_port_spec("9010-9000"),
+            (DEFAULT_CALLBACK_PORT_START, DEFAULT_CALLBACK_PORT_END)
+        );
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
     }
 
     for name in pending.iter().map(|(n, _)| n) {
-        eprintln!("[serve] discovering tools from {name}...");
+        tracing::info!(server = %name, "discovering tools");
     }
 
     let discovery_timeout = Duration::from_secs(30);
@@ -53,14 +53,14 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
                 let resources = match client.list_resources().await {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("[serve] {name}: resources/list not supported or failed: {e:#}");
+                        tracing::debug!(server = %name, error = %e, "resources/list not supported or failed");
                         vec![]
                     }
                 };
                 let prompts = match client.list_prompts().await {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[serve] {name}: prompts/list not supported or failed: {e:#}");
+                        tracing::debug!(server = %name, error = %e, "prompts/list not supported or failed");
                         vec![]
                     }
                 };
@@ -78,7 +78,7 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
         let (name, result) = match joined {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[serve] discovery task panicked: {e}");
+                tracing::error!(error = %e, "discovery task panicked");
                 continue;
             }
         };
@@ -90,11 +90,12 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
                     drop(client);
                     continue;
                 }
-                eprintln!(
-                    "[serve] {name}: {} tool(s), {} resource(s), {} prompt(s)",
-                    tools.len(),
-                    resources.len(),
-                    prompts.len()
+                tracing::info!(
+                    server = %name,
+                    tools = tools.len(),
+                    resources = resources.len(),
+                    prompts = prompts.len(),
+                    "discovered capabilities"
                 );
                 p.register_tools(&name, &tools);
                 p.register_resources(&name, &resources);
@@ -112,7 +113,7 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
             Ok(Err(e)) => {
                 let mut p = proxy.lock().await;
                 let msg = format!("failed to discover: {e:#}");
-                eprintln!("[serve] {name}: {msg}");
+                tracing::warn!(server = %name, error = %e, "failed to discover");
                 p.audit.log(AuditEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     source: "serve:discovery".to_string(),
@@ -139,7 +140,7 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
             Err(_) => {
                 let mut p = proxy.lock().await;
                 let msg = format!("discovery timed out ({}s)", discovery_timeout.as_secs());
-                eprintln!("[serve] {name}: {msg}");
+                tracing::warn!(server = %name, timeout_secs = discovery_timeout.as_secs(), "discovery timed out");
                 p.audit.log(AuditEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     source: "serve:discovery".to_string(),
@@ -171,12 +172,12 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
     // and would otherwise block every request handler.
     let (cache_entries, cache_store) = {
         let p = proxy.lock().await;
-        eprintln!(
-            "[serve] ready — {} backend(s), {} tool(s), {} resource(s), {} prompt(s)",
-            p.backends.len(),
-            p.tools.len(),
-            p.resources.len(),
-            p.prompts.len()
+        tracing::info!(
+            backends = p.backends.len(),
+            tools = p.tools.len(),
+            resources = p.resources.len(),
+            prompts = p.prompts.len(),
+            "ready"
         );
         (p.snapshot_cache_entries(), p.cache_store.clone())
     };
@@ -224,7 +225,7 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
         }
     };
 
-    eprintln!("[serve] discovering tools from {backend_name}...");
+    tracing::info!(server = %backend_name, "discovering tools");
     let discovery_timeout = Duration::from_secs(30);
     let name = backend_name.to_string();
 
@@ -234,14 +235,14 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
         let resources = match client.list_resources().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[serve] {name}: resources/list not supported or failed: {e:#}");
+                tracing::debug!(server = %name, error = %e, "resources/list not supported or failed");
                 vec![]
             }
         };
         let prompts = match client.list_prompts().await {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[serve] {name}: prompts/list not supported or failed: {e:#}");
+                tracing::debug!(server = %name, error = %e, "prompts/list not supported or failed");
                 vec![]
             }
         };
@@ -256,11 +257,12 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
                 drop(client);
                 return;
             }
-            eprintln!(
-                "[serve] {name}: {} tool(s), {} resource(s), {} prompt(s)",
-                tools.len(),
-                resources.len(),
-                prompts.len()
+            tracing::info!(
+                server = %name,
+                tools = tools.len(),
+                resources = resources.len(),
+                prompts = prompts.len(),
+                "discovered capabilities"
             );
             p.register_tools(&name, &tools);
             p.register_resources(&name, &resources);
@@ -278,7 +280,7 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
         Ok(Err(e)) => {
             let mut p = proxy.lock().await;
             let msg = format!("failed to discover: {e:#}");
-            eprintln!("[serve] {name}: {msg}");
+            tracing::warn!(server = %name, error = %e, "failed to discover");
             p.audit.log(AuditEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 source: "serve:discovery".to_string(),
@@ -305,7 +307,7 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
         Err(_) => {
             let mut p = proxy.lock().await;
             let msg = format!("discovery timed out ({}s)", discovery_timeout.as_secs());
-            eprintln!("[serve] {name}: {msg}");
+            tracing::warn!(server = %name, timeout_secs = discovery_timeout.as_secs(), "discovery timed out");
             p.audit.log(AuditEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 source: "serve:discovery".to_string(),
@@ -389,20 +391,20 @@ pub(crate) async fn connect_backend(
         return Ok(existing);
     }
 
-    eprintln!("[serve] connecting to {server_name}...");
+    tracing::info!(server = %server_name, "connecting");
     let client = McpClient::connect(&config).await?;
     let tools = client.list_tools().await?;
     let resources = match client.list_resources().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[serve] {server_name}: resources/list not supported or failed: {e:#}");
+            tracing::debug!(server = %server_name, error = %e, "resources/list not supported or failed");
             vec![]
         }
     };
     let prompts = match client.list_prompts().await {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[serve] {server_name}: prompts/list not supported or failed: {e:#}");
+            tracing::debug!(server = %server_name, error = %e, "prompts/list not supported or failed");
             vec![]
         }
     };
@@ -430,9 +432,7 @@ pub(crate) async fn connect_backend(
                 .await
                 .is_err()
             {
-                eprintln!(
-                    "[serve] {name}: previous client shutdown timed out — force-killed via drop"
-                );
+                tracing::warn!(server = %name, "previous client shutdown timed out, force-killed via drop");
             }
             drop(prev);
         });

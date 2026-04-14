@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::auth;
 use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
@@ -20,7 +21,13 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(url: &str, headers: &HashMap<String, String>) -> Result<Self> {
-        let client = Client::new();
+        let timeout_secs: u64 = std::env::var("MCP_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()?;
         Ok(Self {
             client,
             url: url.to_string(),
@@ -113,9 +120,9 @@ impl Transport for HttpTransport {
         // Handle 401: try OAuth and retry once
         if status == reqwest::StatusCode::UNAUTHORIZED {
             if self.has_valid_auth_header() {
-                eprintln!("Server returned 401 — token from config may be expired or invalid.");
+                tracing::warn!("server returned 401 — token may be expired or invalid");
             }
-            eprintln!("Starting authentication...");
+            tracing::info!("starting authentication");
             // Clear config auth header so OAuth token takes precedence on retry
             {
                 let mut headers = self.headers.lock().unwrap();

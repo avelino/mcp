@@ -262,7 +262,7 @@ mcp add filesystem
 Fails if:
 - Server not found in registry
 - Server already exists in config
-- Name is reserved (`search`, `add`, `remove`, `list`, `help`, `version`)
+- Name is reserved (`search`, `add`, `remove`, `list`, `help`, `version`, `serve`, `logs`, `config`, `completions`)
 
 ### `mcp add --url <url> <name>`
 
@@ -310,6 +310,61 @@ Fails if:
 - Server is not in the registry
 
 > If the server changed type in the registry (stdio ↔ http), `mcp update` warns and drops type-specific fields that no longer apply.
+
+## Config commands
+
+### `mcp config path`
+
+Print the resolved path to the config file (`servers.json`).
+
+```bash
+mcp config path
+# /Users/you/.config/mcp/servers.json
+```
+
+With `--json`, includes metadata:
+
+```json
+{
+  "path": "/Users/you/.config/mcp/servers.json",
+  "exists": true,
+  "dir": "/Users/you/.config/mcp"
+}
+```
+
+### `mcp config edit`
+
+Open the config file in your editor. Uses `$EDITOR`, falls back to `$VISUAL`, then `vi` (or `notepad` on Windows).
+
+```bash
+mcp config edit
+```
+
+If the config file doesn't exist, it's created with `{}` before opening.
+
+## Shell completions
+
+### `mcp completions <shell>`
+
+Generate shell completion scripts. Supported shells: `bash`, `zsh`, `fish`.
+
+```bash
+# Fish (recommended for the current session)
+mcp completions fish | source
+
+# Fish (persistent)
+mcp completions fish > ~/.config/fish/completions/mcp.fish
+
+# Bash
+mcp completions bash >> ~/.bashrc
+source ~/.bashrc
+
+# Zsh
+mcp completions zsh > "${fpath[1]}/_mcp"
+autoload -Uz compinit && compinit
+```
+
+Completions cover all subcommands, flags, and nested subcommands (`config path|edit`, `acl classify|check`, `logs` flags, etc.).
 
 ## ACL commands
 

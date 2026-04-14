@@ -72,7 +72,7 @@ impl StdioTransport {
                         break;
                     }
                     let trimmed = line.trim_end().to_string();
-                    eprintln!("[server stderr] {trimmed}");
+                    tracing::debug!(line = %trimmed, "server stderr");
                     let mut b = buf.lock().await;
                     b.push(trimmed);
                     if b.len() > 50 {

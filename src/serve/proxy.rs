@@ -282,10 +282,11 @@ impl ProxyServer {
                 classify(tool, overrides.as_ref())
             };
             if classification.kind == Kind::Ambiguous {
-                eprintln!(
-                    "[serve] {server_name}:{tool_name}: classification ambiguous → treated as write (reasons: {reasons})",
-                    tool_name = tool.name,
-                    reasons = classification.reasons.join("; "),
+                tracing::warn!(
+                    server = %server_name,
+                    tool = %tool.name,
+                    reasons = %classification.reasons.join("; "),
+                    "classification ambiguous — treated as write",
                 );
             }
             self.classifications
@@ -389,7 +390,7 @@ impl ProxyServer {
                 .iter()
                 .filter(|t| t.name.starts_with(&format!("{name}{SEPARATOR}")))
                 .count();
-            eprintln!("[serve] {name}: {tool_count} tool(s) (cached)");
+            tracing::info!(server = %name, tool_count, "tools loaded from cache");
         }
     }
 
@@ -533,11 +534,12 @@ impl ProxyServer {
         self.register_resources(server_name, resources);
         self.unregister_prompts(server_name);
         self.register_prompts(server_name, prompts);
-        eprintln!(
-            "[serve] {server_name}: {} tool(s), {} resource(s), {} prompt(s) (reconnected)",
-            tools.len(),
-            resources.len(),
-            prompts.len()
+        tracing::info!(
+            server = %server_name,
+            tools = tools.len(),
+            resources = resources.len(),
+            prompts = prompts.len(),
+            "reconnected",
         );
 
         self.discovered_backends.insert(server_name.to_string());
@@ -603,10 +605,11 @@ impl ProxyServer {
             }) = self.backends.remove(&name)
             {
                 let cached_tools = self.collect_cached_tools(&name);
-                eprintln!(
-                    "[serve] shutting down idle backend: {name} (idle {:?}, {} reqs)",
-                    usage_stats.idle_duration(),
-                    usage_stats.request_count,
+                tracing::info!(
+                    server = %name,
+                    idle = ?usage_stats.idle_duration(),
+                    request_count = usage_stats.request_count,
+                    "shutting down idle backend",
                 );
                 self.backends.insert(
                     name.clone(),
@@ -738,12 +741,12 @@ pub(crate) async fn shutdown_clients_in_parallel(clients: Vec<(String, Arc<McpCl
     let mut joinset: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     for (name, client) in clients {
         joinset.spawn(async move {
-            eprintln!("[serve] finalizing shutdown for {name}");
+            tracing::info!(server = %name, "finalizing shutdown");
             if tokio::time::timeout(Duration::from_secs(5), client.shutdown())
                 .await
                 .is_err()
             {
-                eprintln!("[serve] {name}: shutdown timed out — force-killed via drop");
+                tracing::warn!(server = %name, "shutdown timed out — force-killed via drop");
             }
             // Dropping the last Arc<McpClient> drops the transport, which
             // kills the child via kill_on_drop(true).

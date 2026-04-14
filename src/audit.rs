@@ -10,6 +10,19 @@ fn default_true() -> bool {
     true
 }
 
+fn default_output() -> AuditOutput {
+    AuditOutput::File
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditOutput {
+    File,
+    Stdout,
+    Stderr,
+    None,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuditConfig {
     #[serde(default = "default_true")]
@@ -18,6 +31,8 @@ pub struct AuditConfig {
     pub index_path: Option<String>,
     #[serde(default)]
     pub log_arguments: bool,
+    #[serde(default = "default_output")]
+    pub output: AuditOutput,
 }
 
 impl Default for AuditConfig {
@@ -27,6 +42,7 @@ impl Default for AuditConfig {
             path: None,
             index_path: None,
             log_arguments: false,
+            output: AuditOutput::File,
         }
     }
 }
@@ -183,6 +199,9 @@ pub enum AuditLogger {
         sender: tokio::sync::mpsc::UnboundedSender<AuditEntry>,
         pool: Arc<DbPool>,
     },
+    Stream {
+        sender: tokio::sync::mpsc::UnboundedSender<AuditEntry>,
+    },
     Disabled,
 }
 
@@ -192,36 +211,70 @@ impl AuditLogger {
             return Ok(AuditLogger::Disabled);
         }
 
-        // Writer thread: receives entries via channel, writes to ChronDB on demand.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
-        let writer_pool = pool.clone();
-        tokio::task::spawn_blocking(move || {
-            while let Some(entry) = rx.blocking_recv() {
-                let key = format!(
-                    "audit:{}-{}",
-                    Utc::now().timestamp_millis(),
-                    uuid::Uuid::new_v4()
-                );
-                if let Ok(doc) = serde_json::to_value(&entry) {
-                    if let Ok(db) = writer_pool.acquire() {
-                        let _ = db.put(&key, &doc, None);
-                    }
-                }
-            }
-        });
+        // Check effective output mode (env var overrides config)
+        let output = match std::env::var("MCP_AUDIT_OUTPUT") {
+            Ok(v) => match v.trim().to_lowercase().as_str() {
+                "stdout" => AuditOutput::Stdout,
+                "stderr" => AuditOutput::Stderr,
+                "none" => AuditOutput::None,
+                "file" => AuditOutput::File,
+                _ => config.output.clone(),
+            },
+            Err(_) => config.output.clone(),
+        };
 
-        Ok(AuditLogger::Active { sender: tx, pool })
+        match output {
+            AuditOutput::None => Ok(AuditLogger::Disabled),
+            AuditOutput::Stdout | AuditOutput::Stderr => {
+                let use_stderr = output == AuditOutput::Stderr;
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
+                tokio::task::spawn_blocking(move || {
+                    while let Some(entry) = rx.blocking_recv() {
+                        if let Ok(line) = serde_json::to_string(&entry) {
+                            if use_stderr {
+                                eprintln!("{line}");
+                            } else {
+                                println!("{line}");
+                            }
+                        }
+                    }
+                });
+                Ok(AuditLogger::Stream { sender: tx })
+            }
+            AuditOutput::File => {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
+                let writer_pool = pool.clone();
+                tokio::task::spawn_blocking(move || {
+                    while let Some(entry) = rx.blocking_recv() {
+                        let key = format!(
+                            "audit:{}-{}",
+                            Utc::now().timestamp_millis(),
+                            uuid::Uuid::new_v4()
+                        );
+                        if let Ok(doc) = serde_json::to_value(&entry) {
+                            if let Ok(db) = writer_pool.acquire() {
+                                let _ = db.put(&key, &doc, None);
+                            }
+                        }
+                    }
+                });
+                Ok(AuditLogger::Active { sender: tx, pool })
+            }
+        }
     }
 
     pub fn log(&self, entry: AuditEntry) {
-        if let AuditLogger::Active { sender, .. } = self {
-            let _ = sender.send(entry);
+        match self {
+            AuditLogger::Active { sender, .. } | AuditLogger::Stream { sender } => {
+                let _ = sender.send(entry);
+            }
+            AuditLogger::Disabled => {}
         }
     }
 
     pub fn query_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
         match self {
-            AuditLogger::Disabled => Ok(vec![]),
+            AuditLogger::Disabled | AuditLogger::Stream { .. } => Ok(vec![]),
             AuditLogger::Active { pool, .. } => {
                 let db = pool.acquire()?;
                 let raw = db
@@ -234,7 +287,7 @@ impl AuditLogger {
 
     pub fn query_filtered(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
         match self {
-            AuditLogger::Disabled => Ok(vec![]),
+            AuditLogger::Disabled | AuditLogger::Stream { .. } => Ok(vec![]),
             AuditLogger::Active { pool, .. } => {
                 let db = pool.acquire()?;
                 let raw = db
@@ -506,6 +559,7 @@ mod tests {
         assert!(config.path.is_none());
         assert!(config.index_path.is_none());
         assert!(!config.log_arguments);
+        assert_eq!(config.output, AuditOutput::File);
     }
 
     #[test]
@@ -521,6 +575,40 @@ mod tests {
         assert_eq!(config.path.unwrap(), "/tmp/audit/data");
         assert_eq!(config.index_path.unwrap(), "/tmp/audit/index");
         assert!(config.log_arguments);
+        // Backward compat: missing output field defaults to File
+        assert_eq!(config.output, AuditOutput::File);
+    }
+
+    #[test]
+    fn test_audit_config_output_stdout() {
+        let json = json!({
+            "enabled": true,
+            "output": "stdout"
+        });
+        let config: AuditConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.output, AuditOutput::Stdout);
+    }
+
+    #[test]
+    fn test_audit_config_output_none() {
+        let json = json!({
+            "enabled": true,
+            "output": "none"
+        });
+        let config: AuditConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.output, AuditOutput::None);
+    }
+
+    #[test]
+    fn test_audit_output_serialization() {
+        assert_eq!(
+            serde_json::to_string(&AuditOutput::Stdout).unwrap(),
+            "\"stdout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuditOutput::File).unwrap(),
+            "\"file\""
+        );
     }
 
     // --- Disabled logger ---

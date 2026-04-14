@@ -157,6 +157,7 @@ Add an `audit` section to `~/.config/mcp/servers.json`:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable/disable audit logging |
+| `output` | `file` | Output destination: `file` (ChronDB, queryable), `stdout`, `stderr` (JSON lines), or `none` |
 | `log_arguments` | `false` | Log tool call arguments (may contain PII) |
 | `path` | `~/.config/mcp/audit/data` | ChronDB data directory |
 | `index_path` | `~/.config/mcp/audit/index` | ChronDB index directory |
@@ -216,6 +217,36 @@ MCP_AUDIT_ENABLED=false mcp serve --http 0.0.0.0:8080
 
 When disabled, the logger is a no-op and the database is not initialized — zero overhead, no files created, no filesystem writes. This is the default in the Docker image.
 
+## Streaming to stdout/stderr (containers)
+
+In containers, writing audit to ChronDB is often impractical — the filesystem may be read-only, ephemeral, or you want logs flowing to your container log driver (CloudWatch, Datadog, etc.).
+
+Set `output` to `stdout` or `stderr` to emit audit entries as newline-delimited JSON (one JSON object per line):
+
+```bash
+MCP_AUDIT_OUTPUT=stdout mcp serve --http 0.0.0.0:8080
+```
+
+Or in the config file:
+
+```json
+{
+  "audit": {
+    "output": "stdout"
+  }
+}
+```
+
+Each line is a complete `AuditEntry` JSON object:
+
+```json
+{"timestamp":"2026-04-14T12:00:00-03:00","source":"serve:http","method":"tools/call","tool_name":"search_issues","server_name":"sentry","identity":"alice","duration_ms":142,"success":true}
+```
+
+When using `stdout` or `stderr` mode, `mcp logs` queries are not available (no database to query). Use your log aggregation pipeline instead.
+
+Set `output` to `none` to disable audit entirely without touching the `enabled` flag.
+
 ## Environment variable overrides
 
 All audit settings can be overridden via environment variables, which take priority over the config file. This is useful for container deployments where editing the config JSON is impractical.
@@ -223,6 +254,7 @@ All audit settings can be overridden via environment variables, which take prior
 | Variable | Overrides | Description |
 |---|---|---|
 | `MCP_AUDIT_ENABLED` | `audit.enabled` | Set to `false` or `0` to disable |
+| `MCP_AUDIT_OUTPUT` | `audit.output` | `file`, `stdout`, `stderr`, or `none` |
 | `MCP_AUDIT_PATH` | `audit.path` | ChronDB data directory |
 | `MCP_AUDIT_INDEX_PATH` | `audit.index_path` | ChronDB index directory |
 
@@ -234,6 +266,14 @@ docker run -d \
   -e MCP_AUDIT_PATH=/data/audit/data \
   -e MCP_AUDIT_INDEX_PATH=/data/audit/index \
   -v audit-vol:/data/audit \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080
+```
+
+Example: stream audit to container stdout (no volume needed):
+
+```bash
+docker run -d \
+  -e MCP_AUDIT_OUTPUT=stdout \
   ghcr.io/avelino/mcp serve --http 0.0.0.0:8080
 ```
 
