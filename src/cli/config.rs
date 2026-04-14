@@ -72,24 +72,61 @@ fn handle_config_edit() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvRestore {
+        editor: Option<String>,
+        visual: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn capture() -> Self {
+            Self {
+                editor: std::env::var("EDITOR").ok(),
+                visual: std::env::var("VISUAL").ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.editor {
+                Some(v) => std::env::set_var("EDITOR", v),
+                None => std::env::remove_var("EDITOR"),
+            }
+            match &self.visual {
+                Some(v) => std::env::set_var("VISUAL", v),
+                None => std::env::remove_var("VISUAL"),
+            }
+        }
+    }
 
     #[test]
     fn test_resolve_editor_from_env() {
+        let _guard = env_lock().lock().unwrap();
+        let _restore = EnvRestore::capture();
         std::env::set_var("EDITOR", "nano");
         assert_eq!(resolve_editor(), "nano");
-        std::env::remove_var("EDITOR");
     }
 
     #[test]
     fn test_resolve_editor_visual_fallback() {
+        let _guard = env_lock().lock().unwrap();
+        let _restore = EnvRestore::capture();
         std::env::remove_var("EDITOR");
         std::env::set_var("VISUAL", "code");
         assert_eq!(resolve_editor(), "code");
-        std::env::remove_var("VISUAL");
     }
 
     #[test]
     fn test_resolve_editor_default() {
+        let _guard = env_lock().lock().unwrap();
+        let _restore = EnvRestore::capture();
         std::env::remove_var("EDITOR");
         std::env::remove_var("VISUAL");
         let editor = resolve_editor();
@@ -102,7 +139,6 @@ mod tests {
 
     #[test]
     fn test_config_path_json_output() {
-        // Verify the JSON mode produces valid JSON with expected fields
         let path = config::config_path().unwrap();
         let json = serde_json::json!({
             "path": path.to_string_lossy(),

@@ -14,11 +14,22 @@ use super::discovery::discover_pending_backends;
 use super::dispatch::dispatch_request;
 use super::proxy::{shutdown_clients_in_parallel, ProxyServer, SharedProxy};
 
-pub async fn run_stdio(config: Config) -> Result<()> {
-    let pool = crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
-        tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
+pub async fn run_stdio(mut config: Config) -> Result<()> {
+    // In stdio mode, stdout is the JSON-RPC transport. Redirect audit to stderr
+    // to avoid interleaving audit JSON lines with protocol responses.
+    if config.audit.output == crate::audit::AuditOutput::Stdout {
+        tracing::warn!("audit output=stdout conflicts with stdio transport, redirecting to stderr");
+        config.audit.output = crate::audit::AuditOutput::Stderr;
+    }
+
+    let pool = if config.audit.output == crate::audit::AuditOutput::File {
+        crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
+            tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
+            Arc::new(crate::db::DbPool::disabled())
+        })
+    } else {
         Arc::new(crate::db::DbPool::disabled())
-    });
+    };
     let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
     let cache_store = ToolCacheStore::new(pool);
     let mut server = ProxyServer::new(

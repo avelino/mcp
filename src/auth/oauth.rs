@@ -72,7 +72,12 @@ pub async fn run_oauth_flow(server_url: &str) -> Result<String> {
 
     let metadata = discover_auth_server(&key).await?;
 
-    let client_id = match get_or_register_client(&key, &metadata).await {
+    // Bind callback listener BEFORE client registration so the redirect_uri
+    // in the registration request matches the actual port we're listening on.
+    let (listener, port) = bind_callback_listener().await?;
+    let redirect_uri = format!("http://localhost:{port}/callback");
+
+    let client_id = match get_or_register_client(&key, &metadata, &redirect_uri).await {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(error = format!("{e:#}"), "OAuth registration not available");
@@ -82,9 +87,6 @@ pub async fn run_oauth_flow(server_url: &str) -> Result<String> {
 
     let (code_verifier, code_challenge) = generate_pkce();
     let state = generate_random_string(32);
-
-    let (listener, port) = bind_callback_listener().await?;
-    let redirect_uri = format!("http://localhost:{port}/callback");
 
     let scopes = metadata.scopes_supported.join(" ");
     let mut auth_url = Url::parse(&metadata.authorization_endpoint)?;
@@ -235,6 +237,7 @@ async fn discover_auth_server(server_url: &str) -> Result<AuthServerMetadata> {
 async fn get_or_register_client(
     server_key_str: &str,
     metadata: &AuthServerMetadata,
+    redirect_uri: &str,
 ) -> Result<String> {
     let auth_store = store::load_auth_store()?;
     if let Some(reg) = auth_store.clients.get(server_key_str) {
@@ -249,7 +252,7 @@ async fn get_or_register_client(
     let http = reqwest::Client::new();
     let body = serde_json::json!({
         "client_name": "mcp",
-        "redirect_uris": ["http://localhost:8085/callback"],
+        "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none"
