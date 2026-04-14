@@ -176,7 +176,7 @@ _mcp() {{
             _describe 'subcommand' subcommands
             ;;
         args)
-            case $words[1] in
+            case $words[2] in
                 config)
                     _values 'config subcommand' 'path[Show config file path]' 'edit[Open config in editor]'
                     ;;

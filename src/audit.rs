@@ -251,9 +251,22 @@ impl AuditLogger {
                             Utc::now().timestamp_millis(),
                             uuid::Uuid::new_v4()
                         );
-                        if let Ok(doc) = serde_json::to_value(&entry) {
-                            if let Ok(db) = writer_pool.acquire() {
-                                let _ = db.put(&key, &doc, None);
+                        match serde_json::to_value(&entry) {
+                            Ok(doc) => match writer_pool.acquire() {
+                                Ok(db) => {
+                                    if let Err(e) = db.put(&key, &doc, None) {
+                                        tracing::warn!(error = ?e, "failed to write audit entry");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = format!("{e:#}"),
+                                        "failed to acquire db for audit"
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to serialize audit entry");
                             }
                         }
                     }

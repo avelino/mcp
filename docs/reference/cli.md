@@ -262,7 +262,7 @@ mcp add filesystem
 Fails if:
 - Server not found in registry
 - Server already exists in config
-- Name is reserved (`search`, `add`, `remove`, `list`, `help`, `version`, `serve`, `logs`, `config`, `completions`)
+- Name is reserved (`search`, `add`, `remove`, `update`, `list`, `help`, `version`, `serve`, `logs`, `acl`, `config`, `completions`, `healthcheck`)
 
 ### `mcp add --url <url> <name>`
 

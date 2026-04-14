@@ -13,13 +13,16 @@ const RESERVED_NAMES: &[&str] = &[
     "search",
     "add",
     "remove",
+    "update",
     "list",
     "help",
     "version",
     "serve",
     "logs",
+    "acl",
     "config",
     "completions",
+    "healthcheck",
 ];
 
 #[derive(Debug, Default, Deserialize, Clone, PartialEq)]
