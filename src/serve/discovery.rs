@@ -343,7 +343,7 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
     };
     if let Some(entry) = cache_entry {
         let bname = backend_name.to_string();
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             cache_store.save_backend(&bname, &entry);
         });
     }

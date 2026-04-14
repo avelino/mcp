@@ -348,7 +348,7 @@ The proxy caches discovered tools in a local [ChronDB](https://chrondb.avelino.r
 
 On startup, the proxy loads cached tools and serves them immediately. A background task then connects to real backends to refresh the cache. If a backend's configuration changes (detected via SHA-256 hash), its cached entry is invalidated and re-discovered.
 
-First run with no cache: `tools/list` falls back to blocking full discovery (connecting to all backends before responding). However, `tools/call` uses per-server lazy discovery — it infers the target backend from the namespaced tool name and discovers only that server, so a single tool call never blocks on unrelated backends.
+First run with no cache: `tools/list` falls back to blocking full discovery (connecting to all backends before responding). However, `tools/call` uses per-server lazy discovery — it infers the target backend from the namespaced tool name and discovers only that server, so it avoids triggering full discovery of unrelated backends, though it can still be delayed if another discovery is already in progress.
 
 ### Cache invalidation
 
