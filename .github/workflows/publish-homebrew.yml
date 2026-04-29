@@ -3,15 +3,28 @@ name: Publish Homebrew
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.5.0)"
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
   homebrew:
-    if: "!github.event.release.prerelease"
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
     runs-on: ubuntu-latest
     steps:
       - name: Set version
         id: version
-        run: echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Download binaries and compute checksums
         id: checksums
@@ -22,10 +35,10 @@ jobs:
           BASE="https://github.com/avelino/mcp/releases/download/${TAG}"
 
           # Download macOS and Linux binaries
-          curl -sL "${BASE}/mcp-x86_64-apple-darwin" -o mcp-x86_64-apple-darwin
-          curl -sL "${BASE}/mcp-aarch64-apple-darwin" -o mcp-aarch64-apple-darwin
-          curl -sL "${BASE}/mcp-x86_64-unknown-linux-gnu" -o mcp-x86_64-unknown-linux-gnu
-          curl -sL "${BASE}/mcp-aarch64-unknown-linux-gnu" -o mcp-aarch64-unknown-linux-gnu
+          curl -fsSL "${BASE}/mcp-x86_64-apple-darwin" -o mcp-x86_64-apple-darwin
+          curl -fsSL "${BASE}/mcp-aarch64-apple-darwin" -o mcp-aarch64-apple-darwin
+          curl -fsSL "${BASE}/mcp-x86_64-unknown-linux-gnu" -o mcp-x86_64-unknown-linux-gnu
+          curl -fsSL "${BASE}/mcp-aarch64-unknown-linux-gnu" -o mcp-aarch64-unknown-linux-gnu
 
           # Compute SHA256
           echo "sha_darwin_x86=$(sha256sum mcp-x86_64-apple-darwin | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -33,11 +46,11 @@ jobs:
           echo "sha_linux_x86=$(sha256sum mcp-x86_64-unknown-linux-gnu | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "sha_linux_arm=$(sha256sum mcp-aarch64-unknown-linux-gnu | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout tap
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          repository: avelino/homebrew-mcp
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update formula
         env:
@@ -47,6 +60,7 @@ jobs:
           SHA_LINUX_X86: ${{ steps.checksums.outputs.sha_linux_x86 }}
           SHA_LINUX_ARM: ${{ steps.checksums.outputs.sha_linux_arm }}
         run: |
+          mkdir -p Formula
           VERSION="${TAG#v}"
           cat > Formula/mcp.rb << FORMULA
           class Mcp < Formula
@@ -89,9 +103,15 @@ jobs:
           sed -i 's/^          //' Formula/mcp.rb
 
       - name: Commit and push
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/mcp.rb
-          git commit -m "mcp ${TAG}"
-          git push
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit"
+            exit 0
+          fi
+          git commit -m "homebrew: bump formula to ${TAG}"
+          git push origin HEAD:main

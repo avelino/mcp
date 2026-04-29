@@ -26,6 +26,7 @@ Output is always JSON. Pipe it, `jq` it, script it.
 
 ```bash
 # Homebrew (macOS and Linux)
+brew tap avelino/mcp https://github.com/avelino/mcp.git
 brew install avelino/mcp/mcp
 
 # Docker
