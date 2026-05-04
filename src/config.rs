@@ -442,7 +442,11 @@ fn apply_audit_env_overrides(mut audit: AuditConfig) -> AuditConfig {
     audit
 }
 
-fn substitute_env_vars(input: &str) -> String {
+/// Replace `${VAR_NAME}` placeholders with the value of the corresponding
+/// environment variable. Missing or empty vars resolve to an empty string —
+/// matching the existing behavior used for `MCP_SERVERS_CONFIG` so that
+/// `MCP_AUTH_CONFIG` stays at parity.
+pub(crate) fn substitute_env_vars(input: &str) -> String {
     let re = Regex::new(r"\$\{([^}]+)\}").unwrap();
     re.replace_all(input, |caps: &regex::Captures| {
         let var_name = &caps[1];

@@ -112,7 +112,7 @@ env:
         key: auth.json
 ```
 
-The proxy reads the inline JSON at startup. **No file is ever written**: when `MCP_AUTH_CONFIG` is set, writes to the auth store are silently dropped (one `warn` log on first attempt). In-process token refresh keeps working for the pod's lifetime; on restart, the Secret is re-read.
+The proxy reads the inline JSON at startup and keeps it in an in-memory store. OAuth refresh and dynamic-client registration update the in-memory copy so refreshed tokens stay coherent across requests within the pod's lifetime. **Nothing is ever written to disk** — one `warn` log is emitted on the first save attempt. On pod restart, the Secret is re-read and in-memory mutations are discarded.
 
 **Refresh strategy.** When refresh tokens are about to expire, rotate the Secret externally (sealed-secrets, external-secrets-operator, a CronJob that re-runs `mcp add`, etc.) and let the rolling update pick it up. The proxy itself is not designed to write back to the Secret.
 

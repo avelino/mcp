@@ -169,7 +169,9 @@ export MCP_AUTH_CONFIG='{
 mcp serve --http 0.0.0.0:8080
 ```
 
-**Read-only by design.** When `MCP_AUTH_CONFIG` is set, `mcp` treats the auth store as immutable — the source of truth is the env var (typically a k8s Secret), so persisting back to disk would be ineffective and confusing. Writes are silently dropped and a single `warn` log is emitted at first attempt. Token refreshes still work *in-process* for the lifetime of the proxy; on restart, the Secret is read again.
+`${VAR}` placeholders are expanded the same way as in [`MCP_SERVERS_CONFIG`](#mcp_servers_config), so you can split tokens across multiple Secret keys.
+
+**Read-only on disk; mutable in memory.** When `MCP_AUTH_CONFIG` is set, the env var seeds an in-memory auth store on first load. Subsequent OAuth flows — token refresh, dynamic-client registration — update the cache so refreshed tokens are visible to later calls within the same process. Nothing is ever written back to disk (the source of truth is the Secret), and a single `warn` log is emitted on the first save attempt. On pod restart, the Secret is read again — any in-memory mutations are discarded.
 
 **Use cases:**
 
