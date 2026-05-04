@@ -156,7 +156,8 @@ These variables are especially useful for container deployments. See the full li
 | `MCP_AUDIT_OUTPUT` | `file` | `stdout`/`stderr` for container log drivers, `none` to disable |
 | `MCP_AUDIT_PATH` | `~/.config/mcp/db/data` | Override audit data path |
 | `MCP_AUDIT_INDEX_PATH` | `~/.config/mcp/db/index` | Override audit index path |
-| `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override OAuth token storage |
+| `MCP_AUTH_CONFIG` | — | Inline `auth.json` content (read-only, writes are no-ops). Same idea as `MCP_SERVERS_CONFIG`. |
+| `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override OAuth token storage (file path) |
 | `MCP_CLASSIFIER_CACHE` | `~/.config/mcp/tool-classification.json` | Override classifier cache |
 
 ## Kubernetes
@@ -210,5 +211,5 @@ docker run --rm ghcr.io/avelino/mcp:0.1.0 --help
 ## Limitations
 
 - **Stdio servers only work if the runtime is available inside the container.** The default image includes only the `mcp` binary and `ca-certificates`. Servers that require `npx`, `python`, or other runtimes won't work unless you build a custom image. HTTP servers (configured with `url`) work out of the box.
-- **OAuth browser flow doesn't work in Docker.** For HTTP servers that need OAuth, run `mcp add <server>` on your host first to complete authentication, then mount the config directory (which includes `auth.json`), or set `MCP_AUTH_PATH` to a mounted volume.
+- **OAuth browser flow doesn't work in Docker.** For HTTP servers that need OAuth, run `mcp add <server>` on your host first to complete authentication, then either mount the config directory (which includes `auth.json`), set `MCP_AUTH_PATH` to a mounted volume, or pass the JSON inline via `MCP_AUTH_CONFIG` (read-only — useful for read-only containers and Kubernetes Secrets).
 - **Audit logging is disabled by default** in the Docker image because `scratch` images have no writable filesystem. Use `MCP_AUDIT_OUTPUT=stdout` to stream to the container log driver, or mount a volume and set `MCP_AUDIT_ENABLED=true`.

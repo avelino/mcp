@@ -170,6 +170,21 @@ alias mcp-work='MCP_CONFIG_PATH=~/.config/mcp/work.json mcp'
 alias mcp-personal='MCP_CONFIG_PATH=~/.config/mcp/personal.json mcp'
 ```
 
+## Container / Kubernetes deployments
+
+This guide covers configuration on a workstation, where `mcp` reads JSON files from `~/.config/mcp/`. In a container or Kubernetes pod — typically with a read-only root filesystem — file mounts are awkward. For those scenarios, `mcp` accepts the same JSON content directly via environment variables:
+
+| File | Inline env var | Read/write |
+|---|---|---|
+| `servers.json` | [`MCP_SERVERS_CONFIG`](../reference/environment-variables.md#mcp_servers_config) | read-only |
+| `auth.json` | [`MCP_AUTH_CONFIG`](../reference/environment-variables.md#mcp_auth_config) | read-only (writes are no-ops) |
+
+When set, the inline env var takes priority over the corresponding file path (`MCP_CONFIG_PATH` / `MCP_AUTH_PATH`).
+
+These env vars are intended **only** for container deployments — don't use them on a workstation. Putting an entire JSON config in your shell environment is awkward to edit and breaks `mcp add` / `mcp remove`, which write back to the file.
+
+For full deployment instructions, see [Deploying on Kubernetes](../howto/kubernetes.md) and [Running in Docker](../howto/docker.md).
+
 ## Complete example
 
 A real-world config with multiple server types:

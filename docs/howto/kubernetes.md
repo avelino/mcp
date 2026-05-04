@@ -81,6 +81,43 @@ env:
         key: grafana-token
 ```
 
+### OAuth tokens via Secret
+
+For backends that use OAuth (Sentry, Honeycomb, GitHub Copilot, etc.), `mcp` keeps issued access/refresh tokens and dynamic-client registrations in `auth.json`. In a pod with a read-only root filesystem, mounting a writable `auth.json` is awkward — instead, inject the contents directly via `MCP_AUTH_CONFIG`.
+
+**1. Run the OAuth flow once on a workstation:**
+
+```bash
+mcp add sentry --remote https://mcp.sentry.dev
+# completes browser flow, writes ~/.config/mcp/auth.json
+```
+
+**2. Push the resulting file into a Secret:**
+
+```bash
+kubectl -n mcp create secret generic mcp-auth \
+  --from-file=auth.json=$HOME/.config/mcp/auth.json
+```
+
+> Use a Secret (not a ConfigMap) — the file contains live access tokens.
+
+**3. Inject it as an env var in the Deployment:**
+
+```yaml
+env:
+  - name: MCP_AUTH_CONFIG
+    valueFrom:
+      secretKeyRef:
+        name: mcp-auth
+        key: auth.json
+```
+
+The proxy reads the inline JSON at startup. **No file is ever written**: when `MCP_AUTH_CONFIG` is set, writes to the auth store are silently dropped (one `warn` log on first attempt). In-process token refresh keeps working for the pod's lifetime; on restart, the Secret is re-read.
+
+**Refresh strategy.** When refresh tokens are about to expire, rotate the Secret externally (sealed-secrets, external-secrets-operator, a CronJob that re-runs `mcp add`, etc.) and let the rolling update pick it up. The proxy itself is not designed to write back to the Secret.
+
+**Limitation.** Since `MCP_AUTH_CONFIG` is read-only, you cannot run `mcp add <server>` against a running pod and have the registration persist. Always pre-provision the auth store on a workstation or in a one-off Job, then ship it via the Secret.
+
 ### Pinning the image version
 
 Edit `deploy/kubernetes/kustomization.yaml`:
@@ -209,6 +246,7 @@ When Kubernetes sends `SIGTERM` (during rolling updates or scale-down):
 | Variable | Manifest value | Description |
 |----------|----------------|-------------|
 | `MCP_SERVERS_CONFIG` | (from ConfigMap) | Inline JSON config (highest priority) |
+| `MCP_AUTH_CONFIG` | (from Secret, optional) | Inline OAuth tokens (`auth.json`). Read-only — writes are no-ops. |
 | `MCP_PROXY_REQUEST_TIMEOUT` | `120` (app default) | Max seconds per JSON-RPC request |
 | `MCP_AUDIT_ENABLED` | `false` | Enable audit logging |
 | `MCP_AUDIT_OUTPUT` | `file` | `stdout` for cluster log pipeline, `file` for PVC, `none` to disable |

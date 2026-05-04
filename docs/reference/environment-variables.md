@@ -21,7 +21,8 @@ These variables configure `mcp` behavior:
 | `MCP_LOG_LEVEL` | `info` | Log verbosity: `trace`, `debug`, `info`, `warn`, `error`. Uses `tracing` `EnvFilter` syntax — you can also set per-module levels like `mcp=debug,hyper=warn`. |
 | `MCP_LOG_FORMAT` | `text` | Log output format: `text` (human-readable) or `json` (structured, for container log drivers). |
 | `MCP_OAUTH_CALLBACK_PORT` | `8085-8099` | Port or range for the OAuth callback listener. Single port (`9000`), range (`9000-9010`), or `0` for OS-assigned. |
-| `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override the OAuth token storage location |
+| `MCP_AUTH_CONFIG` | — | Inline JSON content of `auth.json` (read-only). Highest priority for auth — skips file read. Writes are no-ops with a single `warn` log. Intended for k8s/Docker Secrets. |
+| `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override the OAuth token storage location (file path) |
 
 ### Config loading priority
 
@@ -149,13 +150,58 @@ Override the ChronDB data and index directories. These take priority over the `a
 MCP_AUDIT_PATH=/var/lib/mcp/data MCP_AUDIT_INDEX_PATH=/var/lib/mcp/index mcp serve --http 0.0.0.0:8080
 ```
 
+### `MCP_AUTH_CONFIG`
+
+Inline JSON content of `auth.json`, equivalent to [`MCP_SERVERS_CONFIG`](#mcp_servers_config) but for OAuth tokens and dynamic-client registrations. Highest priority — when set, the file at `MCP_AUTH_PATH` (or the default location) is **not** read.
+
+```bash
+export MCP_AUTH_CONFIG='{
+  "clients": {
+    "https://mcp.sentry.dev": {"client_id": "abc123"}
+  },
+  "tokens": {
+    "https://mcp.sentry.dev": {
+      "access_token": "${SENTRY_ACCESS_TOKEN}",
+      "refresh_token": "${SENTRY_REFRESH_TOKEN}"
+    }
+  }
+}'
+mcp serve --http 0.0.0.0:8080
+```
+
+**Read-only by design.** When `MCP_AUTH_CONFIG` is set, `mcp` treats the auth store as immutable — the source of truth is the env var (typically a k8s Secret), so persisting back to disk would be ineffective and confusing. Writes are silently dropped and a single `warn` log is emitted at first attempt. Token refreshes still work *in-process* for the lifetime of the proxy; on restart, the Secret is read again.
+
+**Use cases:**
+
+- Kubernetes deployments where the pod has a read-only filesystem and OAuth tokens come from a Secret (see [Deploying on Kubernetes](../howto/kubernetes.md))
+- Docker containers where mounting a writable `auth.json` is undesirable
+- CI environments that need pre-provisioned tokens for ephemeral runs
+
+**Not recommended for:**
+
+- Local development on a workstation — use the default `auth.json` and let `mcp add` handle the OAuth flow.
+- Any environment where you expect `mcp add <server>` to register a new client and persist the result. That flow requires a writable file.
+
+`MCP_AUTH_CONFIG` takes priority over `MCP_AUTH_PATH`. If both are set, the inline content wins. An empty or whitespace-only value falls through to the file path.
+
 ### `MCP_AUTH_PATH`
 
-Override the OAuth token storage location. Default is `~/.config/mcp/auth.json`. Useful in containers where `$HOME` doesn't exist or is read-only.
+Override the OAuth token storage location (file path). Default is `~/.config/mcp/auth.json`. Useful in containers where `$HOME` doesn't exist, or to share an auth store across multiple `mcp` invocations.
 
 ```bash
 MCP_AUTH_PATH=/data/auth.json mcp add sentry --remote https://mcp.sentry.dev
 ```
+
+For container deployments where the filesystem is read-only or you want tokens injected from a secret manager, use [`MCP_AUTH_CONFIG`](#mcp_auth_config) instead.
+
+### Auth loading priority
+
+`mcp` resolves the auth store in this order:
+
+1. **`MCP_AUTH_CONFIG`** — inline JSON (read-only, no file I/O)
+2. **`MCP_AUTH_PATH`** — file path override
+3. **`MCP_CONFIG_DIR`/auth.json** — config directory override
+4. **`~/.config/mcp/auth.json`** — default file location
 
 ## Config variables
 
