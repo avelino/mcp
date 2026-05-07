@@ -41,7 +41,7 @@ shell-words = "1"
 socket2 = { version = "0.6", features = ["all"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 [dev-dependencies]
 tempfile = "3"
