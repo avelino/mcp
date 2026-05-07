@@ -133,6 +133,15 @@ impl OAuthAsConfig {
         if self.redirect_uri_allowlist.is_empty() {
             bail!("oauthAs.redirectUriAllowlist must list at least one pattern");
         }
+        // Pattern shape itself is also validated at request time, but
+        // doing it here turns operator typos (middle `*`, missing
+        // scheme, `https//` instead of `https://`) into a fail-fast
+        // boot error instead of a per-request rejection clients first
+        // see in production.
+        for pattern in &self.redirect_uri_allowlist {
+            super::redirect_uri::validate_pattern(pattern)
+                .map_err(|e| anyhow::anyhow!("oauthAs.redirectUriAllowlist invalid: {e}"))?;
+        }
         if self.access_token_ttl_seconds == 0 {
             bail!("oauthAs.accessTokenTtlSeconds must be > 0");
         }
@@ -208,6 +217,41 @@ mod tests {
         let mut c = valid_config();
         c.redirect_uri_allowlist.clear();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_middle_wildcard_pattern_rejected_at_boot() {
+        // Regression for PR #91 review: only trailing `*` allowed.
+        // Middle `*` would silently widen matching at request time;
+        // catching it at boot prevents that surprise.
+        let mut c = valid_config();
+        c.redirect_uri_allowlist = vec!["https://*.example.com/cb".to_string()];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("redirectUriAllowlist"));
+    }
+
+    #[test]
+    fn test_malformed_url_pattern_rejected_at_boot() {
+        // Operator typo: missing colon in scheme — must fail at boot.
+        let mut c = valid_config();
+        c.redirect_uri_allowlist = vec!["https//example.com/cb".to_string()];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_non_http_scheme_pattern_rejected_at_boot() {
+        let mut c = valid_config();
+        c.redirect_uri_allowlist = vec!["custom://nope".to_string()];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_trailing_wildcard_pattern_accepted_at_boot() {
+        // Trailing `*` is the only wildcard form allowed; ChatGPT-style
+        // redirects rely on it.
+        let mut c = valid_config();
+        c.redirect_uri_allowlist = vec!["https://chat.openai.com/aip/*".to_string()];
+        c.validate().unwrap();
     }
 
     #[test]

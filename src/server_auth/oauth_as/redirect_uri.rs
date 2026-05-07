@@ -27,6 +27,28 @@ fn matches_pattern(candidate: &str, pattern: &str) -> bool {
     }
 }
 
+/// Validate that an allowlist pattern is well-formed. Used both at
+/// boot (so misconfiguration fails fast) and at request time. Only
+/// trailing `*` wildcards are accepted.
+pub(crate) fn validate_pattern(pattern: &str) -> Result<()> {
+    if pattern.contains('*') && !pattern.ends_with('*') {
+        bail!("redirect_uri allowlist patterns may only use trailing '*': {pattern}");
+    }
+    // The non-wildcard prefix must be a parseable http(s) URL on its
+    // own. This catches operator typos like `https//example.com/cb`
+    // (missing colon) or schemes other than http/https before any
+    // request hits the server.
+    let prefix = pattern.trim_end_matches('*');
+    let parsed = Url::parse(prefix).map_err(|_| {
+        anyhow::anyhow!("redirect_uri allowlist pattern is not a valid URL: {pattern}")
+    })?;
+    let scheme = parsed.scheme();
+    if scheme != "https" && scheme != "http" {
+        bail!("redirect_uri allowlist pattern scheme must be http or https: {pattern}");
+    }
+    Ok(())
+}
+
 /// Validate a redirect URI for use in an OAuth flow. Returns `Ok(())`
 /// when the URI passes both the allowlist and the security checks.
 pub fn validate(uri: &str, allowlist: &[String]) -> Result<()> {
@@ -36,29 +58,40 @@ pub fn validate(uri: &str, allowlist: &[String]) -> Result<()> {
     if scheme != "https" && scheme != "http" {
         bail!("redirect_uri scheme must be http or https: {uri}");
     }
+    // RFC 6749 §3.1.2: redirect_uri MUST NOT include a fragment
+    // component. Also, `build_redirect` would compose the response
+    // URL incorrectly if a fragment were present.
+    if parsed.fragment().is_some() {
+        bail!("redirect_uri must not contain a fragment: {uri}");
+    }
     if scheme == "http" {
         // Loopback only — this is the OAuth-spec carve-out for
         // native apps and dev clients. Anything else over plain
         // HTTP is rejected.
-        let host = parsed.host_str().unwrap_or("");
-        let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+        //
+        // Avoid string-based host comparison (it stumbles on
+        // `[::1]` vs `::1`, percent-encoding, IDN). `Url::host()`
+        // gives the structured host so IPv4/IPv6 loopback checks
+        // delegate to the standard library.
+        let is_loopback = match parsed.host() {
+            Some(url::Host::Domain(d)) => d == "localhost",
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
         if !is_loopback {
             bail!("redirect_uri uses plain http on non-loopback host: {uri}");
         }
     }
 
-    if !allowlist.iter().any(|p| matches_pattern(uri, p)) {
-        bail!("redirect_uri not in allowlist: {uri}");
+    // Defense in depth: every pattern must be well-formed even if
+    // [`OAuthAsConfig::validate`] already vetted them at boot.
+    for pattern in allowlist {
+        validate_pattern(pattern)?;
     }
 
-    // Reject any pattern that has `*` in the middle (was let through
-    // by `matches_pattern` only as a trailing wildcard). Defense
-    // against operator typos that would relax matching unexpectedly.
-    if allowlist
-        .iter()
-        .any(|p| p.contains('*') && !p.ends_with('*'))
-    {
-        bail!("redirect_uri allowlist patterns may only use trailing '*'");
+    if !allowlist.iter().any(|p| matches_pattern(uri, p)) {
+        bail!("redirect_uri not in allowlist: {uri}");
     }
 
     Ok(())
@@ -94,6 +127,24 @@ mod tests {
     fn test_http_loopback_allowed() {
         let allow = vec!["http://localhost:1234/cb".to_string()];
         assert!(validate("http://localhost:1234/cb", &allow).is_ok());
+    }
+
+    #[test]
+    fn test_http_ipv6_loopback_allowed() {
+        // Regression for code review on PR #91: `Url::host_str` returns
+        // `"::1"` (no brackets) for `http://[::1]/...`, so an earlier
+        // version that compared against `"[::1]"` would reject valid
+        // IPv6 loopback redirects.
+        let allow = vec!["http://[::1]:9000/cb".to_string()];
+        assert!(validate("http://[::1]:9000/cb", &allow).is_ok());
+    }
+
+    #[test]
+    fn test_redirect_uri_with_fragment_rejected() {
+        // RFC 6749 §3.1.2: redirect_uri MUST NOT contain a fragment.
+        let allow = vec!["https://example.com/cb".to_string()];
+        let err = validate("https://example.com/cb#hash", &allow).unwrap_err();
+        assert!(err.to_string().contains("fragment"));
     }
 
     #[test]

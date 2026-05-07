@@ -171,7 +171,12 @@ impl AuthProvider for ForwardedUserAuth {
     async fn authenticate(&self, creds: &Credentials) -> Result<AuthIdentity> {
         match read_trusted_user(creds, &self.header, &self.groups_header) {
             Some((subject, roles)) => Ok(AuthIdentity::new(subject, roles)),
-            None => match creds.get(&self.header) {
+            // Mirror the case-insensitive lookup `read_trusted_user`
+            // performs on the header name. The constructor already
+            // lowercases `self.header`, but redoing it here keeps the
+            // error branch correct even if a future change relaxes
+            // that invariant.
+            None => match creds.get(&self.header.to_lowercase()) {
                 Some(_) => bail!("{} header is empty", self.header),
                 None => bail!("missing {} header", self.header),
             },
