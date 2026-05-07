@@ -118,7 +118,7 @@ Use bearer tokens to identify each engineer and control access:
 {
   "mcpServers": { ... },
   "serverAuth": {
-    "provider": "bearer",
+    "providers": ["bearer"],
     "bearer": {
       "tokens": {
         "eng-alice-a1b2c3": "alice",
@@ -141,8 +141,26 @@ Or, if you already have an identity provider behind a reverse proxy:
 ```json
 {
   "serverAuth": {
-    "provider": "forwarded",
+    "providers": ["forwarded"],
     "forwarded": { "header": "x-forwarded-user" }
+  }
+}
+```
+
+Or, if engineers also want to connect via Claude.ai / ChatGPT / Cursor as Custom Connectors, run `bearer` and `oauth_as` together — same instance, same `/mcp`:
+
+```json
+{
+  "serverAuth": {
+    "providers": ["bearer", "oauth_as"],
+    "bearer": { "tokens": { "eng-alice-a1b2c3": { "subject": "alice", "roles": ["dev"] } } },
+    "oauthAs": {
+      "issuerUrl": "https://mcp.internal:8443",
+      "jwtSecret": "${MCP_OAUTH_AS_JWT_SECRET}",
+      "trustedSourceCidrs": ["10.0.0.0/8"],
+      "redirectUriAllowlist": ["https://claude.ai/api/mcp/auth_callback"],
+      "injectedRoles": ["ai-client"]
+    }
   }
 }
 ```

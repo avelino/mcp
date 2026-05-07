@@ -450,6 +450,8 @@ The proxy supports server-side authentication for HTTP mode. Authentication is c
 
 By default, no authentication is required. This is suitable for local development and stdio mode.
 
+> **Schema.** `serverAuth.providers` is a `Vec<String>`. List one or many — the proxy runs them as a chain, accepting the first identity that validates. Empty list (or omitted) = anonymous (`NoAuth`). The legacy `provider: "..."` single-string field is no longer accepted; configs that still carry it boot as `NoAuth`.
+
 ### Bearer token auth
 
 Static token-to-user mapping. Each token maps to a subject identity:
@@ -458,7 +460,7 @@ Static token-to-user mapping. Each token maps to a subject identity:
 {
   "mcpServers": { ... },
   "serverAuth": {
-    "provider": "bearer",
+    "providers": ["bearer"],
     "bearer": {
       "tokens": {
         "secret-token-abc": "alice",
@@ -486,13 +488,35 @@ Trusts a reverse proxy header (e.g. `X-Forwarded-User`). Only use behind a trust
 {
   "mcpServers": { ... },
   "serverAuth": {
-    "provider": "forwarded",
+    "providers": ["forwarded"],
     "forwarded": {
       "header": "x-forwarded-user"
     }
   }
 }
 ```
+
+### OAuth Authorization Server
+
+Lets Claude.ai, ChatGPT, Cursor and other AI clients connect as Custom Connectors via OAuth 2.0 + Dynamic Client Registration. Combine with `bearer` to keep static tokens working for local dev on the same instance:
+
+```json
+{
+  "serverAuth": {
+    "providers": ["bearer", "oauth_as"],
+    "bearer": { "tokens": { "tok-local-dev": { "subject": "avelino", "roles": ["admin"] } } },
+    "oauthAs": {
+      "issuerUrl": "https://mcp.example.com",
+      "jwtSecret": "${MCP_OAUTH_AS_JWT_SECRET}",
+      "trustedSourceCidrs": ["10.0.0.0/8"],
+      "redirectUriAllowlist": ["https://claude.ai/api/mcp/auth_callback"],
+      "injectedRoles": ["oauth-user"]
+    }
+  }
+}
+```
+
+Full setup, security notes, and troubleshooting in the [OAuth AS how-to](../howto/oauth-as.md).
 
 ### Access control (ACL)
 
@@ -506,7 +530,7 @@ Define reusable roles with server-aware, read/write-aware grants:
 {
   "mcpServers": { ... },
   "serverAuth": {
-    "provider": "bearer",
+    "providers": ["bearer"],
     "bearer": {
       "tokens": {
         "tok-alice": { "subject": "alice", "roles": ["admin"] },

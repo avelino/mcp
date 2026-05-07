@@ -17,6 +17,7 @@ use crate::audit::{AuditEntry, AuditLogger};
 use crate::cache::ToolCacheStore;
 use crate::config::Config;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::server_auth::oauth_as::{self, AsState};
 use crate::server_auth::{self, AclConfig, AuthIdentity, AuthProvider, Credentials};
 
 use super::discovery::discover_pending_backends;
@@ -133,7 +134,20 @@ fn validate_bind_addr(addr: &str, insecure: bool) -> Result<std::net::SocketAddr
 pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result<()> {
     let sock_addr = validate_bind_addr(bind_addr, insecure)?;
 
-    let auth_provider = server_auth::build_auth_provider(&config.server_auth)?;
+    // OAuth AS state — only allocated when the operator opted in via
+    // `serverAuth.providers` containing "oauth_as". Loaded from disk
+    // (or env-var inline) so registered clients and refresh tokens
+    // survive a restart.
+    let as_enabled = config.server_auth.providers.iter().any(|p| p == "oauth_as");
+    let as_state: Option<Arc<AsState>> = if as_enabled {
+        let s = oauth_as::load_state()
+            .map_err(|e| anyhow::anyhow!("failed to load AS state: {e:#}"))?;
+        Some(Arc::new(s))
+    } else {
+        None
+    };
+
+    let auth_provider = server_auth::build_auth_provider(&config.server_auth, as_state.as_ref())?;
     let acl = config.server_auth.acl.clone();
 
     let pool = if config.audit.output == crate::audit::AuditOutput::File {
@@ -165,6 +179,27 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         sessions: Arc::new(Mutex::new(HashMap::new())),
         shutdown: shutdown_rx,
     };
+
+    // Background GC for the OAuth AS — drops expired authorization
+    // codes and refresh tokens. Cheap pass; runs every 60s.
+    if let Some(ref state) = as_state {
+        let gc_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let removed = gc_state.gc_expired();
+                if removed > 0 {
+                    if let Err(e) = oauth_as::save_state(&gc_state) {
+                        tracing::warn!(
+                            error = format!("{e:#}"),
+                            "failed to persist AS state after GC"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // Background reaper: shuts down idle backends periodically.
     // Lock is released before async shutdown so request handlers are never
@@ -219,10 +254,30 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         },
     );
 
-    let app = Router::new()
+    let core_router = Router::new()
         .route("/health", get(health_handler))
         .route("/mcp", post(mcp_handler).get(mcp_sse_handler))
         .route("/mcp/sse", get(mcp_sse_handler))
+        .with_state(state.clone());
+
+    // Mount the OAuth AS sub-router when the operator enabled it.
+    // Without it, the well-known/discovery paths simply 404 — same
+    // shape the previous short-circuit produced, just routed through
+    // the standard fallback now.
+    let app = if let Some(ref state) = as_state {
+        let cfg = Arc::new(
+            config
+                .server_auth
+                .oauth_as
+                .clone()
+                .expect("oauth_as enabled but no oauthAs config — caught at boot"),
+        );
+        core_router.merge(oauth_as::router(cfg, state.clone()))
+    } else {
+        core_router
+    };
+
+    let app = app
         .fallback(|req: axum::extract::Request| async move {
             let path = req.uri().path().to_string();
             let method = req.method().clone();
@@ -231,18 +286,9 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
                 path = %path,
                 "unhandled request"
             );
-            // OAuth/OIDC discovery endpoints: return 404 with valid JSON
-            // so clients that probe for auth don't crash on empty bodies
-            if path.contains(".well-known") || path == "/register" {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "not_found", "error_description": "This server does not support OAuth"})),
-                );
-            }
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
         })
-        .layer(request_logger)
-        .with_state(state.clone());
+        .layer(request_logger);
 
     tracing::info!(addr = %sock_addr, "HTTP server listening");
     if sock_addr.ip().is_loopback() {
@@ -274,9 +320,17 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         let _ = shutdown_tx.send(true);
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
+    // ConnectInfo<SocketAddr> is required by the OAuth /authorize
+    // handler so it can verify the request originates from a trusted
+    // CIDR (anti-spoof against direct clients injecting
+    // X-Forwarded-User). Wiring it unconditionally is harmless for
+    // other handlers.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await?;
 
     // Cleanup backends — bounded so a stuck handler doesn't block exit.
     // Drain under the lock (cheap), then run all shutdowns in parallel.

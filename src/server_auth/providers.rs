@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::{AuthIdentity, AuthProvider, BearerToken, Credentials};
 
@@ -50,6 +51,63 @@ impl AuthProvider for BearerTokenAuth {
     }
 }
 
+/// Composite provider: tries each inner provider in order and returns
+/// the first successful identity. Designed for the case where one
+/// `mcp serve` instance must accept *both* static bearer tokens (used
+/// by local CLI / dev tools) **and** OAuth-issued JWTs (used by
+/// Claude.ai / ChatGPT / Cursor) on the same `/mcp` endpoint.
+///
+/// Ordering note: providers are tried in array order. Cheaper checks
+/// (static map lookup) belong first; HMAC verification belongs last.
+/// Ordering is a performance choice, not a correctness one — every
+/// configured provider gets a fair shot until one accepts.
+///
+/// Oracle defense: when *all* providers reject, the chain returns the
+/// error of the **first** configured provider, never something
+/// derived from which provider got further. Otherwise an attacker
+/// could probe the chain to learn which token format is in use.
+pub struct ProviderChain {
+    providers: Vec<Arc<dyn AuthProvider>>,
+}
+
+impl ProviderChain {
+    pub fn new(providers: Vec<Arc<dyn AuthProvider>>) -> Self {
+        Self { providers }
+    }
+}
+
+#[async_trait]
+impl AuthProvider for ProviderChain {
+    async fn authenticate(&self, creds: &Credentials) -> Result<AuthIdentity> {
+        // Empty chain is equivalent to NoAuth — degenerate but valid.
+        if self.providers.is_empty() {
+            return NoAuth.authenticate(creds).await;
+        }
+
+        let mut first_error: Option<anyhow::Error> = None;
+        for (idx, provider) in self.providers.iter().enumerate() {
+            match provider.authenticate(creds).await {
+                Ok(identity) => {
+                    // Debug-only: never log at info level — that would leak
+                    // which provider format the request used to anyone with
+                    // access to logs.
+                    tracing::debug!(provider_index = idx, "auth chain matched provider");
+                    return Ok(identity);
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        // Unwrap is safe: providers is non-empty, so at least one error
+        // was recorded.
+        Err(first_error.unwrap())
+    }
+}
+
 /// Trusts a reverse proxy header (e.g. X-Forwarded-User).
 /// Only use behind a trusted proxy that sets this header.
 ///
@@ -74,7 +132,7 @@ impl ForwardedUserAuth {
 /// Parse a comma-separated groups header into a list of role names.
 /// Trims each entry and drops empty ones. Case is preserved (role matching
 /// is case-sensitive).
-fn parse_groups(raw: &str) -> Vec<String> {
+pub(crate) fn parse_groups(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -82,23 +140,42 @@ fn parse_groups(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract the trusted user identity from request credentials, using
+/// the same shape `ForwardedUserAuth` does. Returned `(subject, roles)`
+/// is suitable for both per-request authentication (the existing
+/// provider) and for OAuth `/authorize` where the AS reads the
+/// reverse-proxy-set headers to identify the human before issuing a
+/// code.
+///
+/// Header names are matched case-insensitively (HTTP convention) and
+/// roles default to an empty vec when the groups header is absent.
+/// Returns `None` when the user header is missing or empty.
+pub(crate) fn read_trusted_user(
+    creds: &Credentials,
+    user_header: &str,
+    groups_header: &str,
+) -> Option<(String, Vec<String>)> {
+    let user = creds.get(&user_header.to_lowercase())?;
+    if user.is_empty() {
+        return None;
+    }
+    let roles = creds
+        .get(&groups_header.to_lowercase())
+        .map(|raw| parse_groups(raw))
+        .unwrap_or_default();
+    Some((user.clone(), roles))
+}
+
 #[async_trait]
 impl AuthProvider for ForwardedUserAuth {
     async fn authenticate(&self, creds: &Credentials) -> Result<AuthIdentity> {
-        let user = creds
-            .get(&self.header)
-            .ok_or_else(|| anyhow::anyhow!("missing {} header", self.header))?;
-
-        if user.is_empty() {
-            bail!("{} header is empty", self.header);
+        match read_trusted_user(creds, &self.header, &self.groups_header) {
+            Some((subject, roles)) => Ok(AuthIdentity::new(subject, roles)),
+            None => match creds.get(&self.header) {
+                Some(_) => bail!("{} header is empty", self.header),
+                None => bail!("missing {} header", self.header),
+            },
         }
-
-        let roles = creds
-            .get(&self.groups_header)
-            .map(|raw| parse_groups(raw))
-            .unwrap_or_default();
-
-        Ok(AuthIdentity::new(user.clone(), roles))
     }
 }
 
@@ -525,5 +602,234 @@ mod tests {
         let mut creds = Credentials::new();
         creds.insert("x-forwarded-groups".to_string(), "admin".to_string());
         assert!(provider.authenticate(&creds).await.is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // ProviderChain — composite provider running multiple auth backends
+    // in parallel on the same /mcp endpoint. Models the issue #90 use case:
+    // dev local with static bearer + Claude.ai web with OAuth JWT, both on
+    // the same instance, no config swap.
+    // ---------------------------------------------------------------------
+
+    /// Test-only provider that mimics a JWT validator: accepts a single
+    /// bearer value mapped to an identity. Lets us exercise chain
+    /// behavior without pulling in real JWT crypto.
+    struct StubBearerOnly {
+        token: String,
+        identity: AuthIdentity,
+    }
+
+    #[async_trait]
+    impl AuthProvider for StubBearerOnly {
+        async fn authenticate(&self, creds: &Credentials) -> Result<AuthIdentity> {
+            let header = creds
+                .get("authorization")
+                .ok_or_else(|| anyhow::anyhow!("missing Authorization header"))?;
+            if header.len() < 7 || !header[..7].eq_ignore_ascii_case("bearer ") {
+                bail!("Authorization header must use Bearer scheme");
+            }
+            if &header[7..] == self.token {
+                Ok(self.identity.clone())
+            } else {
+                bail!("invalid token (stub)")
+            }
+        }
+    }
+
+    fn local_dev_provider() -> Arc<dyn AuthProvider> {
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            "tok-local-dev".to_string(),
+            BearerToken::Extended {
+                subject: "avelino".to_string(),
+                roles: vec!["admin".to_string()],
+            },
+        );
+        Arc::new(BearerTokenAuth::new(tokens))
+    }
+
+    fn jwt_like_provider() -> Arc<dyn AuthProvider> {
+        Arc::new(StubBearerOnly {
+            token: "fake.jwt.token".to_string(),
+            identity: AuthIdentity::new(
+                "alice@example.com",
+                vec!["dev".to_string(), "oauth-user".to_string()],
+            ),
+        })
+    }
+
+    fn auth_creds(token: &str) -> Credentials {
+        let mut c = Credentials::new();
+        c.insert("authorization".to_string(), format!("Bearer {token}"));
+        c
+    }
+
+    #[tokio::test]
+    async fn test_chain_static_bearer_authenticates_local_dev() {
+        // First provider in chain accepts → second provider never runs.
+        let chain = ProviderChain::new(vec![local_dev_provider(), jwt_like_provider()]);
+        let id = chain
+            .authenticate(&auth_creds("tok-local-dev"))
+            .await
+            .unwrap();
+        assert_eq!(id.subject, "avelino");
+        assert_eq!(id.roles, vec!["admin".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_chain_jwt_authenticates_when_static_fails() {
+        // Static rejects, JWT-like accepts → chain returns JWT identity.
+        // This is the cross-provider case that the briefing required.
+        let chain = ProviderChain::new(vec![local_dev_provider(), jwt_like_provider()]);
+        let id = chain
+            .authenticate(&auth_creds("fake.jwt.token"))
+            .await
+            .unwrap();
+        assert_eq!(id.subject, "alice@example.com");
+        assert!(id.roles.contains(&"oauth-user".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_chain_returns_first_provider_error_when_all_fail() {
+        // Oracle defense: must not leak which provider got further.
+        // The error returned must come from the FIRST configured provider,
+        // not the most informative one.
+        let chain = ProviderChain::new(vec![local_dev_provider(), jwt_like_provider()]);
+        let err = chain.authenticate(&auth_creds("nope")).await.unwrap_err();
+        // BearerTokenAuth's error is "invalid bearer token"; StubBearerOnly's
+        // is "invalid token (stub)". The first must win.
+        assert!(
+            err.to_string().contains("invalid bearer token"),
+            "expected first provider's error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chain_does_not_leak_jwt_role_to_static_user() {
+        // Privilege isolation: JWT identity has role `oauth-user` but a
+        // static-bearer auth must never inherit it. Ensures providers
+        // remain isolated state-wise.
+        let chain = ProviderChain::new(vec![local_dev_provider(), jwt_like_provider()]);
+        let id = chain
+            .authenticate(&auth_creds("tok-local-dev"))
+            .await
+            .unwrap();
+        assert!(
+            !id.roles.contains(&"oauth-user".to_string()),
+            "static bearer must not inherit OAuth role"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chain_empty_acts_as_no_auth() {
+        // Degenerate but valid: empty chain == anonymous identity.
+        let chain = ProviderChain::new(vec![]);
+        let id = chain.authenticate(&Credentials::new()).await.unwrap();
+        assert_eq!(id.subject, "anonymous");
+        assert!(id.roles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chain_short_circuits_on_first_success() {
+        // Performance contract: provider 2 must NOT be called when
+        // provider 1 already accepted. Wired with a counting stub.
+        struct CountingAccept(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        #[async_trait]
+        impl AuthProvider for CountingAccept {
+            async fn authenticate(&self, _: &Credentials) -> Result<AuthIdentity> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(AuthIdentity::new("counted", vec![]))
+            }
+        }
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chain = ProviderChain::new(vec![
+            local_dev_provider(),
+            Arc::new(CountingAccept(counter.clone())),
+        ]);
+        chain
+            .authenticate(&auth_creds("tok-local-dev"))
+            .await
+            .unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "second provider must not be invoked when first accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chain_order_does_not_change_correctness() {
+        // Reversing provider order must still accept the same tokens.
+        let normal = ProviderChain::new(vec![local_dev_provider(), jwt_like_provider()]);
+        let reversed = ProviderChain::new(vec![jwt_like_provider(), local_dev_provider()]);
+
+        for tok in ["tok-local-dev", "fake.jwt.token"] {
+            let a = normal.authenticate(&auth_creds(tok)).await;
+            let b = reversed.authenticate(&auth_creds(tok)).await;
+            assert!(a.is_ok(), "normal order rejected token {tok}");
+            assert!(b.is_ok(), "reversed order rejected token {tok}");
+            assert_eq!(a.unwrap().subject, b.unwrap().subject);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chain_rejects_bypass_via_missing_header() {
+        // No Authorization header → every provider in the chain rejects.
+        let chain = ProviderChain::new(vec![local_dev_provider(), jwt_like_provider()]);
+        assert!(chain.authenticate(&Credentials::new()).await.is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // read_trusted_user — extracted helper, reused by ForwardedUserAuth and
+    // by the OAuth AS /authorize handler (issue #90).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_read_trusted_user_present() {
+        let mut creds = Credentials::new();
+        creds.insert("x-forwarded-user".to_string(), "alice".to_string());
+        creds.insert("x-forwarded-groups".to_string(), "dev,admin".to_string());
+        let (subject, roles) =
+            read_trusted_user(&creds, "x-forwarded-user", "x-forwarded-groups").unwrap();
+        assert_eq!(subject, "alice");
+        assert_eq!(roles, vec!["dev".to_string(), "admin".to_string()]);
+    }
+
+    #[test]
+    fn test_read_trusted_user_case_insensitive_header_lookup() {
+        // Operator may declare headers with any casing in config; lookup
+        // must still find the lowercased credentials map entry.
+        let mut creds = Credentials::new();
+        creds.insert("x-forwarded-user".to_string(), "bob".to_string());
+        let (subject, _) =
+            read_trusted_user(&creds, "X-Forwarded-User", "X-Forwarded-Groups").unwrap();
+        assert_eq!(subject, "bob");
+    }
+
+    #[test]
+    fn test_read_trusted_user_missing_returns_none() {
+        let creds = Credentials::new();
+        assert!(read_trusted_user(&creds, "x-forwarded-user", "x-forwarded-groups").is_none());
+    }
+
+    #[test]
+    fn test_read_trusted_user_empty_returns_none() {
+        // Empty user header is treated as "no identity" — never as an
+        // anonymous one. Important for the AS: an empty header must
+        // refuse to issue a code, not issue a code for "" subject.
+        let mut creds = Credentials::new();
+        creds.insert("x-forwarded-user".to_string(), String::new());
+        assert!(read_trusted_user(&creds, "x-forwarded-user", "x-forwarded-groups").is_none());
+    }
+
+    #[test]
+    fn test_read_trusted_user_no_groups_header_yields_empty_roles() {
+        let mut creds = Credentials::new();
+        creds.insert("x-forwarded-user".to_string(), "alice".to_string());
+        let (_, roles) =
+            read_trusted_user(&creds, "x-forwarded-user", "x-forwarded-groups").unwrap();
+        assert!(roles.is_empty());
     }
 }
