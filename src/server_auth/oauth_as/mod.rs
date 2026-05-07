@@ -29,6 +29,8 @@ mod types;
 
 #[cfg(test)]
 mod e2e_tests;
+#[cfg(test)]
+mod test_helpers;
 
 pub use config::OAuthAsConfig;
 pub use provider::OAuthAsAuth;

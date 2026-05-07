@@ -106,9 +106,7 @@ mod tests {
     use super::*;
     use crate::server_auth::oauth_as::types::{IssuedRefreshToken, RegisteredClient};
 
-    /// Serialize env-var access between tests; these tests mutate
-    /// process-wide state.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::super::test_helpers::env_lock;
 
     struct EnvGuard {
         config: Option<String>,
@@ -144,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_save_then_load_roundtrip_via_file() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvGuard::capture();
         reset_cache();
 
@@ -182,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_inline_takes_precedence_over_path() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvGuard::capture();
         reset_cache();
 
@@ -209,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_inline_save_does_not_touch_disk() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvGuard::capture();
         reset_cache();
 
@@ -236,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_inline_invalid_json_returns_empty_state() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _guard = EnvGuard::capture();
         reset_cache();
 

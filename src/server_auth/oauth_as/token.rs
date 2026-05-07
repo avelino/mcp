@@ -333,19 +333,7 @@ mod tests {
     use crate::auth::oauth_primitives::generate_pkce;
     use crate::server_auth::oauth_as::types::{AuthorizationCode, RegisteredClient};
 
-    fn save_disabled() -> impl Drop {
-        struct G;
-        std::env::set_var(
-            "MCP_AUTH_SERVER_CONFIG",
-            r#"{"clients":{},"refresh_tokens":{}}"#,
-        );
-        impl Drop for G {
-            fn drop(&mut self) {
-                std::env::remove_var("MCP_AUTH_SERVER_CONFIG");
-            }
-        }
-        G
-    }
+    use super::super::test_helpers::InlineSaveGuard;
 
     fn ctx_with_code(code: &str, challenge: &str) -> Arc<AppCtx> {
         let config = Arc::new(super::super::OAuthAsConfig {
@@ -386,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorization_code_grant_happy_path() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let (verifier, challenge) = generate_pkce();
         let ctx = ctx_with_code("the-code", &challenge);
         let resp = token(
@@ -424,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn test_pkce_verifier_mismatch_rejected() {
         // Critical bypass guard: wrong verifier must fail.
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let (_, challenge) = generate_pkce();
         let ctx = ctx_with_code("the-code", &challenge);
         let err = token(
@@ -446,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_code_replay_rejected() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let (verifier, challenge) = generate_pkce();
         let ctx = ctx_with_code("the-code", &challenge);
         let req = || TokenRequest {
@@ -466,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_redirect_uri_mismatch_rejected() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let (verifier, challenge) = generate_pkce();
         let ctx = ctx_with_code("the-code", &challenge);
         let err = token(
@@ -489,7 +477,7 @@ mod tests {
     async fn test_client_id_mismatch_rejected() {
         // Token confusion guard: code was issued for client-A,
         // presenting it as client-B must fail.
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let (verifier, challenge) = generate_pkce();
         let ctx = ctx_with_code("the-code", &challenge);
         let err = token(
@@ -510,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_grant_rotates_token() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let (verifier, challenge) = generate_pkce();
         let ctx = ctx_with_code("the-code", &challenge);
         // First, an authorization_code grant to seed a refresh token.
@@ -568,7 +556,7 @@ mod tests {
     async fn test_refresh_grant_rejects_cross_client_replay() {
         // Privilege escalation: refresh token from client-A must NOT
         // mint a token under client-B credentials.
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let (verifier, challenge) = generate_pkce();
         let ctx = ctx_with_code("the-code", &challenge);
         let initial = token(
@@ -602,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsupported_grant_type_rejected() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let ctx = ctx_with_code("the-code", "ignored");
         let err = token(
             State(ctx),
