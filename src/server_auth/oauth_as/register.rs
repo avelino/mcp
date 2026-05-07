@@ -197,25 +197,11 @@ mod tests {
         })
     }
 
-    fn save_disabled() -> impl Drop {
-        // Force the inline cache path so save() doesn't write to disk
-        // during the test — keeps these tests hermetic.
-        struct G;
-        std::env::set_var(
-            "MCP_AUTH_SERVER_CONFIG",
-            r#"{"clients":{},"refresh_tokens":{}}"#,
-        );
-        impl Drop for G {
-            fn drop(&mut self) {
-                std::env::remove_var("MCP_AUTH_SERVER_CONFIG");
-            }
-        }
-        G
-    }
+    use super::super::test_helpers::InlineSaveGuard;
 
     #[tokio::test]
     async fn test_register_emits_client_id() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
         let res = register(
             State(ctx),
@@ -235,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_rejects_uri_outside_allowlist() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
         let err = register(
             State(ctx),
@@ -255,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_rejects_empty_redirect_uris() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
         let err = register(
             State(ctx),
@@ -274,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_rejects_unsupported_grant_type() {
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
         let err = register(
             State(ctx),
@@ -297,7 +283,7 @@ mod tests {
         // Two separate registrations must produce distinct client_ids
         // and independent redirect_uri lists, so a flow started with
         // client A cannot be redirected through B's URIs.
-        let _g = save_disabled();
+        let _g = InlineSaveGuard::acquire();
         let ctx = ctx_with(vec![
             "https://claude.ai/api/mcp/auth_callback".to_string(),
             "https://chat.openai.com/aip/*".to_string(),

@@ -166,19 +166,7 @@ fn cfg_for_e2e() -> Arc<OAuthAsConfig> {
     })
 }
 
-fn save_disabled() -> impl Drop {
-    struct G;
-    std::env::set_var(
-        "MCP_AUTH_SERVER_CONFIG",
-        r#"{"clients":{},"refresh_tokens":{}}"#,
-    );
-    impl Drop for G {
-        fn drop(&mut self) {
-            std::env::remove_var("MCP_AUTH_SERVER_CONFIG");
-        }
-    }
-    G
-}
+use super::test_helpers::InlineSaveGuard;
 
 fn build_chain(
     cfg: Arc<OAuthAsConfig>,
@@ -271,7 +259,7 @@ async fn run_oauth_flow(client: &Client, base: &str) -> (String, String) {
 
 #[tokio::test]
 async fn e2e_static_bearer_path_authenticates() {
-    let _g = save_disabled();
+    let _g = InlineSaveGuard::acquire();
     let cfg = cfg_for_e2e();
     let state = Arc::new(AsState::default());
 
@@ -302,7 +290,7 @@ async fn e2e_static_bearer_path_authenticates() {
 
 #[tokio::test]
 async fn e2e_oauth_flow_then_call_mcp() {
-    let _g = save_disabled();
+    let _g = InlineSaveGuard::acquire();
     let cfg = cfg_for_e2e();
     let state = Arc::new(AsState::default());
     let chain = build_chain(cfg.clone(), state.clone(), None);
@@ -330,7 +318,7 @@ async fn e2e_both_providers_coexist_in_same_instance() {
     // The exact scenario from issue #90: dev-local static bearer
     // and Claude.ai-web OAuth JWT must both authenticate against
     // /mcp on the same running instance.
-    let _g = save_disabled();
+    let _g = InlineSaveGuard::acquire();
     let cfg = cfg_for_e2e();
     let state = Arc::new(AsState::default());
     let mut tokens = HashMap::new();
@@ -389,7 +377,7 @@ async fn e2e_acl_discriminates_oauth_vs_admin_roles() {
     // OAuth-authenticated identity carries `oauth-user` role (via
     // injectedRoles); ACL grants `oauth-user` only `sentry__*`.
     // Static-bearer identity carries `admin` and gets `*`.
-    let _g = save_disabled();
+    let _g = InlineSaveGuard::acquire();
     let cfg = cfg_for_e2e();
     let state = Arc::new(AsState::default());
     let mut tokens = HashMap::new();
@@ -474,7 +462,7 @@ async fn e2e_acl_discriminates_oauth_vs_admin_roles() {
 
 #[tokio::test]
 async fn e2e_mcp_rejects_invalid_jwt() {
-    let _g = save_disabled();
+    let _g = InlineSaveGuard::acquire();
     let cfg = cfg_for_e2e();
     let state = Arc::new(AsState::default());
     let chain = build_chain(cfg.clone(), state.clone(), None);
@@ -494,7 +482,7 @@ async fn e2e_mcp_rejects_invalid_jwt() {
 
 #[tokio::test]
 async fn e2e_well_known_endpoints_advertise_full_metadata() {
-    let _g = save_disabled();
+    let _g = InlineSaveGuard::acquire();
     let cfg = cfg_for_e2e();
     let state = Arc::new(AsState::default());
     let chain = build_chain(cfg.clone(), state.clone(), None);
