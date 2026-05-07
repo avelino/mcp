@@ -1,5 +1,6 @@
 mod hints;
 pub mod oauth;
+pub(crate) mod oauth_primitives;
 pub mod store;
 
 use anyhow::{Context, Result};

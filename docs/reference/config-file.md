@@ -239,25 +239,31 @@ Optional. Configures authentication for `mcp serve --http`. Ignored for direct C
 {
   "mcpServers": { ... },
   "serverAuth": {
-    "provider": "<provider>",
+    "providers": ["<provider>", "<provider>"],
     "bearer": { ... },
     "forwarded": { ... },
+    "oauthAs": { ... },
     "acl": { ... }
   }
 }
 ```
 
-### Provider
+### Providers
+
+`providers` is an array of provider names, evaluated in order as a chain. The first provider that accepts the request wins; if all reject, the chain returns the error of the *first* provider configured (oracle-resistant). Empty array (or omitted) is equivalent to anonymous access.
 
 | Value | Description |
 |-------|-------------|
-| `"none"` (default) | No authentication — all requests are anonymous |
-| `"bearer"` | Static bearer token validation |
-| `"forwarded"` | Trust reverse proxy header |
+| `"none"` | Anonymous identity (`subject: "anonymous"`, no roles). Useful for testing. |
+| `"bearer"` | Static bearer token validation. Reads from `bearer` sub-config. |
+| `"forwarded"` | Trust reverse proxy header (e.g. `X-Forwarded-User`). Reads from `forwarded` sub-config. |
+| `"oauth_as"` | OAuth 2.0 Authorization Server with Dynamic Client Registration — the route required by Claude.ai / ChatGPT / Cursor. Reads from `oauthAs` sub-config. See the [OAuth AS how-to](../howto/oauth-as.md). |
+
+> **Schema change.** Earlier versions used a single `provider: "..."` string. The new schema is the array `providers: [...]`. Configs carrying the legacy field deserialize into an empty providers list and boot as `NoAuth` — silently weakening auth, so an explicit migration is required. Booting with a missing sub-config (e.g. `"bearer"` listed without a `bearer` block) fails at startup rather than degrading.
 
 ### Bearer config
 
-Required when `provider` is `"bearer"`. Each entry in `tokens` accepts two shapes:
+Required when `"bearer"` is in `providers`. Each entry in `tokens` accepts two shapes:
 
 - **Legacy (string):** `"<token>": "<subject>"` — subject only, no roles.
 - **Extended (object):** `"<token>": { "subject": "<subject>", "roles": ["<role>", ...] }` — subject plus roles used by ACL evaluation.
@@ -288,7 +294,7 @@ Each extended entry:
 
 ### Forwarded config
 
-Optional when `provider` is `"forwarded"`. Reads the authenticated user from a header set by a trusted reverse proxy, and optionally reads a groups header to populate roles.
+Optional when `"forwarded"` is in `providers`. Reads the authenticated user from a header set by a trusted reverse proxy, and optionally reads a groups header to populate roles.
 
 ```json
 {
@@ -307,6 +313,47 @@ Optional when `provider` is `"forwarded"`. Reads the authenticated user from a h
 Groups header value is parsed as a comma-separated list: each entry is trimmed and empty entries are dropped. Missing header yields empty roles (not an error). Role matching is case-sensitive.
 
 > Only use `forwarded` behind a trusted reverse proxy. The proxy **must** strip these headers from incoming client requests — otherwise a client could forge identity and roles.
+
+### OAuth AS config (`oauthAs`)
+
+Required when `"oauth_as"` is in `providers`. Turns `mcp serve` into an OAuth 2.0 Authorization Server with Dynamic Client Registration so Claude.ai, ChatGPT, Cursor and other AI clients can connect. User authentication is delegated to a trusted reverse proxy (oauth2-proxy / Cloudflare Access / Pomerium) — `mcp serve` never handles passwords.
+
+```json
+{
+  "oauthAs": {
+    "issuerUrl": "https://mcp.example.com",
+    "jwtSecret": "${MCP_OAUTH_AS_JWT_SECRET}",
+    "trustedUserHeader": "x-forwarded-user",
+    "trustedGroupsHeader": "x-forwarded-groups",
+    "trustedSourceCidrs": ["10.0.0.0/8"],
+    "accessTokenTtlSeconds": 3600,
+    "refreshTokenTtlSeconds": 2592000,
+    "authorizationCodeTtlSeconds": 60,
+    "scopesSupported": ["mcp"],
+    "redirectUriAllowlist": [
+      "https://claude.ai/api/mcp/auth_callback",
+      "https://chat.openai.com/aip/*/oauth/callback"
+    ],
+    "injectedRoles": ["oauth-user"]
+  }
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|---------|---------|-------------|
+| `issuerUrl` | string | yes | — | Public origin the AS advertises in metadata and embeds as `iss` in JWTs. Must match what clients reach. |
+| `jwtSecret` | string | yes | — | HMAC-SHA256 signing key. **Must be ≥ 32 bytes** — boot fails otherwise. |
+| `trustedUserHeader` | string | no | `"x-forwarded-user"` | Header read at `/authorize` to identify the human. |
+| `trustedGroupsHeader` | string | no | `"x-forwarded-groups"` | Comma-separated → JWT `groups` claim. |
+| `trustedSourceCidrs` | string[] | yes | — | CIDRs allowed to reach `/authorize`. **Empty list rejected at boot** — without it any client could spoof the trusted user header. |
+| `accessTokenTtlSeconds` | number | no | `3600` | JWT lifetime. |
+| `refreshTokenTtlSeconds` | number | no | `2592000` (30d) | Refresh-token lifetime. |
+| `authorizationCodeTtlSeconds` | number | no | `60` | Authorization-code lifetime. |
+| `scopesSupported` | string[] | no | `[]` | Scopes advertised in metadata. |
+| `redirectUriAllowlist` | string[] | yes | — | Patterns clients may register. Trailing `*` allowed (for ChatGPT-style URIs). |
+| `injectedRoles` | string[] | no | `[]` | Roles always added to issued JWTs — useful as a "came in via OAuth" marker for ACL discrimination. |
+
+State (registered clients via DCR + refresh tokens) persists to `auth_server.json` in the config directory; override with `MCP_AUTH_SERVER_PATH` or inline via `MCP_AUTH_SERVER_CONFIG`. See the [OAuth AS how-to](../howto/oauth-as.md) for setup, security notes, and troubleshooting.
 
 ### ACL config
 

@@ -157,13 +157,15 @@ The sections above cover **client-side** authentication — how `mcp` authentica
 
 This is configured via the `serverAuth` key in `servers.json`. See the [proxy mode guide](proxy-mode.md#authentication) for full details.
 
+> **Schema change.** As of the OAuth Authorization Server feature, `serverAuth` takes a `providers: ["..."]` array instead of a single `provider: "..."` string. The new shape lets a single instance accept multiple kinds of bearer credentials in parallel — for example, static tokens for local CLI tools *and* OAuth-issued JWTs for Claude.ai web. Configs using the old `provider` field will silently boot as `NoAuth`; rewrite them as shown below.
+
 ### Quick example
 
 ```json
 {
   "mcpServers": { ... },
   "serverAuth": {
-    "provider": "bearer",
+    "providers": ["bearer"],
     "bearer": {
       "tokens": {
         "tok-alice": "alice",
@@ -193,7 +195,7 @@ Both forms can coexist in the same config file.
 {
   "mcpServers": { ... },
   "serverAuth": {
-    "provider": "bearer",
+    "providers": ["bearer"],
     "bearer": {
       "tokens": {
         "tok-alice": { "subject": "alice", "roles": ["admin"] },
@@ -220,18 +222,39 @@ See [proxy mode ACL docs](proxy-mode.md#access-control-acl) for the full schema,
 
 | Provider | Use case |
 |----------|----------|
-| `none` (default) | No auth — all requests are anonymous |
+| `none` (default when `providers` is empty) | No auth — all requests are anonymous |
 | `bearer` | Static token-to-user mapping, with optional per-token roles |
 | `forwarded` | Trust reverse proxy `X-Forwarded-User` header (and optional `X-Forwarded-Groups` for roles) |
+| `oauth_as` | Run an OAuth 2.0 Authorization Server with Dynamic Client Registration so Claude.ai, ChatGPT, Cursor and other AI clients can connect as Custom Connectors. See the [OAuth AS how-to](../howto/oauth-as.md). |
 
-### Forwarded provider and roles
-
-When `provider` is `forwarded`, the proxy reads the user from the configured user header (default `x-forwarded-user`) and, optionally, a groups header (default `x-forwarded-groups`, following the oauth2-proxy convention) to populate roles.
+`providers` is a list — combine multiple in the same instance:
 
 ```json
 {
   "serverAuth": {
-    "provider": "forwarded",
+    "providers": ["bearer", "oauth_as"],
+    "bearer": { "tokens": { "tok-local-dev": { "subject": "avelino", "roles": ["admin"] } } },
+    "oauthAs": {
+      "issuerUrl": "https://mcp.example.com",
+      "jwtSecret": "${MCP_OAUTH_AS_JWT_SECRET}",
+      "trustedSourceCidrs": ["10.0.0.0/8"],
+      "redirectUriAllowlist": ["https://claude.ai/api/mcp/auth_callback"],
+      "injectedRoles": ["oauth-user"]
+    }
+  }
+}
+```
+
+The chain tries each provider in order; the first one that accepts the request wins. When all reject, the chain returns the error of the *first* configured provider — which avoids leaking which token format hit a closer-to-success path. Order is a performance hint (cheap lookups first), not a correctness one.
+
+### Forwarded provider and roles
+
+With `"forwarded"` in `providers`, the proxy reads the user from the configured user header (default `x-forwarded-user`) and, optionally, a groups header (default `x-forwarded-groups`, following the oauth2-proxy convention) to populate roles.
+
+```json
+{
+  "serverAuth": {
+    "providers": ["forwarded"],
     "forwarded": {
       "header": "x-forwarded-user",
       "groups_header": "x-forwarded-groups"

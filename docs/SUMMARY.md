@@ -25,6 +25,7 @@
 
 * [Docker](howto/docker.md)
 * [Kubernetes](howto/kubernetes.md)
+* [OAuth Authorization Server (Claude.ai, ChatGPT, Cursor)](howto/oauth-as.md)
 * [Supported services](howto/services.md)
 * [Troubleshooting](howto/troubleshooting.md)
 

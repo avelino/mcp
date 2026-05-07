@@ -23,6 +23,9 @@ These variables configure `mcp` behavior:
 | `MCP_OAUTH_CALLBACK_PORT` | `8085-8099` | Port or range for the OAuth callback listener. Single port (`9000`), range (`9000-9010`), or `0` for OS-assigned. |
 | `MCP_AUTH_CONFIG` | — | Inline JSON content of `auth.json` (read-only). Highest priority for auth — skips file read. Writes are no-ops with a single `warn` log. Intended for k8s/Docker Secrets. |
 | `MCP_AUTH_PATH` | `~/.config/mcp/auth.json` | Override the OAuth token storage location (file path) |
+| `MCP_AUTH_SERVER_CONFIG` | — | Inline JSON of the OAuth Authorization Server state (`auth_server.json`). Same precedence model as `MCP_AUTH_CONFIG`: read-only on disk, mutable in memory. Used when `serverAuth.providers` includes `"oauth_as"`. |
+| `MCP_AUTH_SERVER_PATH` | `~/.config/mcp/auth_server.json` | File path for AS state (registered DCR clients + refresh tokens). Used when `serverAuth.providers` includes `"oauth_as"`. |
+| `MCP_OAUTH_AS_JWT_SECRET` | — | HMAC-SHA256 signing key for issued JWTs when running the OAuth Authorization Server. Must be ≥ 32 bytes. Typically referenced from `serverAuth.oauthAs.jwtSecret` via `${MCP_OAUTH_AS_JWT_SECRET}`. Rotation invalidates every previously issued token. |
 
 ### Config loading priority
 
@@ -204,6 +207,43 @@ For container deployments where the filesystem is read-only or you want tokens i
 2. **`MCP_AUTH_PATH`** — file path override
 3. **`MCP_CONFIG_DIR`/auth.json** — config directory override
 4. **`~/.config/mcp/auth.json`** — default file location
+
+### `MCP_AUTH_SERVER_CONFIG`
+
+Inline JSON for the OAuth Authorization Server state — registered clients (Dynamic Client Registration / RFC 7591) and persisted refresh tokens. Equivalent to `MCP_AUTH_CONFIG` but for the *server-side* AS state file (`auth_server.json`), used only when `serverAuth.providers` contains `"oauth_as"`.
+
+Same precedence model: inline content takes priority, writes during runtime stay in memory only (the on-disk source is treated as read-only, matching how Kubernetes Secrets behave).
+
+```bash
+export MCP_AUTH_SERVER_CONFIG='{
+  "clients": {},
+  "refresh_tokens": {}
+}'
+```
+
+Authorization codes are intentionally **not** persisted — restart drops them, which is the safer default than letting captured codes resume post-restart.
+
+### `MCP_AUTH_SERVER_PATH`
+
+Override the file location for AS state. Default is `~/.config/mcp/auth_server.json`. The file is rewritten atomically via tempfile-then-rename, so a crash mid-write cannot leave a partial JSON behind.
+
+```bash
+MCP_AUTH_SERVER_PATH=/var/lib/mcp/auth_server.json mcp serve --http 0.0.0.0:8080
+```
+
+`MCP_AUTH_SERVER_CONFIG` takes priority over `MCP_AUTH_SERVER_PATH`. Both apply only when `oauth_as` is in `serverAuth.providers`; otherwise they're ignored.
+
+### `MCP_OAUTH_AS_JWT_SECRET`
+
+HMAC-SHA256 signing key for the JWTs issued by the OAuth Authorization Server. Must be at least 32 bytes — boot fails otherwise. Generate with:
+
+```bash
+export MCP_OAUTH_AS_JWT_SECRET=$(openssl rand -hex 32)
+```
+
+Reference it from `serverAuth.oauthAs.jwtSecret` via `${MCP_OAUTH_AS_JWT_SECRET}` so the secret never lives in the config file.
+
+> Rotation invalidates every previously issued access and refresh token. v1 has no in-place rotation — plan for a forced re-login when changing the secret.
 
 ## Config variables
 

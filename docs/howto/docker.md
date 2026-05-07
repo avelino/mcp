@@ -105,8 +105,10 @@ docker run -d \
       "sentry": {"url": "https://mcp.sentry.dev/sse"}
     },
     "serverAuth": {
-      "provider": "bearer",
-      "tokens": ["my-secret-token"]
+      "providers": ["bearer"],
+      "bearer": {
+        "tokens": { "my-secret-token": "ops" }
+      }
     }
   }' \
   -p 8080:8080 \

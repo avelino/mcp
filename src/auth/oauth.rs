@@ -1,15 +1,12 @@
 use anyhow::{bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use rand::Rng;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use url::Url;
 
 use super::hints;
+use super::oauth_primitives::{generate_pkce, generate_random_string};
 use super::store::{self, to_stored_tokens};
 
 const DEFAULT_CALLBACK_PORT_START: u16 = 8085;
@@ -291,28 +288,6 @@ async fn get_or_register_client(
     Ok(client_id)
 }
 
-// --- PKCE ---
-
-fn generate_pkce() -> (String, String) {
-    let verifier = generate_random_string(43);
-    let mut hasher = Sha256::new();
-    hasher.update(verifier.as_bytes());
-    let hash = hasher.finalize();
-    let challenge = URL_SAFE_NO_PAD.encode(hash);
-    (verifier, challenge)
-}
-
-fn generate_random_string(len: usize) -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-    let mut rng = rand::rng();
-    (0..len)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
-}
-
 // --- Callback server ---
 
 async fn bind_callback_listener() -> Result<(TcpListener, u16)> {
@@ -398,30 +373,8 @@ async fn send_callback_response(stream: &mut tokio::net::TcpStream, message: &st
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_generate_pkce() {
-        let (verifier, challenge) = generate_pkce();
-        assert!(verifier.len() >= 43);
-        assert!(!challenge.is_empty());
-        assert!(!challenge.contains('='));
-        assert!(!challenge.contains('+'));
-        assert!(!challenge.contains('/'));
-
-        let mut hasher = Sha256::new();
-        hasher.update(verifier.as_bytes());
-        let hash = hasher.finalize();
-        let expected = URL_SAFE_NO_PAD.encode(hash);
-        assert_eq!(challenge, expected);
-    }
-
-    #[test]
-    fn test_generate_random_string() {
-        let s = generate_random_string(32);
-        assert_eq!(s.len(), 32);
-        assert!(s
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
-    }
+    // PKCE / random-string tests live with the helpers in
+    // `super::oauth_primitives` — see `src/auth/oauth_primitives.rs`.
 
     #[test]
     fn test_parse_port_spec_single_port() {
