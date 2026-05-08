@@ -153,6 +153,53 @@ Override the ChronDB data and index directories. These take priority over the `a
 MCP_AUDIT_PATH=/var/lib/mcp/data MCP_AUDIT_INDEX_PATH=/var/lib/mcp/index mcp serve --http 0.0.0.0:8080
 ```
 
+### `MCP_LOG_LEVEL`
+
+Controls verbosity of `tracing` events emitted by the proxy and CLI. Output goes to **stderr** (so `stdout` stays clean for `mcp logs --json`, `MCP_AUDIT_OUTPUT=stdout`, and stdio JSON-RPC).
+
+Accepts the full [`tracing` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax — not just a single level:
+
+```bash
+# Global level
+MCP_LOG_LEVEL=debug mcp serve --http :7332
+
+# Per-module: keep mcp at debug, silence noisy HTTP-stack libs
+MCP_LOG_LEVEL='mcp=debug,hyper=warn,reqwest=warn,h2=warn' mcp serve --http :7332
+
+# Trace a single module
+MCP_LOG_LEVEL='mcp::server_auth=trace,info' mcp serve --http :7332
+```
+
+The per-module pattern is the one to reach for in containers. A bare `debug` floods logs with HTTP framing noise from `hyper`/`h2`/`reqwest` — scoping `mcp` to `debug` and the rest to `warn` keeps the signal-to-noise ratio usable.
+
+Invalid filter strings fall back silently to `info`.
+
+### `MCP_LOG_FORMAT`
+
+Selects between human-readable and structured logging. Defaults to `text` (color, indented multiline events). Set to `json` for newline-delimited JSON — one complete event per line, drop-in for any log driver:
+
+```bash
+MCP_LOG_FORMAT=json mcp serve --http 0.0.0.0:8080
+```
+
+Each event is a self-contained JSON object:
+
+```json
+{"timestamp":"2026-04-14T12:00:00.123Z","level":"INFO","fields":{"message":"backend connected","server":"sentry"}}
+{"timestamp":"2026-04-14T12:00:01.456Z","level":"WARN","fields":{"message":"discovery failed","server":"grafana","error":"connection refused"}}
+```
+
+Combined with [`MCP_AUDIT_OUTPUT=stdout`](#mcp_audit_enabled), every byte the container emits is JSON: tracing on stderr, audit on stdout. No mixed formats, no parse rules to maintain.
+
+```bash
+# Container-friendly logging recipe:
+docker run -d \
+  -e MCP_LOG_LEVEL='mcp=debug,hyper=warn,reqwest=warn,h2=warn' \
+  -e MCP_LOG_FORMAT=json \
+  -e MCP_AUDIT_OUTPUT=stdout \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080 --insecure
+```
+
 ### `MCP_AUTH_CONFIG`
 
 Inline JSON content of `auth.json`, equivalent to [`MCP_SERVERS_CONFIG`](#mcp_servers_config) but for OAuth tokens and dynamic-client registrations. Highest priority — when set, the file at `MCP_AUTH_PATH` (or the default location) is **not** read.

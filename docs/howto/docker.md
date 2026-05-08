@@ -144,6 +144,29 @@ docker run -d \
   ghcr.io/avelino/mcp serve --http 0.0.0.0:8080 --insecure
 ```
 
+### Application logs (stderr, JSON for log drivers)
+
+Tracing logs (startup, backend discovery, request errors) go to **stderr**. Two env vars tune them for production:
+
+```bash
+docker run -d \
+  -e MCP_SERVERS_CONFIG='{"mcpServers":{...}}' \
+  -e MCP_LOG_LEVEL='mcp=debug,hyper=warn,reqwest=warn,h2=warn' \
+  -e MCP_LOG_FORMAT=json \
+  -p 8080:8080 \
+  ghcr.io/avelino/mcp serve --http 0.0.0.0:8080 --insecure
+```
+
+- `MCP_LOG_LEVEL` uses [`tracing` EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax — global level (`info`/`debug`) or per-module (`mcp=debug,hyper=warn`). The example silences noisy HTTP-stack libraries while keeping the proxy at `debug`.
+- `MCP_LOG_FORMAT=json` emits newline-delimited JSON, one event per line — drop straight into Datadog, CloudWatch, Loki, etc.
+
+Pair with `MCP_AUDIT_OUTPUT=stdout` and you get a single Docker log stream where every line is JSON: app/tracing on stderr, audit on stdout — both captured by `docker logs`.
+
+```bash
+# Filter app errors:
+docker logs mcp-proxy 2>&1 | jq -c 'select(.level=="ERROR")'
+```
+
 ## Container environment variables
 
 These variables are especially useful for container deployments. See the full list in the [environment variables reference](../reference/environment-variables.md).

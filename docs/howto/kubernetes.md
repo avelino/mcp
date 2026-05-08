@@ -157,6 +157,35 @@ The proxy exposes `GET /health` returning:
 
 > **Do not** use `backends_connected > 0` as a readiness condition. The proxy is designed to start with zero connections and connect on demand.
 
+## Application logs
+
+Application logs (`tracing` events from the proxy itself — startup, backend discovery, request errors, OAuth flows) go to **stderr** by default and are captured by the kubelet, so `kubectl logs` just works. Two env vars tune this for production:
+
+```yaml
+env:
+  # EnvFilter syntax — silence noisy library logs, keep mcp at debug.
+  - name: MCP_LOG_LEVEL
+    value: "mcp=debug,hyper=warn,reqwest=warn,h2=warn"
+  # Newline-delimited JSON, one event per line. Drop in any log driver
+  # (Loki, Datadog, CloudWatch, Fluentd) without parsing rules.
+  - name: MCP_LOG_FORMAT
+    value: "json"
+```
+
+`MCP_LOG_LEVEL` follows `tracing`'s [EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax. Set the global level with `info`/`debug`/`trace`, or scope per module with `target=level` separated by commas. The example above keeps the proxy at `debug` while silencing `hyper`/`reqwest`/`h2` chatter — which dominates request volume otherwise.
+
+`MCP_LOG_FORMAT=json` swaps the human-readable formatter for newline-delimited JSON. Each line is a complete event with `timestamp`, `level`, `message`, and structured fields. Pair with the audit stream below and you get a single tail-able log surface — every line is JSON, no mixed formats.
+
+```bash
+# Live tail, all events:
+kubectl -n mcp logs deploy/mcp-proxy -f
+
+# Only proxy errors via jq:
+kubectl -n mcp logs deploy/mcp-proxy -f | jq -c 'select(.level=="ERROR")'
+```
+
+> **Why stderr, not stdout, for app logs?** Audit logs go to **stdout** (when `MCP_AUDIT_OUTPUT=stdout`) and they're the structured product surface. Application/tracing logs go to **stderr** as the diagnostic surface. Kubernetes captures both in the same `kubectl logs` stream by default — split them downstream with `jq` (audit lines have `method`/`identity`; tracing lines have `level`/`target`).
+
 ## Audit logging
 
 By default, audit logging is disabled (`MCP_AUDIT_ENABLED=false`) because the scratch-based image has no writable filesystem.
@@ -248,6 +277,8 @@ When Kubernetes sends `SIGTERM` (during rolling updates or scale-down):
 | `MCP_SERVERS_CONFIG` | (from ConfigMap) | Inline JSON config (highest priority) |
 | `MCP_AUTH_CONFIG` | (from Secret, optional) | Inline OAuth tokens (`auth.json`). Read-only — writes are no-ops. |
 | `MCP_PROXY_REQUEST_TIMEOUT` | `120` (app default) | Max seconds per JSON-RPC request |
+| `MCP_LOG_LEVEL` | `info` | `tracing` `EnvFilter` (e.g. `mcp=debug,hyper=warn,reqwest=warn,h2=warn`) |
+| `MCP_LOG_FORMAT` | `text` | `json` for newline-delimited JSON to stderr (log drivers) |
 | `MCP_AUDIT_ENABLED` | `false` | Enable audit logging |
 | `MCP_AUDIT_OUTPUT` | `file` | `stdout` for cluster log pipeline, `file` for PVC, `none` to disable |
 | `MCP_AUDIT_PATH` | `/data/audit/data` | Audit data directory (app default: `~/.config/mcp/db/data`) |
