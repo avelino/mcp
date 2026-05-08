@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::server_auth::oauth_as::{self, AsState};
 use crate::server_auth::{self, AclConfig, AuthIdentity, AuthProvider, Credentials};
+use crate::telemetry::extract_parent_context;
 
 use super::discovery::discover_pending_backends;
 use super::dispatch::dispatch_request;
@@ -179,6 +180,36 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
         sessions: Arc::new(Mutex::new(HashMap::new())),
         shutdown: shutdown_rx,
     };
+
+    // OTel observable gauges. The closures hold `Weak` refs so they don't
+    // keep the proxy alive past shutdown. `try_lock` is best-effort: if the
+    // mutex is contended at observation time we report 0 instead of stalling
+    // the metrics export task.
+    {
+        let proxy_weak = Arc::downgrade(&shared);
+        let sessions_weak = Arc::downgrade(&state.sessions);
+        crate::telemetry::register_proxy_observers(
+            move || {
+                proxy_weak
+                    .upgrade()
+                    .and_then(|p| {
+                        p.try_lock().ok().map(|p| {
+                            p.backends
+                                .values()
+                                .filter(|s| matches!(s, BackendState::Connected { .. }))
+                                .count() as u64
+                        })
+                    })
+                    .unwrap_or(0)
+            },
+            move || {
+                sessions_weak
+                    .upgrade()
+                    .and_then(|s| s.try_lock().ok().map(|m| m.len() as u64))
+                    .unwrap_or(0)
+            },
+        );
+    }
 
     // Background GC for the OAuth AS — drops expired authorization
     // codes and refresh tokens. Cheap pass; runs every 60s.
@@ -429,12 +460,14 @@ async fn mcp_handler(
             .unwrap_or(120),
     );
     let req_id = req.id.clone();
-    let response_json = match tokio::time::timeout(
-        request_timeout,
-        dispatch_request(&state.proxy, req, &identity, &state.acl, "serve:http"),
-    )
-    .await
-    {
+    // W3C parent context from inbound headers. When the client is OTel-aware
+    // (Claude.ai, an instrumented gateway), this stitches the proxy span
+    // under the caller's trace. With telemetry off, this is a no-op.
+    use opentelemetry::trace::FutureExt as _;
+    let parent_cx = extract_parent_context(&headers);
+    let dispatch_fut = dispatch_request(&state.proxy, req, &identity, &state.acl, "serve:http")
+        .with_context(parent_cx);
+    let response_json = match tokio::time::timeout(request_timeout, dispatch_fut).await {
         Ok(resp) => serde_json::to_value(&resp).unwrap(),
         Err(_) => {
             let err = JsonRpcResponse::error(

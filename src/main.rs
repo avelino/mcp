@@ -16,6 +16,7 @@ mod registry;
 mod serve;
 mod server_auth;
 mod spinner;
+mod telemetry;
 mod transport;
 
 use anyhow::{bail, Result};
@@ -25,7 +26,11 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    logging::init();
+    // OTel guard is RAII — keeping it alive in `main` flushes spans/metrics
+    // on normal exit. `None` when telemetry is disabled (no env var) — and
+    // in that case logging+behavior is byte-identical to the pre-OTel path.
+    let telemetry = telemetry::init();
+    logging::init(telemetry.as_ref());
     if let Err(e) = run().await {
         tracing::error!(error = format!("{e:#}"), "fatal error");
         std::process::exit(1);

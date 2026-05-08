@@ -272,8 +272,26 @@ impl ProxyServer {
                     tool.annotations.as_ref(),
                 );
                 if let Some(cached) = self.classifier_cache.get(&key).cloned() {
+                    if let Some(m) = crate::telemetry::metrics() {
+                        m.classifier_hits.add(
+                            1,
+                            &[opentelemetry::KeyValue::new(
+                                "mcp.server",
+                                server_name.to_string(),
+                            )],
+                        );
+                    }
                     cached
                 } else {
+                    if let Some(m) = crate::telemetry::metrics() {
+                        m.classifier_misses.add(
+                            1,
+                            &[opentelemetry::KeyValue::new(
+                                "mcp.server",
+                                server_name.to_string(),
+                            )],
+                        );
+                    }
                     let c = classify(tool, None);
                     self.classifier_cache.put(key, c.clone());
                     c
