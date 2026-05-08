@@ -1,24 +1,25 @@
-//! OpenTelemetry integration — default-off, ativado via env vars padrão OTel.
+//! OpenTelemetry integration — default-off, activated via standard OTel env vars.
 //!
-//! Quando `OTEL_EXPORTER_OTLP_ENDPOINT` está setado, [`init`] configura:
-//! - `TracerProvider` global com batch exporter OTLP (gRPC ou HTTP/protobuf,
-//!   conforme `OTEL_EXPORTER_OTLP_PROTOCOL`).
-//! - `MeterProvider` global com periodic reader (default: 60s).
-//! - `TraceContextPropagator` global (W3C `traceparent`).
+//! When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, [`init`] wires:
+//! - A global `TracerProvider` with an OTLP batch exporter (gRPC or
+//!   HTTP/protobuf, picked via `OTEL_EXPORTER_OTLP_PROTOCOL`).
+//! - A global `MeterProvider` with a periodic reader (default: 60s).
+//! - The W3C `TraceContextPropagator` (used for `traceparent`/`tracestate`).
 //!
-//! O guard retornado faz flush+shutdown no Drop. Sem o env var, [`init`]
-//! retorna `None` e o sistema se comporta exatamente como antes.
+//! The returned guard flushes and shuts down providers on `Drop`. Without
+//! the env var, [`init`] returns `None` and the rest of the binary behaves
+//! exactly like the pre-OTel build.
 //!
-//! Env vars suportadas (todas opcionais exceto endpoint):
-//! - `OTEL_EXPORTER_OTLP_ENDPOINT` — único ativador.
-//! - `OTEL_EXPORTER_OTLP_PROTOCOL` — `grpc` (default) ou `http/protobuf`.
-//! - `OTEL_EXPORTER_OTLP_HEADERS` — CSV `k1=v1,k2=v2` (HTTP only por spec).
-//! - `OTEL_SERVICE_NAME` — default `mcp`.
-//! - `OTEL_RESOURCE_ATTRIBUTES` — CSV adicionado ao Resource.
+//! Supported env vars (all optional except the endpoint):
+//! - `OTEL_EXPORTER_OTLP_ENDPOINT` — sole activator.
+//! - `OTEL_EXPORTER_OTLP_PROTOCOL` — `grpc` (default) or `http/protobuf`.
+//! - `OTEL_EXPORTER_OTLP_HEADERS` — CSV `k1=v1,k2=v2` (HTTP only per spec).
+//! - `OTEL_SERVICE_NAME` — defaults to `mcp`.
+//! - `OTEL_RESOURCE_ATTRIBUTES` — CSV merged into the Resource.
 //!
-//! Escape hatch: se algum backend MCP rejeitar `traceparent` injetado,
-//! `MCP_OTEL_INJECT_TRACEPARENT=0` desliga apenas a injeção outbound sem
-//! mexer no resto.
+//! Escape hatch: if some MCP backend rejects the injected `traceparent`,
+//! set `MCP_OTEL_INJECT_TRACEPARENT=0` to disable outbound injection only,
+//! leaving traces and metrics untouched.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -441,6 +442,13 @@ pub fn inject_traceparent(headers: &mut HashMap<String, String>) {
 mod tests {
     use super::*;
 
+    /// `cargo test` runs in parallel by default. Any test that mutates a
+    /// process-wide env var must hold this lock or it can race with both
+    /// peer tests in this module and tests elsewhere reading OTel vars
+    /// (e.g. via [`init`]). Pattern matches `src/config.rs` /
+    /// `src/auth/store.rs`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parse_headers_csv_basic() {
         let h = parse_headers(Some("k1=v1,k2=v2"));
@@ -464,14 +472,14 @@ mod tests {
 
     #[test]
     fn parse_protocol_default_is_grpc() {
-        // SAFETY: tests run in-process; we don't rely on absence in parallel
-        // tests because we set explicitly.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(PROTOCOL_VAR);
         assert_eq!(parse_protocol(), WireProtocol::Grpc);
     }
 
     #[test]
     fn parse_protocol_http() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(PROTOCOL_VAR, "http/protobuf");
         assert_eq!(parse_protocol(), WireProtocol::HttpProto);
         std::env::remove_var(PROTOCOL_VAR);
@@ -479,12 +487,14 @@ mod tests {
 
     #[test]
     fn init_returns_none_without_endpoint() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(ENDPOINT_VAR);
         assert!(init().is_none(), "init must be a no-op without endpoint");
     }
 
     #[test]
     fn init_returns_none_with_empty_endpoint() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(ENDPOINT_VAR, "   ");
         assert!(init().is_none(), "blank endpoint must not enable OTel");
         std::env::remove_var(ENDPOINT_VAR);

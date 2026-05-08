@@ -1,47 +1,49 @@
 # Observability — OpenTelemetry traces & metrics
 
-`mcp serve` (proxy mode) emite **traces** e **métricas** OTLP nativas. Default-off:
-sem env var, comportamento é bit-idêntico à 0.5.2 — log estruturado em stderr +
-audit local em chrondb.
+`mcp serve` (proxy mode) emits native OTLP **traces** and **metrics**.
+Default-off: without an env var, behavior is byte-identical to 0.5.2 —
+structured logs on stderr + local audit trail in chrondb.
 
-> **Quer testar agora?** Vai direto pro [quickstart hands-on](../howto/observability-quickstart.md)
-> — sobe Jaeger + `mcp serve` em 3 minutos e prova end-to-end (incluindo `traceparent`
-> propagation e métricas).
+> **Want to try it now?** Jump to the [hands-on quickstart](../howto/observability-quickstart.md)
+> — it spins up Jaeger + `mcp serve` in 3 minutes and proves the full path
+> end-to-end (including `traceparent` propagation and metrics).
 >
-> Esta página aqui é a **referência** — o que cada atributo significa, como
-> configurar pra cada vendor, e os escape hatches pra quando algo der ruim.
+> This page is the **reference** — what each attribute means, how to
+> configure each vendor, and the escape hatches for when something goes
+> sideways.
 
-## Escape hatches (lê isso primeiro)
+## Escape hatches (read this first)
 
-Roda `mcp serve` em produção e tá nervoso de ligar OTel? Dois switches que valem
-ouro:
+Running `mcp serve` in production and nervous about turning OTel on? Two
+switches worth knowing:
 
-- **Unset `OTEL_EXPORTER_OTLP_ENDPOINT`** → telemetria **inteira** desliga. Comportamento
-  idêntico ao 0.5.2. Sem rebuild, sem rollback, é só remover do deploy.
-- **`MCP_OTEL_INJECT_TRACEPARENT=0`** → mantém traces e métricas, **só** desliga a
-  injeção do header `traceparent` em chamadas outbound. Use se algum backend MCP
-  estranho rejeitar header desconhecido (W3C `traceparent` é padrão, mas servidor
-  ruim existe).
+- **Unset `OTEL_EXPORTER_OTLP_ENDPOINT`** → telemetry is **fully**
+  disabled. Behavior is identical to 0.5.2. No rebuild, no rollback,
+  just remove the env var from the deploy.
+- **`MCP_OTEL_INJECT_TRACEPARENT=0`** → keeps traces and metrics on,
+  **only** disables `traceparent` injection on outbound calls. Use this
+  if some odd backend rejects unknown headers (W3C `traceparent` is
+  standard, but bad servers exist).
 
-## Configuração — env vars padrão OTel
+## Configuration — standard OTel env vars
 
-Tudo controlado por env var OTel. **Nada** vai pro `servers.json`.
+Everything is driven by OTel env vars. **Nothing** lives in `servers.json`.
 
-| Variável | Efeito |
+| Variable | Effect |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | **Único ativador.** Vazio ou ausente = OTel off. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (default) ou `http/protobuf`. |
-| `OTEL_EXPORTER_OTLP_HEADERS` | CSV `k1=v1,k2=v2`. Só HTTP por spec. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | **Sole activator.** Empty or unset = OTel off. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (default) or `http/protobuf`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | CSV `k1=v1,k2=v2`. HTTP only per spec. |
 | `OTEL_SERVICE_NAME` | Resource `service.name`. Default `mcp`. |
-| `OTEL_RESOURCE_ATTRIBUTES` | Resource attrs extras, CSV. |
-| `MCP_OTEL_INJECT_TRACEPARENT` | `0`/`false`/`no` desliga injeção outbound. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, CSV format. |
+| `MCP_OTEL_INJECT_TRACEPARENT` | `0`/`false`/`no` disables outbound injection. |
 
-> **Diagnóstico rápido**: a primeira linha do stderr quando OTel inicia é
+> **Quick diagnostic**: when OTel boots, the very first line on stderr is
 > `[telemetry] OpenTelemetry initialized — endpoint=... protocol=...`.
-> Sai direto pra stderr, **não** respeita `MCP_LOG_LEVEL`. Se essa linha não
-> aparece, OTel não subiu — confere o env var.
+> It prints directly to stderr and **does not** respect `MCP_LOG_LEVEL`.
+> If you don't see it, OTel didn't start — check the env var.
 
-## Recipes por vendor
+## Vendor recipes
 
 ### Honeycomb
 
@@ -54,8 +56,8 @@ OTEL_RESOURCE_ATTRIBUTES="deployment.environment=production" \
 mcp serve --http 0.0.0.0:7331 --insecure
 ```
 
-Honeycomb público **só aceita HTTP/protobuf** — gRPC não roda. Não esquece o
-`x-honeycomb-team` header.
+The public Honeycomb ingest **only accepts HTTP/protobuf** — gRPC won't
+work. Don't forget the `x-honeycomb-team` header.
 
 ### Grafana Tempo (self-hosted)
 
@@ -66,8 +68,8 @@ OTEL_SERVICE_NAME=mcp \
 mcp serve --http 0.0.0.0:7331 --insecure
 ```
 
-`grpc` é o default da spec OTel — pode omitir `OTEL_EXPORTER_OTLP_PROTOCOL` se
-quiser.
+`grpc` is the OTel SDK default — you can omit `OTEL_EXPORTER_OTLP_PROTOCOL`
+if you want.
 
 ### Datadog (via Agent)
 
@@ -79,78 +81,80 @@ OTEL_RESOURCE_ATTRIBUTES="env=prod,team=platform" \
 mcp serve --http 0.0.0.0:7331 --insecure
 ```
 
-Datadog Agent expõe OTLP receiver na 4317/4318 quando habilitado.
+The Datadog Agent exposes an OTLP receiver on 4317/4318 once enabled.
 
-### Local (desenvolvimento)
+### Local (development)
 
-Pra subir Jaeger + ver tudo end-to-end na sua máquina, segue o
-[quickstart hands-on](../howto/observability-quickstart.md).
+To bring up Jaeger + see the whole flow on your machine, follow the
+[hands-on quickstart](../howto/observability-quickstart.md).
 
 ## Span attributes
 
-Toda request gera um span raiz `mcp.request` com:
+Every request produces a single root span `mcp.request` with:
 
-| Attribute | Significado |
+| Attribute | Meaning |
 |---|---|
 | `otel.kind` | `server` |
-| `mcp.method` | método JSON-RPC (`tools/call`, `tools/list`, `resources/read`, …) |
-| `mcp.transport` | `serve:http` ou `serve:stdio` |
-| `mcp.identity` | subject autenticado (JWT `sub`, nome do bearer-token, ou `anonymous`) |
-| `mcp.server` | alias do backend, **só** depois que routing resolve (tools/call, resources/read, prompts/get) |
-| `mcp.tool` | nome do tool no backend |
-| `mcp.status` | `ok` ou `error` |
+| `mcp.method` | JSON-RPC method (`tools/call`, `tools/list`, `resources/read`, …) |
+| `mcp.transport` | `serve:http` or `serve:stdio` |
+| `mcp.identity` | Authenticated subject (JWT `sub`, bearer-token name, or `anonymous`) |
+| `mcp.server` | Backend alias, **only** after routing resolves (tools/call, resources/read, prompts/get) |
+| `mcp.tool` | Backend tool name |
+| `mcp.status` | `ok` or `error` |
 
-A duração do span = tempo total do `dispatch_request`. Inclui ACL, lock do
-proxy, conexão com backend e o backend call em si — útil pra entender onde tá
-gastando latência.
+Span duration = total time inside `dispatch_request`. Includes ACL
+evaluation, the brief proxy lock, the backend connection, and the backend
+call itself — useful to see where latency is going.
 
-`traceparent` inbound (do cliente) é honrado: o span da `mcp` vira filho do
-span do cliente, não cria trace novo. Saindo pra backends HTTP, a `mcp` injeta
-`traceparent`/`tracestate` automaticamente — backend instrumentado continua o
-trace.
+Inbound `traceparent` (from the client) is honored: the `mcp` span
+becomes a child of the client's span, no new trace is created. Outbound,
+`mcp` injects `traceparent`/`tracestate` automatically — an instrumented
+backend continues the trace.
 
 ## Metrics
 
-| Métrica | Tipo | Unidade | Atributos |
+| Metric | Type | Unit | Attributes |
 |---|---|---|---|
 | `mcp.proxy.requests` | counter | — | `mcp.method`, `mcp.transport`, `mcp.status`, `mcp.identity`, `mcp.server`*, `mcp.tool`* |
-| `mcp.proxy.request.duration` | histogram | ms | mesmos da counter |
+| `mcp.proxy.request.duration` | histogram | ms | same as the counter |
 | `mcp.proxy.classifier.cache.hits` | counter | — | `mcp.server` |
 | `mcp.proxy.classifier.cache.misses` | counter | — | `mcp.server` |
 | `mcp.proxy.backends.connected` | gauge | — | — |
 | `mcp.proxy.sessions.active` | gauge | — | — |
 
-\* `mcp.server` e `mcp.tool` só presentes quando a request resolve pra um
-backend (ausentes em `auth/failure`, métodos desconhecidos, payload
-malformado).
+\* `mcp.server` and `mcp.tool` only appear when the request resolves to
+a backend (absent on `auth/failure`, unknown methods, malformed payload).
+The `mcp.tool` label carries the backend tool name (un-namespaced) — the
+namespace lives in `mcp.server`.
 
-PeriodicReader exporta a cada 60s (default OTel SDK). Se for testar local, espera
-~65s depois do primeiro request pra ver no exporter.
+The PeriodicReader exports every 60s (OTel SDK default). When testing
+locally, wait ~65s after the first request before checking the exporter.
 
-## Cardinalidade — atenção
+## Cardinality — heads-up
 
-`mcp.identity` discrimina por subject autenticado. Se subjects são UUIDs por
-usuário (JWT `sub` único), você gera muita série. Honeycomb/Tempo/Datadog
-aguentam, mas é trade-off consciente — se só interessa breakdown por role,
-remove o label upstream (config do collector).
+`mcp.identity` discriminates per authenticated subject. If your subjects
+are per-user UUID JWTs, you'll generate many series. Honeycomb / Tempo /
+Datadog handle it, but it's a deliberate trade-off — if you only care
+about role-level breakdowns, drop the label upstream (in your collector
+config).
 
-## O que NÃO faz
+## What it does NOT do
 
-- **Sem Sentry / panic tracking.** Erros viram `mcp.status=error` no span.
-  Sentry vai em issue separada.
-- **Sem profiling contínuo.**
-- **Sem OTLP logs signal.** Audit fica em chrondb (`mcp logs`); log
-  estruturado continua em stderr controlado por `MCP_LOG_LEVEL` /
-  `MCP_LOG_FORMAT`.
+- **No Sentry / panic tracking.** Errors flow as `mcp.status=error` on
+  the span. Sentry is tracked in a separate issue.
+- **No continuous profiling.**
+- **No OTLP logs signal.** The audit trail stays in chrondb (`mcp logs`);
+  the structured log keeps going to stderr, controlled by `MCP_LOG_LEVEL`
+  / `MCP_LOG_FORMAT`.
 
 ## Troubleshooting
 
-Se algo deu ruim, [o quickstart](../howto/observability-quickstart.md#troubleshooting)
-tem checklist mais completo. Resumo:
+If something went wrong, [the quickstart](../howto/observability-quickstart.md#troubleshooting)
+has a longer checklist. In short:
 
-- **Sem `[telemetry] OpenTelemetry initialized` no stderr** = env var não foi
-  lido. Confere `OTEL_EXPORTER_OTLP_ENDPOINT`.
-- **Inicializou mas nada chega** = endpoint errado, firewall, ou vendor que só
-  aceita HTTP (`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`).
-- **`traceparent` não chega no backend** = telemetria não inicializou OU
-  `MCP_OTEL_INJECT_TRACEPARENT=0` está setado.
+- **No `[telemetry] OpenTelemetry initialized` on stderr** = the env var
+  wasn't read. Check `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- **It initialized but nothing arrives** = wrong endpoint, firewall, or
+  a vendor that only accepts HTTP (`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`).
+- **`traceparent` not reaching the backend** = either telemetry didn't
+  initialize, or `MCP_OTEL_INJECT_TRACEPARENT=0` is set.
