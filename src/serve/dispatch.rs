@@ -28,6 +28,24 @@ enum DiscoveryAction {
 /// backends run fully in parallel, and many concurrent calls to the same
 /// backend share the same `Arc<McpClient>` (whose transport multiplexes
 /// internally where possible).
+///
+/// The `#[tracing::instrument]` here is the OTel root span for every
+/// proxied request. Empty fields are filled in via `Span::record` once the
+/// tool/server are resolved or once the response is built — using
+/// `tracing::field::Empty` avoids any allocation when telemetry is off.
+#[tracing::instrument(
+    name = "mcp.request",
+    skip_all,
+    fields(
+        otel.kind = "server",
+        mcp.method = %req.method,
+        mcp.transport = %source,
+        mcp.identity = %identity.subject,
+        mcp.server = tracing::field::Empty,
+        mcp.tool = tracing::field::Empty,
+        mcp.status = tracing::field::Empty,
+    )
+)]
 pub(crate) async fn dispatch_request(
     proxy: &SharedProxy,
     req: JsonRpcRequest,
@@ -167,6 +185,12 @@ pub(crate) async fn dispatch_request(
                         // namespaced tool resolves to a real backend.
                         tool_name_for_audit = Some(format!("{server}{SEPARATOR}{orig}"));
                         server_name_for_audit = Some(server.clone());
+                        // Fill the OTel span attributes now that resolution
+                        // succeeded — Empty fields are no-ops when telemetry
+                        // is off, so this is safe to do unconditionally.
+                        let span = tracing::Span::current();
+                        span.record("mcp.server", server.as_str());
+                        span.record("mcp.tool", orig.as_str());
                         Ok((server, orig, args, client, decision))
                     }
                     Err((maybe_decision, resp)) => {
@@ -620,6 +644,36 @@ pub(crate) struct AuditCtx<'a> {
 }
 
 pub(crate) fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> JsonRpcResponse {
+    // Record the final OTel status on the root span. No-op when the field
+    // wasn't declared (i.e. caller wasn't instrumented) or telemetry is off.
+    let status = if response.error.is_none() {
+        "ok"
+    } else {
+        "error"
+    };
+    tracing::Span::current().record("mcp.status", status);
+
+    let duration_ms = ctx.start.elapsed().as_millis() as u64;
+
+    // OTel metrics — emit when an exporter was wired. Reuse the same
+    // `duration_ms` the audit path computes, so we never measure twice.
+    if let Some(metrics) = crate::telemetry::metrics() {
+        let mut labels = vec![
+            opentelemetry::KeyValue::new("mcp.method", ctx.method.clone()),
+            opentelemetry::KeyValue::new("mcp.transport", ctx.source.to_string()),
+            opentelemetry::KeyValue::new("mcp.status", status.to_string()),
+            opentelemetry::KeyValue::new("mcp.identity", ctx.identity.subject.clone()),
+        ];
+        if let Some(server) = ctx.server_name.as_ref() {
+            labels.push(opentelemetry::KeyValue::new("mcp.server", server.clone()));
+        }
+        if let Some(tool) = ctx.tool_name.as_ref() {
+            labels.push(opentelemetry::KeyValue::new("mcp.tool", tool.clone()));
+        }
+        metrics.requests.add(1, &labels);
+        metrics.request_duration.record(duration_ms as f64, &labels);
+    }
+
     let (acl_decision, acl_matched_rule, acl_access_kind, cls_kind, cls_source, cls_conf) =
         match &ctx.decision {
             Some(d) => (
@@ -640,7 +694,7 @@ pub(crate) fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> Json
         tool_name: ctx.tool_name,
         server_name: ctx.server_name,
         identity: ctx.identity.subject.clone(),
-        duration_ms: ctx.start.elapsed().as_millis() as u64,
+        duration_ms,
         success: response.error.is_none(),
         error_message: response.error.as_ref().map(|e| e.message.clone()),
         arguments: None,

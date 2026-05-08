@@ -19,6 +19,7 @@
 * [CLI as MCP](guides/cli-as-mcp.md)
 * [Proxy mode](guides/proxy-mode.md)
 * [Audit logging](guides/audit-logging.md)
+* [Observability](guides/observability.md)
 * [Enterprise token management](guides/enterprise-token-management.md)
 
 ## How-to
@@ -26,6 +27,7 @@
 * [Docker](howto/docker.md)
 * [Kubernetes](howto/kubernetes.md)
 * [OAuth Authorization Server (Claude.ai, ChatGPT, Cursor)](howto/oauth-as.md)
+* [Observability quickstart (Jaeger + OTel collector)](howto/observability-quickstart.md)
 * [Supported services](howto/services.md)
 * [Troubleshooting](howto/troubleshooting.md)
 

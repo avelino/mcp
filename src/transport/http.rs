@@ -92,6 +92,14 @@ impl HttpTransport {
             req = req.header("Mcp-Session-Id", session_id);
         }
 
+        // W3C traceparent/tracestate so the upstream MCP backend can
+        // continue the trace. Empty when telemetry is off — zero overhead.
+        let mut otel_headers = HashMap::<String, String>::new();
+        crate::telemetry::inject_traceparent(&mut otel_headers);
+        for (k, v) in otel_headers {
+            req = req.header(k, v);
+        }
+
         req.body(body.to_string())
     }
 

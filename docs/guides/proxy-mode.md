@@ -717,6 +717,14 @@ All standard `mcp` env vars apply:
 
 See [environment variables reference](../reference/environment-variables.md) for full details.
 
+## Observability (OpenTelemetry)
+
+`mcp serve` natively emits **traces** and **metrics** via OTLP when
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set. Default-off; standard OTel env
+vars only. See [observability guide](./observability.md) for span
+attributes, metrics list, Honeycomb / Tempo / collector recipes, and
+escape hatches for production rollback.
+
 ## When to use each mode
 
 | Scenario | Mode |
