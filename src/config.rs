@@ -355,7 +355,8 @@ fn parse_config_content(content: &str, source: PathBuf) -> Result<Config> {
             map.iter()
                 .map(|(name, val)| {
                     let json = serde_json::to_string(val).unwrap_or_default();
-                    let hash = format!("{:x}", Sha256::digest(json.as_bytes()));
+                    let digest = Sha256::digest(json.as_bytes());
+                    let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
                     (name.clone(), hash)
                 })
                 .collect()
