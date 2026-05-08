@@ -1,22 +1,23 @@
-# Quickstart — OpenTelemetry no `mcp serve`
+# Quickstart — OpenTelemetry on `mcp serve`
 
-Tutorial copy-paste pra subir traces + metrics em ~3 minutos. Roda local
-com Jaeger (UI bonita) e depois mostra como ver métricas com OTel
-Collector. No final tem o teste de regressão (default-off).
+Copy-paste tutorial to bring up traces + metrics in ~3 minutes. Runs
+locally with Jaeger (nice UI) and then shows how to inspect metrics
+with the OTel Collector. Ends with the regression test (default-off).
 
-Pré-requisito: Docker + `mcp` 0.6.0+ (`mcp --version`).
+Prerequisites: Docker + a build of `mcp` that includes native OTel
+support (any post-OpenTelemetry release; check `mcp --version`).
 
-> Por que rodar isso? Antes de plugar `mcp serve` num Honeycomb /
-> Datadog / Tempo de produção, você quer **provar local** que o trace
-> tá fluindo, que o `traceparent` propaga, e que sem env var nada
-> muda. Esse passo a passo prova as três coisas.
+> Why bother running this? Before pointing `mcp serve` at a production
+> Honeycomb / Datadog / Tempo, you want to **prove locally** that the
+> trace flows, that `traceparent` propagates, and that without the env
+> var nothing changes. This walkthrough proves all three.
 
 ---
 
-## 1. Sobe Jaeger
+## 1. Start Jaeger
 
-Jaeger v2 já fala OTLP nativo (gRPC em `:4317`, HTTP em `:4318`) e tem
-UI em `:16686`. Um container só:
+Jaeger v2 speaks OTLP natively (gRPC on `:4317`, HTTP on `:4318`) and
+ships a UI on `:16686`. One container does it:
 
 ```bash
 docker run -d --rm --name mcp-jaeger \
@@ -24,7 +25,7 @@ docker run -d --rm --name mcp-jaeger \
   jaegertracing/jaeger:latest
 ```
 
-Espera ficar de pé:
+Wait until it's up:
 
 ```bash
 until curl -fsS http://127.0.0.1:16686/api/services >/dev/null; do sleep 1; done
@@ -35,10 +36,11 @@ UI: <http://localhost:16686>.
 
 ---
 
-## 2. Sobe `mcp serve` com OTel ligado
+## 2. Start `mcp serve` with OTel enabled
 
-Aponta pra Jaeger HTTP (porta 4318). `OTEL_EXPORTER_OTLP_ENDPOINT` é o
-**único** ativador — qualquer outro env var abaixo é opcional:
+Point it at Jaeger's HTTP receiver (port 4318).
+`OTEL_EXPORTER_OTLP_ENDPOINT` is the **sole** activator — every other
+env var below is optional:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
@@ -47,24 +49,24 @@ OTEL_SERVICE_NAME=mcp-local \
 mcp serve --http 127.0.0.1:7331
 ```
 
-No stderr, **a primeira linha** tem que ser:
+On stderr, **the very first line** must be:
 
 ```
 [telemetry] OpenTelemetry initialized — endpoint=http://127.0.0.1:4318 protocol=HttpProto
 ```
 
-> Sem essa linha = OTel **não** subiu. Confere o env var.
+> Without that line, OTel did **not** start. Double-check the env var.
 
-Deixa rodando.
+Leave it running.
 
 ---
 
-## 3. Dispara requests
+## 3. Fire some requests
 
-Em outro terminal, dispara umas chamadas:
+In another terminal:
 
 ```bash
-# tools/list — span sem mcp.tool/mcp.server (não resolve em backend)
+# tools/list — span without mcp.tool/mcp.server (no backend resolved)
 for i in 1 2 3; do
   curl -s -X POST http://127.0.0.1:7331/mcp \
     -H 'Content-Type: application/json' \
@@ -72,8 +74,8 @@ for i in 1 2 3; do
     -o /dev/null -w "tools/list $i: %{http_code}\n"
 done
 
-# tools/call — span com mcp.tool e mcp.server resolvidos
-# (troca filesystem__list_allowed_directories por algum tool seu)
+# tools/call — span with mcp.tool and mcp.server resolved
+# (replace filesystem__list_allowed_directories with one of your own tools)
 curl -s -X POST http://127.0.0.1:7331/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":99,"method":"tools/call",
@@ -81,7 +83,7 @@ curl -s -X POST http://127.0.0.1:7331/mcp \
   -o /dev/null -w "tools/call: %{http_code}\n"
 ```
 
-Aguarda o batch flushar (default ~5s):
+Wait for the batch to flush (default ~5s):
 
 ```bash
 sleep 8
@@ -89,31 +91,31 @@ sleep 8
 
 ---
 
-## 4. Vê os spans no Jaeger
+## 4. Inspect the spans in Jaeger
 
-Abre <http://localhost:16686>:
+Open <http://localhost:16686>:
 
-1. **Service:** escolhe `mcp-local`
+1. **Service:** pick `mcp-local`
 2. **Operation:** `mcp.request`
 3. Click **Find Traces**
 
-Aparecem N traces, cada um com 1 span `mcp.request`. Click em qualquer
-um — em **Tags** você vê:
+You'll see N traces, each with one `mcp.request` span. Click any of
+them — under **Tags** you should find:
 
 ```
 otel.kind       = server
-mcp.method      = tools/list (ou tools/call)
+mcp.method      = tools/list (or tools/call)
 mcp.transport   = serve:http
 mcp.identity    = anonymous
 mcp.status      = ok
-mcp.server      = filesystem      ← só nos tools/call resolvidos
+mcp.server      = filesystem      ← only on resolved tools/call
 mcp.tool        = list_allowed_directories
 ```
 
-A duração do span é o tempo total que o `dispatch_request` levou —
-inclui ACL, lock do proxy, conexão com backend e o backend call em si.
+Span duration is the total time `dispatch_request` took — includes ACL,
+the proxy lock, backend connection, and the backend call itself.
 
-### Sanity check via API (sem clicar)
+### Sanity check via API (no clicking)
 
 ```bash
 curl -s "http://127.0.0.1:16686/api/traces?service=mcp-local&limit=3" \
@@ -129,14 +131,14 @@ for t in json.load(sys.stdin)["data"]:
 
 ---
 
-## 5. Testa parent context (`traceparent` inbound)
+## 5. Test parent context (inbound `traceparent`)
 
-Quando o cliente é OTel-aware (Claude.ai, gateway instrumentado, OTel
-SDK), ele manda `traceparent` no header. O `mcp serve` deve **continuar
-o trace** — span dele vira filho do span do cliente, não cria trace
-novo.
+When the client is OTel-aware (Claude.ai, an instrumented gateway, an
+OTel SDK), it sends `traceparent` in the headers. `mcp serve` should
+**continue the trace** — its span becomes a child of the client's
+span instead of starting a new trace.
 
-Manda um `traceparent` fake e confere stitching:
+Send a fake `traceparent` and check stitching:
 
 ```bash
 TRACEPARENT='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'
@@ -149,13 +151,13 @@ curl -s -X POST http://127.0.0.1:7331/mcp \
 
 sleep 5
 
-# Pega o trace pelo traceID que injetamos
+# Pull the trace by the traceID we injected
 curl -s "http://127.0.0.1:16686/api/traces/0af7651916cd43dd8448eb211c80319c" \
   | python3 -c '
 import json, sys
 data = json.load(sys.stdin)["data"]
 if not data:
-    print("FAIL: parent context não funcionou")
+    print("FAIL: parent context did not work")
 else:
     for s in data[0]["spans"]:
         refs = s.get("references", [])
@@ -164,21 +166,21 @@ else:
 '
 ```
 
-Saída esperada:
+Expected output:
 
 ```
   span mcp.request parent=b7ad6b7169203331
 ```
 
-`parent=b7ad6b7169203331` confirma que o span do `mcp.request` virou
-filho do span que mandamos no `traceparent`. Trace stitching ✓.
+`parent=b7ad6b7169203331` confirms the `mcp.request` span became a child
+of the span we sent in `traceparent`. Trace stitching ✓.
 
 ---
 
-## 6. Vê as métricas
+## 6. Inspect the metrics
 
-Jaeger v2 só guarda traces. Pra ver counter/histogram/gauge, troca por
-um OTel Collector com debug exporter:
+Jaeger v2 only stores traces. To see counters / histograms / gauges,
+swap it out for an OTel Collector with a debug exporter:
 
 ```bash
 docker stop mcp-jaeger
@@ -204,23 +206,23 @@ docker run -d --rm --name mcp-otelcol \
   otel/opentelemetry-collector-contrib:latest
 ```
 
-Continua disparando requests no `mcp serve`. **Importante:** o
-PeriodicReader exporta métricas a cada 60s (default OTel SDK), então
-**aguarda ~65 segundos** depois do primeiro request.
+Keep firing requests at `mcp serve`. **Important:** the PeriodicReader
+exports metrics every 60s (OTel SDK default), so **wait ~65 seconds**
+after the first request.
 
-Depois de 65s:
+After 65s:
 
 ```bash
 docker logs mcp-otelcol 2>&1 | grep -E "Name:|Value:|mcp\." | head -40
 ```
 
-Saída esperada:
+Expected output:
 
 ```
      -> Name: mcp.proxy.requests
      -> mcp.method: Str(tools/call)
      -> mcp.server: Str(filesystem)
-     -> mcp.tool: Str(filesystem__list_allowed_directories)
+     -> mcp.tool: Str(list_allowed_directories)
 Value: 6
      -> Name: mcp.proxy.classifier.cache.hits
      -> mcp.server: Str(filesystem)
@@ -231,35 +233,36 @@ Value: 6
 Value: 0
 ```
 
-> Métricas que a `mcp` emite, em uma frase:
-> - `mcp.proxy.requests` (counter) e `mcp.proxy.request.duration` (histogram, ms) — uma por request, com labels `method/server/tool/status/transport/identity`
-> - `mcp.proxy.classifier.cache.hits/misses` por server
-> - `mcp.proxy.backends.connected` e `mcp.proxy.sessions.active` (gauges) atualizados a cada export
+> The metrics `mcp` emits, in one line:
+> - `mcp.proxy.requests` (counter) and `mcp.proxy.request.duration` (histogram, ms) — one per request, with labels `method/server/tool/status/transport/identity`
+> - `mcp.proxy.classifier.cache.hits/misses` per server
+> - `mcp.proxy.backends.connected` and `mcp.proxy.sessions.active` (gauges) refreshed at every export
 
 ---
 
-## 7. Teste de regressão — sem OTel = comportamento 0.5.2
+## 7. Regression test — no OTel = 0.5.2 behavior
 
-Esse é o passo que **prova que sua versão atual em produção não
-quebra**. Mata o serve atual e religa **sem nenhuma env var OTel**:
+This is the step that **proves your current production version won't
+break**. Kill the running `mcp serve` and bring it back up **without
+any OTel env var**:
 
 ```bash
-# em outro terminal
+# from another terminal
 pkill -f "mcp serve"
 sleep 1
 
 mcp serve --http 127.0.0.1:7331
 ```
 
-No stderr você **não pode ver** a linha `[telemetry] OpenTelemetry
-initialized`. Boot tem que abrir igualzinho à 0.5.2:
+On stderr you **must not** see `[telemetry] OpenTelemetry initialized`.
+Boot should look exactly like 0.5.2:
 
 ```
 INFO database opened idle_timeout=120s
 INFO HTTP server listening addr=127.0.0.1:7331
 ```
 
-`tools/list` continua respondendo:
+`tools/list` keeps responding:
 
 ```bash
 curl -s -X POST http://127.0.0.1:7331/mcp \
@@ -269,10 +272,9 @@ curl -s -X POST http://127.0.0.1:7331/mcp \
 # no-otel HTTP 200
 ```
 
-Esse é o **fail-safe**: se o OTel der pau em produção, basta
-**unset** do `OTEL_EXPORTER_OTLP_ENDPOINT` no deploy e o sistema
-volta exatamente ao comportamento anterior. Sem rebuild, sem
-rollback de imagem.
+This is the **fail-safe**: if OTel ever goes wrong in production, just
+**unset** `OTEL_EXPORTER_OTLP_ENDPOINT` in the deploy and the system
+reverts to the previous behavior. No rebuild, no image rollback.
 
 ---
 
@@ -286,45 +288,43 @@ rm -f /tmp/otel-debug.yaml
 
 ---
 
-## Próximos passos
+## Next steps
 
-- Em produção, troca o endpoint pra Honeycomb / Tempo / Datadog —
-  exemplos no [guia conceitual de observability](../guides/observability.md).
-- Se um backend MCP rejeitar `traceparent` (raro, é header W3C
-  padrão), ative o escape hatch sem mexer no resto:
+- In production, swap the endpoint for Honeycomb / Tempo / Datadog —
+  examples in the [observability reference guide](../guides/observability.md).
+- If a backend MCP rejects `traceparent` (rare, it's a W3C standard
+  header), enable the escape hatch without touching anything else:
   `MCP_OTEL_INJECT_TRACEPARENT=0`.
-- Sampling fica do lado do exporter — `mcp serve` sempre cria o span;
-  Honeycomb/Tempo/seu collector decide o que sample. Configure lá, não
-  aqui.
+- Sampling lives at the exporter side — `mcp serve` always creates the
+  span; Honeycomb / Tempo / your collector decides what to keep.
+  Configure it there, not here.
 
 ## Troubleshooting
 
-**Não aparece nada no Jaeger nem nos logs do collector.**
-Confere a primeira linha do stderr do `mcp serve` — se não tem
-`[telemetry] OpenTelemetry initialized`, o env var não foi lido. A
-linha sai **direto pra stderr**, antes do logging subscriber, **não**
-respeita `MCP_LOG_LEVEL`.
+**Nothing shows up in Jaeger or in the collector logs.** Check the very
+first line of `mcp serve` stderr — if `[telemetry] OpenTelemetry
+initialized` is missing, the env var wasn't read. The line goes
+**straight to stderr**, before the logging subscriber wires up, and
+**does not** respect `MCP_LOG_LEVEL`.
 
-**Saiu "OpenTelemetry initialized" mas nada chega no collector.**
-Provavelmente o endpoint está errado. A `mcp` espera o **base URL**
-(ex: `http://host:4318`), não o caminho completo (`/v1/traces`). Mas
-ela aceita ambos. Se você trocou de receiver e não cleanou env var
-antiga, ainda pode estar mandando pro lugar errado.
+**It said "OpenTelemetry initialized" but nothing reaches the
+collector.** Endpoint is probably wrong. `mcp` accepts the **base URL**
+(e.g. `http://host:4318`), not the full path (`/v1/traces`) — but it
+also tolerates a pre-suffixed value. If you swapped receivers and didn't
+clean up the old env var, you might still be sending elsewhere.
 
-**Span sem `mcp.server`/`mcp.tool`.**
-Isso é normal pra `tools/list`, `auth/failure`, métodos
-desconhecidos, ou requests com payload malformado — esses não
-resolvem pra um backend específico. Em `tools/call` resolvido eles
-sempre aparecem.
+**Span without `mcp.server`/`mcp.tool`.** Normal for `tools/list`,
+`auth/failure`, unknown methods, or requests with malformed payloads —
+those don't resolve to a specific backend. On a resolved `tools/call`
+they always show up.
 
-**`tonic` connection refused em endpoint HTTPS.**
-Honeycomb (e alguns outros vendors) **só aceitam HTTP/protobuf** no
-endpoint público. Defina `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`
-e use `https://` no endpoint.
+**`tonic` connection refused on an HTTPS endpoint.** Honeycomb (and a
+few other vendors) **only accept HTTP/protobuf** on the public ingest.
+Set `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` and use `https://` in
+the endpoint.
 
-**Métricas não aparecem mesmo depois de 60s.**
-PeriodicReader é "best-effort": se o processo cair antes do primeiro
-flush, o export some. O `TelemetryGuard` no `Drop` de `main` faz
-shutdown gracioso (que força flush). Em prod isso é coberto pelo
-SIGTERM normal — mas se você der `kill -9` pode perder o último
-batch.
+**Metrics don't show up even after 60s.** PeriodicReader is "best
+effort": if the process dies before the first flush, the export is
+gone. The `TelemetryGuard` in `main`'s `Drop` performs a graceful
+shutdown (which forces a flush). In production this is covered by a
+normal SIGTERM — but a `kill -9` may drop the last batch.

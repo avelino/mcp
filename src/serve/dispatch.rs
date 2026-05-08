@@ -667,8 +667,20 @@ pub(crate) fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> Json
         if let Some(server) = ctx.server_name.as_ref() {
             labels.push(opentelemetry::KeyValue::new("mcp.server", server.clone()));
         }
+        // Audit stores tool_name namespaced (`{server}__{tool}`) on
+        // resolved tools/call so the audit log stays self-contained. For
+        // the metric, strip the server prefix when present so `mcp.tool`
+        // mirrors the span attribute (un-namespaced) and avoids
+        // multiplying cardinality with `mcp.server`.
         if let Some(tool) = ctx.tool_name.as_ref() {
-            labels.push(opentelemetry::KeyValue::new("mcp.tool", tool.clone()));
+            let bare = match ctx.server_name.as_ref() {
+                Some(server) => {
+                    let prefix = format!("{server}{SEPARATOR}");
+                    tool.strip_prefix(&prefix).unwrap_or(tool).to_string()
+                }
+                None => tool.clone(),
+            };
+            labels.push(opentelemetry::KeyValue::new("mcp.tool", bare));
         }
         metrics.requests.add(1, &labels);
         metrics.request_duration.record(duration_ms as f64, &labels);

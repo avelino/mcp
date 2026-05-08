@@ -93,11 +93,15 @@ impl HttpTransport {
         }
 
         // W3C traceparent/tracestate so the upstream MCP backend can
-        // continue the trace. Empty when telemetry is off — zero overhead.
-        let mut otel_headers = HashMap::<String, String>::new();
-        crate::telemetry::inject_traceparent(&mut otel_headers);
-        for (k, v) in otel_headers {
-            req = req.header(k, v);
+        // continue the trace. Skip the allocation entirely when telemetry
+        // is disabled or the operator opted out — this is the proxy's
+        // hottest path.
+        if crate::telemetry::should_inject_traceparent() {
+            let mut otel_headers = HashMap::<String, String>::new();
+            crate::telemetry::inject_traceparent(&mut otel_headers);
+            for (k, v) in otel_headers {
+                req = req.header(k, v);
+            }
         }
 
         req.body(body.to_string())

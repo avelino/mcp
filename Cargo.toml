@@ -63,10 +63,10 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
   "metrics",
   "grpc-tonic",
   "http-proto",
-  "reqwest-client",
-  "reqwest-rustls",
+  # `hyper-client` reuses the hyper 1.x stack axum 0.8 already pulls,
+  # avoiding a second copy of reqwest in the binary.
+  "hyper-client",
 ] }
-opentelemetry-semantic-conventions = "0.31"
 tracing-opentelemetry = "0.32"
 
 [dev-dependencies]
