@@ -633,7 +633,7 @@ mod tests {
             if header.len() < 7 || !header[..7].eq_ignore_ascii_case("bearer ") {
                 bail!("Authorization header must use Bearer scheme");
             }
-            if &header[7..] == self.token {
+            if header[7..] == self.token {
                 Ok(self.identity.clone())
             } else {
                 bail!("invalid token (stub)")
