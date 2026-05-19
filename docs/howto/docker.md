@@ -178,7 +178,7 @@ These variables are especially useful for container deployments. See the full li
 | `MCP_LOG_LEVEL` | `info` | Log verbosity: `trace`, `debug`, `info`, `warn`, `error` |
 | `MCP_LOG_FORMAT` | `text` | Log format: `text` or `json` (structured, for log drivers) |
 | `MCP_AUDIT_ENABLED` | `false` (in Docker image) | Disable audit for read-only fs |
-| `MCP_AUDIT_OUTPUT` | `file+stdout` | `stdout`/`stderr` for log driver only, `file` for ChronDB only, `file+stdout`/`file+stderr` (default) for both, `none` to disable |
+| `MCP_AUDIT_OUTPUT` | `file` (auto-promoted to `file+stdout` in `mcp serve --http`) | `stdout`/`stderr` for log driver only, `file` for ChronDB only (skips auto-promotion in serve), `file+stdout`/`file+stderr` for both, `none` to disable |
 | `MCP_AUDIT_PATH` | `~/.config/mcp/db/data` | Override audit data path |
 | `MCP_AUDIT_INDEX_PATH` | `~/.config/mcp/db/index` | Override audit index path |
 | `MCP_AUTH_CONFIG` | — | Inline `auth.json` content (read-only, writes are no-ops). Same idea as `MCP_SERVERS_CONFIG`. |

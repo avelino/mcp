@@ -132,7 +132,7 @@ fn validate_bind_addr(addr: &str, insecure: bool) -> Result<std::net::SocketAddr
     Ok(sock_addr)
 }
 
-pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result<()> {
+pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Result<()> {
     let sock_addr = validate_bind_addr(bind_addr, insecure)?;
 
     // OAuth AS state — only allocated when the operator opted in via
@@ -150,6 +150,14 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
 
     let auth_provider = server_auth::build_auth_provider(&config.server_auth, as_state.as_ref())?;
     let acl = config.server_auth.acl.clone();
+
+    // Serve-mode default promotion: `File` is upgraded to `FileAndStdout`
+    // so audit entries also stream to stdout for the container log
+    // driver. Explicit user choices (config or env) are preserved.
+    config.audit.output = config
+        .audit
+        .output
+        .promote_for_serve(crate::audit::ServeContext::Http);
 
     let pool = if config.audit.output.writes_to_file() {
         crate::db::create_pool(&config.audit).unwrap_or_else(|e| {

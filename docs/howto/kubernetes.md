@@ -184,7 +184,7 @@ kubectl -n mcp logs deploy/mcp-proxy -f
 kubectl -n mcp logs deploy/mcp-proxy -f | jq -c 'select(.level=="ERROR")'
 ```
 
-> **Why stderr, not stdout, for app logs?** Audit logs go to **stdout** by default (`MCP_AUDIT_OUTPUT=file+stdout`) and they're the structured product surface. Application/tracing logs go to **stderr** as the diagnostic surface. Kubernetes captures both in the same `kubectl logs` stream by default — split them downstream with `jq` (audit lines have `method`/`identity`; tracing lines have `level`/`target`).
+> **Why stderr, not stdout, for app logs?** In `mcp serve`, audit logs go to **stdout** by default (auto-promotion of `file` to `file+stdout`) and they're the structured product surface. Application/tracing logs go to **stderr** as the diagnostic surface. Kubernetes captures both in the same `kubectl logs` stream by default — split them downstream with `jq` (audit lines have `method`/`identity`; tracing lines have `level`/`target`).
 
 ## Audit logging
 
@@ -194,7 +194,7 @@ By default, audit logging is disabled (`MCP_AUDIT_ENABLED=false`) because the sc
 
 Set `MCP_AUDIT_OUTPUT=stdout` in the Deployment env. Audit entries are emitted as JSON lines to stdout and captured by your cluster's log pipeline (Fluentd, Loki, CloudWatch, etc.). No persistent storage required.
 
-> If you want **both** PVC persistence (queryable via `mcp logs` in `kubectl exec`) and the cluster log pipeline, use `MCP_AUDIT_OUTPUT=file+stdout` (this is the application default — you only need to set it if your config or other env overrides it).
+> If you want **both** PVC persistence (queryable via `mcp logs` in `kubectl exec`) and the cluster log pipeline, leave `MCP_AUDIT_OUTPUT` unset — `mcp serve --http` auto-promotes the default `file` to `file+stdout` for exactly this case. Setting `MCP_AUDIT_OUTPUT=file+stdout` explicitly also works (and is honored verbatim).
 
 **Option B: Persist to a PVC**
 
@@ -282,7 +282,7 @@ When Kubernetes sends `SIGTERM` (during rolling updates or scale-down):
 | `MCP_LOG_LEVEL` | `info` | `tracing` `EnvFilter` (e.g. `mcp=debug,hyper=warn,reqwest=warn,h2=warn`) |
 | `MCP_LOG_FORMAT` | `text` | `json` for newline-delimited JSON to stderr (log drivers) |
 | `MCP_AUDIT_ENABLED` | `false` | Enable audit logging |
-| `MCP_AUDIT_OUTPUT` | `file+stdout` | `stdout` for cluster log pipeline only, `file` for PVC only, `file+stdout` (default) for both PVC and pipeline, `none` to disable |
+| `MCP_AUDIT_OUTPUT` | `file` (auto-promoted to `file+stdout` in `mcp serve --http`) | `stdout` for cluster log pipeline only, `file` for PVC only (skips auto-promotion), `file+stdout` for both PVC and pipeline (the auto-promoted default in serve), `none` to disable |
 | `MCP_AUDIT_PATH` | `/data/audit/data` | Audit data directory (app default: `~/.config/mcp/db/data`) |
 | `MCP_AUDIT_INDEX_PATH` | `/data/audit/index` | Audit index directory (app default: `~/.config/mcp/db/index`) |
 | `MCP_CLASSIFIER_CACHE` | `/tmp/tool-classification.json` | Tool classification cache (app default: `~/.config/mcp/tool-classification.json`) |

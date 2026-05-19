@@ -426,18 +426,10 @@ fn apply_audit_env_overrides(mut audit: AuditConfig) -> AuditConfig {
         }
     }
     if let Some(v) = non_empty_env("MCP_AUDIT_OUTPUT") {
-        match v.to_lowercase().as_str() {
-            "file" => audit.output = crate::audit::AuditOutput::File,
-            "stdout" => audit.output = crate::audit::AuditOutput::Stdout,
-            "stderr" => audit.output = crate::audit::AuditOutput::Stderr,
-            "none" => audit.output = crate::audit::AuditOutput::None,
-            "file+stdout" | "stdout+file" => {
-                audit.output = crate::audit::AuditOutput::FileAndStdout
-            }
-            "file+stderr" | "stderr+file" => {
-                audit.output = crate::audit::AuditOutput::FileAndStderr
-            }
-            _ => {}
+        // Single source of truth: `AuditOutput::from_str`. Ignored when
+        // the value is unrecognized (keeps the config-file value).
+        if let Ok(o) = v.parse::<crate::audit::AuditOutput>() {
+            audit.output = o;
         }
     }
     if let Some(v) = non_empty_env("MCP_AUDIT_PATH") {

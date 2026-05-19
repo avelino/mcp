@@ -157,7 +157,7 @@ Add an `audit` section to `~/.config/mcp/servers.json`:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable/disable audit logging |
-| `output` | `file+stdout` | Output destination: `file` (ChronDB, queryable), `stdout`, `stderr` (JSON lines), `file+stdout`, `file+stderr` (ChronDB **and** JSON lines), or `none`. Default mirrors every audit entry on stdout so it's visible in `docker logs`/`kubectl logs` without an extra command, while still persisting to ChronDB for `mcp logs` queries. |
+| `output` | `file` (global), auto-promoted in `mcp serve` to `file+stdout` (HTTP) or `file+stderr` (stdio) | Output destination: `file` (ChronDB, queryable), `stdout`, `stderr` (JSON lines), `file+stdout`, `file+stderr` (ChronDB **and** JSON lines), or `none`. The global default stays `file` so CLI subcommands (`mcp roam ...`, `mcp gh ...`) keep stdout clean for their results. `mcp serve` upgrades the default to a dual-sink mode so audit is visible in `docker logs`/`kubectl logs` without an extra command, while still persisting to ChronDB for `mcp logs` queries. Explicit user values are preserved as-is. |
 | `log_arguments` | `false` | Log tool call arguments (may contain PII) |
 | `path` | `~/.config/mcp/audit/data` | ChronDB data directory |
 | `index_path` | `~/.config/mcp/audit/index` | ChronDB index directory |
@@ -219,7 +219,16 @@ When disabled, the logger is a no-op and the database is not initialized — zer
 
 ## Output destinations
 
-The `output` field controls where audit entries go. The **default is `file+stdout`** — entries are persisted to ChronDB **and** mirrored as JSON lines on stdout, so you can query them with `mcp logs` *and* see them live in your terminal / container log driver without an extra command.
+The `output` field controls where audit entries go.
+
+The **global default is `file`** — entries are persisted to ChronDB and the CLI stays silent on stdout (so `mcp roam ... | jq` and similar pipelines aren't corrupted by audit JSON interleaved with command output).
+
+In **`mcp serve` only**, the default is auto-promoted:
+
+- **HTTP transport** (`mcp serve --http ...`): `file` → `file+stdout`. Audit is mirrored on stdout so it's visible in `docker logs`/`kubectl logs` without an extra command, while still persisting to ChronDB for `mcp logs` queries.
+- **Stdio transport** (`mcp serve`): `file` → `file+stderr`. Stdout in stdio mode is the JSON-RPC channel, so the mirror goes to stderr instead.
+
+Any explicit value in the config file or `MCP_AUDIT_OUTPUT` env var **bypasses** the auto-promotion — your choice is respected.
 
 Each stdout/stderr line is a complete `AuditEntry` JSON object:
 
@@ -233,14 +242,14 @@ The mirror is emitted **before** the ChronDB write, so entries stay visible even
 
 | `output` | ChronDB | stdout | stderr | `mcp logs` |
 |---|---|---|---|---|
-| `file+stdout` (**default**) | ✅ | ✅ | — | ✅ |
-| `file+stderr` | ✅ | — | ✅ | ✅ |
-| `file` | ✅ | — | — | ✅ |
+| `file` (**global default**) | ✅ | — | — | ✅ |
+| `file+stdout` (auto in `mcp serve --http`) | ✅ | ✅ | — | ✅ |
+| `file+stderr` (auto in `mcp serve` stdio) | ✅ | — | ✅ | ✅ |
 | `stdout` | — | ✅ | — | — |
 | `stderr` | — | — | ✅ | — |
 | `none` | — | — | — | — |
 
-Pick `file` if you don't want the stdout noise (e.g. quiet CLI usage). Pick `stdout`/`stderr` only when you can't persist (read-only filesystem, ephemeral containers without a volume). Pick `file+stderr` if your transport is `stdio` — see below.
+Pick `file` explicitly if you want chrondb-only **even in `mcp serve`** (an explicit value skips the auto-promotion). Pick `stdout`/`stderr` only when you can't persist (read-only filesystem, ephemeral containers without a volume). Pick `file+stderr` if your transport is `stdio` or you want to keep stdout reserved for application output.
 
 ```bash
 MCP_AUDIT_OUTPUT=file mcp serve --http 0.0.0.0:8080
@@ -252,7 +261,7 @@ MCP_AUDIT_OUTPUT=file mcp serve --http 0.0.0.0:8080
 
 When using `stdout` or `stderr` alone (without `file`), `mcp logs` queries are not available — there's no database to query. Use your log aggregation pipeline instead.
 
-> **stdio transport caveat**: in `mcp serve` without `--http` (stdio mode), stdout is the JSON-RPC channel. The default `file+stdout` is automatically rewritten to `file+stderr` to avoid interleaving. Same rule applies to plain `stdout` → `stderr`.
+> **stdio transport caveat**: in `mcp serve` without `--http` (stdio mode), stdout is the JSON-RPC channel. The default auto-promotion picks `file+stderr`. If the user explicitly picks `stdout` or `file+stdout`, it's rewritten to the stderr variant with a warning.
 
 Set `output` to `none` to disable audit entirely without touching the `enabled` flag.
 

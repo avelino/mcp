@@ -2,19 +2,49 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 use std::sync::Arc;
 
 use crate::db::DbPool;
+
+/// Write one newline-delimited line to any `Write` implementation, with
+/// an explicit flush. Pulled out so the buffering behaviour can be
+/// exercised by unit tests against an in-memory `Vec<u8>` (the real
+/// callers below lock stdout/stderr, which can't be captured cleanly
+/// inside the test process).
+fn write_line_to<W: Write>(line: &str, w: &mut W) -> std::io::Result<()> {
+    writeln!(w, "{line}")?;
+    w.flush()
+}
+
+/// Emit one newline-delimited JSON line on stdout or stderr with an
+/// explicit lock + flush. `println!`/`eprintln!` are block-buffered
+/// when the destination is a pipe (typical in containers), so audit
+/// entries can stall in the buffer. Flushing makes them visible to
+/// log drivers in real time.
+fn write_mirror_line(line: &str, use_stderr: bool) {
+    if use_stderr {
+        let stderr = std::io::stderr();
+        let _ = write_line_to(line, &mut stderr.lock());
+    } else {
+        let stdout = std::io::stdout();
+        let _ = write_line_to(line, &mut stdout.lock());
+    }
+}
 
 fn default_true() -> bool {
     true
 }
 
 fn default_output() -> AuditOutput {
-    // Default is dual-sink: persist to chrondb (queryable via `mcp logs`)
-    // AND mirror each entry as JSON on stdout so it's visible in the
-    // container log driver / terminal without an extra command.
-    AuditOutput::FileAndStdout
+    // Global default is `File` (chrondb-only, silent on stdout). CLI
+    // subcommands like `mcp roam get_daily_note` emit their result on
+    // stdout — emitting audit JSON on the same stream would corrupt
+    // pipelines (`mcp ... | jq`). `mcp serve` upgrades this to
+    // `FileAndStdout`/`FileAndStderr` via `AuditOutput::promote_for_serve`
+    // so audit is visible in the container log driver without an extra
+    // command.
+    AuditOutput::File
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -35,11 +65,61 @@ pub enum AuditOutput {
     FileAndStderr,
 }
 
+/// Discriminates the two transports `mcp serve` can run as. Drives the
+/// auto-promotion rule in [`AuditOutput::promote_for_serve`]: HTTP mode
+/// mirrors to stdout; stdio mode mirrors to stderr because stdout is
+/// the JSON-RPC channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeContext {
+    Http,
+    Stdio,
+}
+
 impl AuditOutput {
     /// Whether this mode persists entries to the chrondb store.
     /// Used by call-sites that decide whether to allocate the DbPool.
     pub fn writes_to_file(&self) -> bool {
         matches!(self, Self::File | Self::FileAndStdout | Self::FileAndStderr)
+    }
+
+    /// Apply the serve-mode default promotion rule. In `mcp serve`,
+    /// the default `File` is upgraded so audit entries are visible in
+    /// the container log driver without running `mcp logs` in a second
+    /// shell. Any non-`File` value is respected as-is so explicit user
+    /// choices (config or `MCP_AUDIT_OUTPUT`) are not overwritten.
+    ///
+    /// HTTP transport promotes to `FileAndStdout`. Stdio transport
+    /// promotes to `FileAndStderr` because stdout carries the JSON-RPC
+    /// channel and must stay clean.
+    pub fn promote_for_serve(self, ctx: ServeContext) -> Self {
+        match (self, ctx) {
+            (Self::File, ServeContext::Http) => Self::FileAndStdout,
+            (Self::File, ServeContext::Stdio) => Self::FileAndStderr,
+            (other, _) => other,
+        }
+    }
+}
+
+/// Parse audit output mode from a string. Case-insensitive. Accepts the
+/// serde representations plus a swapped form for the combined modes
+/// (`stdout+file` / `stderr+file`) so users don't trip on order.
+///
+/// Single source of truth for env-var parsing — `AuditLogger::open` and
+/// `config::apply_audit_env_overrides` both delegate to this so the
+/// accepted vocabulary cannot drift.
+impl std::str::FromStr for AuditOutput {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "file" => Ok(Self::File),
+            "stdout" => Ok(Self::Stdout),
+            "stderr" => Ok(Self::Stderr),
+            "none" => Ok(Self::None),
+            "file+stdout" | "stdout+file" => Ok(Self::FileAndStdout),
+            "file+stderr" | "stderr+file" => Ok(Self::FileAndStderr),
+            other => Err(format!("unknown audit output mode: {other}")),
+        }
     }
 }
 
@@ -62,7 +142,7 @@ impl Default for AuditConfig {
             path: None,
             index_path: None,
             log_arguments: false,
-            output: AuditOutput::FileAndStdout,
+            output: AuditOutput::File,
         }
     }
 }
@@ -231,19 +311,13 @@ impl AuditLogger {
             return Ok(AuditLogger::Disabled);
         }
 
-        // Check effective output mode (env var overrides config)
-        let output = match std::env::var("MCP_AUDIT_OUTPUT") {
-            Ok(v) => match v.trim().to_lowercase().as_str() {
-                "stdout" => AuditOutput::Stdout,
-                "stderr" => AuditOutput::Stderr,
-                "none" => AuditOutput::None,
-                "file" => AuditOutput::File,
-                "file+stdout" | "stdout+file" => AuditOutput::FileAndStdout,
-                "file+stderr" | "stderr+file" => AuditOutput::FileAndStderr,
-                _ => config.output.clone(),
-            },
-            Err(_) => config.output.clone(),
-        };
+        // Check effective output mode (env var overrides config).
+        // Parsing delegates to `AuditOutput::from_str` so the accepted
+        // vocabulary cannot drift between here and `config.rs`.
+        let output = std::env::var("MCP_AUDIT_OUTPUT")
+            .ok()
+            .and_then(|v| v.parse::<AuditOutput>().ok())
+            .unwrap_or_else(|| config.output.clone());
 
         match output {
             AuditOutput::None => Ok(AuditLogger::Disabled),
@@ -253,11 +327,7 @@ impl AuditLogger {
                 tokio::task::spawn_blocking(move || {
                     while let Some(entry) = rx.blocking_recv() {
                         if let Ok(line) = serde_json::to_string(&entry) {
-                            if use_stderr {
-                                eprintln!("{line}");
-                            } else {
-                                println!("{line}");
-                            }
+                            write_mirror_line(&line, use_stderr);
                         }
                     }
                 });
@@ -272,6 +342,24 @@ impl AuditLogger {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
                 let writer_pool = pool.clone();
                 tokio::task::spawn_blocking(move || {
+                    // Acquire the chrondb handle ONCE at writer startup.
+                    // `DbPool::acquire` only fails when the pool was created
+                    // with `disabled()` (e.g. db init failed, read-only fs),
+                    // so a single warning is enough — without this the loop
+                    // would emit a warning per audit entry and flood logs.
+                    // When `None`, the writer keeps running in mirror-only
+                    // mode (best-effort observability without persistence).
+                    let db_handle = match writer_pool.acquire() {
+                        Ok(db) => Some(db),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = format!("{e:#}"),
+                                "audit db unavailable, running in mirror-only mode"
+                            );
+                            None
+                        }
+                    };
+
                     while let Some(entry) = rx.blocking_recv() {
                         // Serialize once; reuse for both chrondb and stdout/stderr mirror.
                         let doc = match serde_json::to_value(&entry) {
@@ -286,30 +374,18 @@ impl AuditLogger {
                         // if the chrondb write fails (best-effort observability).
                         if let Some(use_stderr) = mirror {
                             if let Ok(line) = serde_json::to_string(&doc) {
-                                if use_stderr {
-                                    eprintln!("{line}");
-                                } else {
-                                    println!("{line}");
-                                }
+                                write_mirror_line(&line, use_stderr);
                             }
                         }
 
-                        let key = format!(
-                            "audit:{}-{}",
-                            Utc::now().timestamp_millis(),
-                            uuid::Uuid::new_v4()
-                        );
-                        match writer_pool.acquire() {
-                            Ok(db) => {
-                                if let Err(e) = db.put(&key, &doc, None) {
-                                    tracing::warn!(error = ?e, "failed to write audit entry");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = format!("{e:#}"),
-                                    "failed to acquire db for audit"
-                                );
+                        if let Some(ref db) = db_handle {
+                            let key = format!(
+                                "audit:{}-{}",
+                                Utc::now().timestamp_millis(),
+                                uuid::Uuid::new_v4()
+                            );
+                            if let Err(e) = db.put(&key, &doc, None) {
+                                tracing::warn!(error = ?e, "failed to write audit entry");
                             }
                         }
                     }
@@ -615,8 +691,13 @@ mod tests {
         assert!(config.path.is_none());
         assert!(config.index_path.is_none());
         assert!(!config.log_arguments);
-        // Default is dual-sink: chrondb + stdout. See default_output().
-        assert_eq!(config.output, AuditOutput::FileAndStdout);
+        // Global default MUST be `File` (chrondb-only). CLI subcommands
+        // emit their result on stdout — mirroring audit JSON there would
+        // corrupt pipelines like `mcp ... | jq`. `mcp serve` upgrades
+        // via `promote_for_serve`. If this assertion ever flips back to
+        // a dual-sink default, the regression you're chasing is the one
+        // reviewed in PR #99 (copilot comment, src/audit.rs:18).
+        assert_eq!(config.output, AuditOutput::File);
     }
 
     #[test]
@@ -632,8 +713,8 @@ mod tests {
         assert_eq!(config.path.unwrap(), "/tmp/audit/data");
         assert_eq!(config.index_path.unwrap(), "/tmp/audit/index");
         assert!(config.log_arguments);
-        // Missing output field falls back to default_output() = FileAndStdout
-        assert_eq!(config.output, AuditOutput::FileAndStdout);
+        // Missing output field falls back to default_output() = File
+        assert_eq!(config.output, AuditOutput::File);
     }
 
     #[test]
@@ -704,6 +785,179 @@ mod tests {
         assert!(!AuditOutput::Stdout.writes_to_file());
         assert!(!AuditOutput::Stderr.writes_to_file());
         assert!(!AuditOutput::None.writes_to_file());
+    }
+
+    // --- FromStr (PR #99 / copilot comment 4) ---
+
+    #[test]
+    fn test_audit_output_from_str_basic_variants() {
+        use std::str::FromStr;
+        assert_eq!(AuditOutput::from_str("file").unwrap(), AuditOutput::File);
+        assert_eq!(
+            AuditOutput::from_str("stdout").unwrap(),
+            AuditOutput::Stdout
+        );
+        assert_eq!(
+            AuditOutput::from_str("stderr").unwrap(),
+            AuditOutput::Stderr
+        );
+        assert_eq!(AuditOutput::from_str("none").unwrap(), AuditOutput::None);
+        assert_eq!(
+            AuditOutput::from_str("file+stdout").unwrap(),
+            AuditOutput::FileAndStdout
+        );
+        assert_eq!(
+            AuditOutput::from_str("file+stderr").unwrap(),
+            AuditOutput::FileAndStderr
+        );
+    }
+
+    #[test]
+    fn test_audit_output_from_str_case_insensitive_and_trimmed() {
+        use std::str::FromStr;
+        assert_eq!(AuditOutput::from_str("FILE").unwrap(), AuditOutput::File);
+        assert_eq!(AuditOutput::from_str("File").unwrap(), AuditOutput::File);
+        assert_eq!(
+            AuditOutput::from_str("  stdout  ").unwrap(),
+            AuditOutput::Stdout
+        );
+        assert_eq!(
+            AuditOutput::from_str("FILE+STDOUT").unwrap(),
+            AuditOutput::FileAndStdout
+        );
+    }
+
+    #[test]
+    fn test_audit_output_from_str_accepts_swapped_combined_form() {
+        // Tolerate either order so the user doesn't trip on token position.
+        use std::str::FromStr;
+        assert_eq!(
+            AuditOutput::from_str("stdout+file").unwrap(),
+            AuditOutput::FileAndStdout
+        );
+        assert_eq!(
+            AuditOutput::from_str("stderr+file").unwrap(),
+            AuditOutput::FileAndStderr
+        );
+    }
+
+    #[test]
+    fn test_audit_output_from_str_rejects_unknown() {
+        use std::str::FromStr;
+        assert!(AuditOutput::from_str("bogus").is_err());
+        assert!(AuditOutput::from_str("").is_err());
+        assert!(AuditOutput::from_str("file+none").is_err());
+        assert!(AuditOutput::from_str("stdout+stderr").is_err());
+    }
+
+    // --- write_line_to (PR #99 / copilot comment 2) ---
+
+    #[test]
+    fn test_write_line_to_appends_newline_and_flushes() {
+        let mut buf: Vec<u8> = Vec::new();
+        super::write_line_to("{\"a\":1}", &mut buf).unwrap();
+        // The newline is what unlocks log-driver consumption (one entry = one line).
+        // Flush is asserted implicitly: Vec<u8>'s flush is a no-op, but `write_line_to`
+        // must return Ok — meaning the underlying writeln + flush both succeeded.
+        assert_eq!(buf, b"{\"a\":1}\n");
+    }
+
+    #[test]
+    fn test_write_line_to_multiple_lines_keep_order_and_separator() {
+        let mut buf: Vec<u8> = Vec::new();
+        super::write_line_to("first", &mut buf).unwrap();
+        super::write_line_to("second", &mut buf).unwrap();
+        super::write_line_to("third", &mut buf).unwrap();
+        // Newline-delimited stream: any container log driver / `jq -c` consumer
+        // must see exactly N lines for N audit entries.
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "first\nsecond\nthird\n");
+    }
+
+    // --- promote_for_serve (PR #99 / copilot comment 1) ---
+
+    #[test]
+    fn test_promote_for_serve_http_promotes_file_to_file_and_stdout() {
+        // `mcp serve --http` makes audit visible in the container log
+        // driver without an extra `mcp logs` call.
+        assert_eq!(
+            AuditOutput::File.promote_for_serve(ServeContext::Http),
+            AuditOutput::FileAndStdout
+        );
+    }
+
+    #[test]
+    fn test_promote_for_serve_stdio_promotes_file_to_file_and_stderr() {
+        // In stdio transport stdout is the JSON-RPC channel, so mirror
+        // goes to stderr to keep the protocol stream clean.
+        assert_eq!(
+            AuditOutput::File.promote_for_serve(ServeContext::Stdio),
+            AuditOutput::FileAndStderr
+        );
+    }
+
+    #[test]
+    fn test_promote_for_serve_respects_explicit_user_choices() {
+        // Explicit user choices (config file or MCP_AUDIT_OUTPUT env)
+        // MUST NOT be overwritten by the promotion rule. Any value other
+        // than `File` is treated as explicit.
+        for ctx in [ServeContext::Http, ServeContext::Stdio] {
+            assert_eq!(
+                AuditOutput::Stdout.promote_for_serve(ctx),
+                AuditOutput::Stdout
+            );
+            assert_eq!(
+                AuditOutput::Stderr.promote_for_serve(ctx),
+                AuditOutput::Stderr
+            );
+            assert_eq!(AuditOutput::None.promote_for_serve(ctx), AuditOutput::None);
+            assert_eq!(
+                AuditOutput::FileAndStdout.promote_for_serve(ctx),
+                AuditOutput::FileAndStdout
+            );
+            assert_eq!(
+                AuditOutput::FileAndStderr.promote_for_serve(ctx),
+                AuditOutput::FileAndStderr
+            );
+        }
+    }
+
+    #[test]
+    fn test_promote_for_serve_is_idempotent_on_already_promoted_values() {
+        // Calling promote twice (e.g. by a future refactor) must be a no-op.
+        let promoted = AuditOutput::File.promote_for_serve(ServeContext::Http);
+        assert_eq!(
+            promoted.promote_for_serve(ServeContext::Http),
+            AuditOutput::FileAndStdout
+        );
+        let promoted_stdio = AuditOutput::File.promote_for_serve(ServeContext::Stdio);
+        assert_eq!(
+            promoted_stdio.promote_for_serve(ServeContext::Stdio),
+            AuditOutput::FileAndStderr
+        );
+    }
+
+    // --- AuditLogger::open with disabled pool (PR #99 / copilot comment 3) ---
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_open_file_mode_with_disabled_pool_does_not_panic() {
+        // Comment 3: when the DbPool is disabled (db init failed /
+        // read-only fs), the writer should cache `None` once at startup
+        // and run in degraded mode without panicking. Older code path
+        // would call `acquire()` per entry and emit a warn per audit
+        // entry — flooding logs under load.
+        let config = AuditConfig {
+            output: AuditOutput::File, // no stdout/stderr mirror — test stays quiet
+            ..AuditConfig::default()
+        };
+        let pool = Arc::new(crate::db::DbPool::disabled());
+        let logger = AuditLogger::open(&config, pool).expect("open should succeed");
+        // Send several entries; the writer task should consume them
+        // without panicking even though acquire() failed up front.
+        for _ in 0..10 {
+            logger.log(sample_entry());
+        }
+        // Give the writer task a moment to drain the channel.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // --- Disabled logger ---

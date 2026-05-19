@@ -15,8 +15,16 @@ use super::dispatch::dispatch_request;
 use super::proxy::{shutdown_clients_in_parallel, ProxyServer, SharedProxy};
 
 pub async fn run_stdio(mut config: Config) -> Result<()> {
-    // In stdio mode, stdout is the JSON-RPC transport. Redirect audit to stderr
-    // to avoid interleaving audit JSON lines with protocol responses.
+    // Serve-mode default promotion: `File` is upgraded to `FileAndStderr`
+    // (not `FileAndStdout`) because in stdio mode stdout carries the
+    // JSON-RPC channel. Explicit user choices are preserved here.
+    config.audit.output = config
+        .audit
+        .output
+        .promote_for_serve(crate::audit::ServeContext::Stdio);
+
+    // If the user explicitly picked Stdout or FileAndStdout, redirect to
+    // the stderr variant for the same JSON-RPC safety reason.
     match config.audit.output {
         crate::audit::AuditOutput::Stdout => {
             tracing::warn!(
