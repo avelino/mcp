@@ -28,11 +28,13 @@ pub fn init(otel: Option<&TelemetryGuard>) {
             tracing_subscriber::fmt::layer()
                 .json()
                 .with_target(false)
+                .with_writer(std::io::stderr)
                 .with_filter(filter),
         ),
         _ => Box::new(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
+                .with_writer(std::io::stderr)
                 .with_filter(filter),
         ),
     };
