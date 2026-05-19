@@ -157,7 +157,7 @@ Add an `audit` section to `~/.config/mcp/servers.json`:
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable/disable audit logging |
-| `output` | `file` | Output destination: `file` (ChronDB, queryable), `stdout`, `stderr` (JSON lines), or `none` |
+| `output` | `file+stdout` | Output destination: `file` (ChronDB, queryable), `stdout`, `stderr` (JSON lines), `file+stdout`, `file+stderr` (ChronDB **and** JSON lines), or `none`. Default mirrors every audit entry on stdout so it's visible in `docker logs`/`kubectl logs` without an extra command, while still persisting to ChronDB for `mcp logs` queries. |
 | `log_arguments` | `false` | Log tool call arguments (may contain PII) |
 | `path` | `~/.config/mcp/audit/data` | ChronDB data directory |
 | `index_path` | `~/.config/mcp/audit/index` | ChronDB index directory |
@@ -217,33 +217,42 @@ MCP_AUDIT_ENABLED=false mcp serve --http 0.0.0.0:8080
 
 When disabled, the logger is a no-op and the database is not initialized — zero overhead, no files created, no filesystem writes. This is the default in the Docker image.
 
-## Streaming to stdout/stderr (containers)
+## Output destinations
 
-In containers, writing audit to ChronDB is often impractical — the filesystem may be read-only, ephemeral, or you want logs flowing to your container log driver (CloudWatch, Datadog, etc.).
+The `output` field controls where audit entries go. The **default is `file+stdout`** — entries are persisted to ChronDB **and** mirrored as JSON lines on stdout, so you can query them with `mcp logs` *and* see them live in your terminal / container log driver without an extra command.
 
-Set `output` to `stdout` or `stderr` to emit audit entries as newline-delimited JSON (one JSON object per line):
-
-```bash
-MCP_AUDIT_OUTPUT=stdout mcp serve --http 0.0.0.0:8080
-```
-
-Or in the config file:
-
-```json
-{
-  "audit": {
-    "output": "stdout"
-  }
-}
-```
-
-Each line is a complete `AuditEntry` JSON object:
+Each stdout/stderr line is a complete `AuditEntry` JSON object:
 
 ```json
 {"timestamp":"2026-04-14T12:00:00-03:00","source":"serve:http","method":"tools/call","tool_name":"search_issues","server_name":"sentry","identity":"alice","duration_ms":142,"success":true}
 ```
 
-When using `stdout` or `stderr` mode, `mcp logs` queries are not available (no database to query). Use your log aggregation pipeline instead.
+The mirror is emitted **before** the ChronDB write, so entries stay visible even if the persistence layer fails.
+
+### Choosing a mode
+
+| `output` | ChronDB | stdout | stderr | `mcp logs` |
+|---|---|---|---|---|
+| `file+stdout` (**default**) | ✅ | ✅ | — | ✅ |
+| `file+stderr` | ✅ | — | ✅ | ✅ |
+| `file` | ✅ | — | — | ✅ |
+| `stdout` | — | ✅ | — | — |
+| `stderr` | — | — | ✅ | — |
+| `none` | — | — | — | — |
+
+Pick `file` if you don't want the stdout noise (e.g. quiet CLI usage). Pick `stdout`/`stderr` only when you can't persist (read-only filesystem, ephemeral containers without a volume). Pick `file+stderr` if your transport is `stdio` — see below.
+
+```bash
+MCP_AUDIT_OUTPUT=file mcp serve --http 0.0.0.0:8080
+```
+
+```json
+{ "audit": { "output": "file" } }
+```
+
+When using `stdout` or `stderr` alone (without `file`), `mcp logs` queries are not available — there's no database to query. Use your log aggregation pipeline instead.
+
+> **stdio transport caveat**: in `mcp serve` without `--http` (stdio mode), stdout is the JSON-RPC channel. The default `file+stdout` is automatically rewritten to `file+stderr` to avoid interleaving. Same rule applies to plain `stdout` → `stderr`.
 
 Set `output` to `none` to disable audit entirely without touching the `enabled` flag.
 
@@ -254,7 +263,7 @@ All audit settings can be overridden via environment variables, which take prior
 | Variable | Overrides | Description |
 |---|---|---|
 | `MCP_AUDIT_ENABLED` | `audit.enabled` | Set to `false` or `0` to disable |
-| `MCP_AUDIT_OUTPUT` | `audit.output` | `file`, `stdout`, `stderr`, or `none` |
+| `MCP_AUDIT_OUTPUT` | `audit.output` | `file`, `stdout`, `stderr`, `file+stdout`, `file+stderr`, or `none` |
 | `MCP_AUDIT_PATH` | `audit.path` | ChronDB data directory |
 | `MCP_AUDIT_INDEX_PATH` | `audit.index_path` | ChronDB index directory |
 

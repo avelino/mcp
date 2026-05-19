@@ -151,7 +151,7 @@ pub async fn run_http(config: Config, bind_addr: &str, insecure: bool) -> Result
     let auth_provider = server_auth::build_auth_provider(&config.server_auth, as_state.as_ref())?;
     let acl = config.server_auth.acl.clone();
 
-    let pool = if config.audit.output == crate::audit::AuditOutput::File {
+    let pool = if config.audit.output.writes_to_file() {
         crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
             tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
             Arc::new(crate::db::DbPool::disabled())

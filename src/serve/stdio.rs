@@ -17,12 +17,23 @@ use super::proxy::{shutdown_clients_in_parallel, ProxyServer, SharedProxy};
 pub async fn run_stdio(mut config: Config) -> Result<()> {
     // In stdio mode, stdout is the JSON-RPC transport. Redirect audit to stderr
     // to avoid interleaving audit JSON lines with protocol responses.
-    if config.audit.output == crate::audit::AuditOutput::Stdout {
-        tracing::warn!("audit output=stdout conflicts with stdio transport, redirecting to stderr");
-        config.audit.output = crate::audit::AuditOutput::Stderr;
+    match config.audit.output {
+        crate::audit::AuditOutput::Stdout => {
+            tracing::warn!(
+                "audit output=stdout conflicts with stdio transport, redirecting to stderr"
+            );
+            config.audit.output = crate::audit::AuditOutput::Stderr;
+        }
+        crate::audit::AuditOutput::FileAndStdout => {
+            tracing::warn!(
+                "audit output=file+stdout conflicts with stdio transport, redirecting to file+stderr"
+            );
+            config.audit.output = crate::audit::AuditOutput::FileAndStderr;
+        }
+        _ => {}
     }
 
-    let pool = if config.audit.output == crate::audit::AuditOutput::File {
+    let pool = if config.audit.output.writes_to_file() {
         crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
             tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
             Arc::new(crate::db::DbPool::disabled())

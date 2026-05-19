@@ -11,16 +11,36 @@ fn default_true() -> bool {
 }
 
 fn default_output() -> AuditOutput {
-    AuditOutput::File
+    // Default is dual-sink: persist to chrondb (queryable via `mcp logs`)
+    // AND mirror each entry as JSON on stdout so it's visible in the
+    // container log driver / terminal without an extra command.
+    AuditOutput::FileAndStdout
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(rename_all = "lowercase")]
 pub enum AuditOutput {
+    #[serde(rename = "file")]
     File,
+    #[serde(rename = "stdout")]
     Stdout,
+    #[serde(rename = "stderr")]
     Stderr,
+    #[serde(rename = "none")]
     None,
+    /// Persist to chrondb AND mirror each entry as JSON on stdout.
+    #[serde(rename = "file+stdout")]
+    FileAndStdout,
+    /// Persist to chrondb AND mirror each entry as JSON on stderr.
+    #[serde(rename = "file+stderr")]
+    FileAndStderr,
+}
+
+impl AuditOutput {
+    /// Whether this mode persists entries to the chrondb store.
+    /// Used by call-sites that decide whether to allocate the DbPool.
+    pub fn writes_to_file(&self) -> bool {
+        matches!(self, Self::File | Self::FileAndStdout | Self::FileAndStderr)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -42,7 +62,7 @@ impl Default for AuditConfig {
             path: None,
             index_path: None,
             log_arguments: false,
-            output: AuditOutput::File,
+            output: AuditOutput::FileAndStdout,
         }
     }
 }
@@ -218,6 +238,8 @@ impl AuditLogger {
                 "stderr" => AuditOutput::Stderr,
                 "none" => AuditOutput::None,
                 "file" => AuditOutput::File,
+                "file+stdout" | "stdout+file" => AuditOutput::FileAndStdout,
+                "file+stderr" | "stderr+file" => AuditOutput::FileAndStderr,
                 _ => config.output.clone(),
             },
             Err(_) => config.output.clone(),
@@ -241,32 +263,53 @@ impl AuditLogger {
                 });
                 Ok(AuditLogger::Stream { sender: tx })
             }
-            AuditOutput::File => {
+            AuditOutput::File | AuditOutput::FileAndStdout | AuditOutput::FileAndStderr => {
+                let mirror = match output {
+                    AuditOutput::FileAndStdout => Some(false), // use_stderr=false
+                    AuditOutput::FileAndStderr => Some(true),
+                    _ => None,
+                };
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
                 let writer_pool = pool.clone();
                 tokio::task::spawn_blocking(move || {
                     while let Some(entry) = rx.blocking_recv() {
+                        // Serialize once; reuse for both chrondb and stdout/stderr mirror.
+                        let doc = match serde_json::to_value(&entry) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to serialize audit entry");
+                                continue;
+                            }
+                        };
+
+                        // Mirror to console first so the entry is visible even
+                        // if the chrondb write fails (best-effort observability).
+                        if let Some(use_stderr) = mirror {
+                            if let Ok(line) = serde_json::to_string(&doc) {
+                                if use_stderr {
+                                    eprintln!("{line}");
+                                } else {
+                                    println!("{line}");
+                                }
+                            }
+                        }
+
                         let key = format!(
                             "audit:{}-{}",
                             Utc::now().timestamp_millis(),
                             uuid::Uuid::new_v4()
                         );
-                        match serde_json::to_value(&entry) {
-                            Ok(doc) => match writer_pool.acquire() {
-                                Ok(db) => {
-                                    if let Err(e) = db.put(&key, &doc, None) {
-                                        tracing::warn!(error = ?e, "failed to write audit entry");
-                                    }
+                        match writer_pool.acquire() {
+                            Ok(db) => {
+                                if let Err(e) = db.put(&key, &doc, None) {
+                                    tracing::warn!(error = ?e, "failed to write audit entry");
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = format!("{e:#}"),
-                                        "failed to acquire db for audit"
-                                    );
-                                }
-                            },
+                            }
                             Err(e) => {
-                                tracing::warn!(error = %e, "failed to serialize audit entry");
+                                tracing::warn!(
+                                    error = format!("{e:#}"),
+                                    "failed to acquire db for audit"
+                                );
                             }
                         }
                     }
@@ -572,7 +615,8 @@ mod tests {
         assert!(config.path.is_none());
         assert!(config.index_path.is_none());
         assert!(!config.log_arguments);
-        assert_eq!(config.output, AuditOutput::File);
+        // Default is dual-sink: chrondb + stdout. See default_output().
+        assert_eq!(config.output, AuditOutput::FileAndStdout);
     }
 
     #[test]
@@ -588,8 +632,8 @@ mod tests {
         assert_eq!(config.path.unwrap(), "/tmp/audit/data");
         assert_eq!(config.index_path.unwrap(), "/tmp/audit/index");
         assert!(config.log_arguments);
-        // Backward compat: missing output field defaults to File
-        assert_eq!(config.output, AuditOutput::File);
+        // Missing output field falls back to default_output() = FileAndStdout
+        assert_eq!(config.output, AuditOutput::FileAndStdout);
     }
 
     #[test]
@@ -622,6 +666,44 @@ mod tests {
             serde_json::to_string(&AuditOutput::File).unwrap(),
             "\"file\""
         );
+        assert_eq!(
+            serde_json::to_string(&AuditOutput::FileAndStdout).unwrap(),
+            "\"file+stdout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuditOutput::FileAndStderr).unwrap(),
+            "\"file+stderr\""
+        );
+    }
+
+    #[test]
+    fn test_audit_config_output_file_and_stdout() {
+        let json = json!({
+            "enabled": true,
+            "output": "file+stdout"
+        });
+        let config: AuditConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.output, AuditOutput::FileAndStdout);
+    }
+
+    #[test]
+    fn test_audit_config_output_file_and_stderr() {
+        let json = json!({
+            "enabled": true,
+            "output": "file+stderr"
+        });
+        let config: AuditConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.output, AuditOutput::FileAndStderr);
+    }
+
+    #[test]
+    fn test_audit_output_writes_to_file() {
+        assert!(AuditOutput::File.writes_to_file());
+        assert!(AuditOutput::FileAndStdout.writes_to_file());
+        assert!(AuditOutput::FileAndStderr.writes_to_file());
+        assert!(!AuditOutput::Stdout.writes_to_file());
+        assert!(!AuditOutput::Stderr.writes_to_file());
+        assert!(!AuditOutput::None.writes_to_file());
     }
 
     // --- Disabled logger ---

@@ -150,8 +150,8 @@ async fn run() -> Result<()> {
     }
 
     // Shared database pool for audit logging and tool cache.
-    // Skip heavy DB init when audit output goes to stdout/stderr/none.
-    let db_pool = if cfg.audit.output == audit::AuditOutput::File {
+    // Skip heavy DB init when audit output goes to stdout/stderr/none only.
+    let db_pool = if cfg.audit.output.writes_to_file() {
         db::create_pool(&cfg.audit).unwrap_or_else(|e| {
             tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
             Arc::new(db::DbPool::disabled())

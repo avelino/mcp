@@ -431,6 +431,12 @@ fn apply_audit_env_overrides(mut audit: AuditConfig) -> AuditConfig {
             "stdout" => audit.output = crate::audit::AuditOutput::Stdout,
             "stderr" => audit.output = crate::audit::AuditOutput::Stderr,
             "none" => audit.output = crate::audit::AuditOutput::None,
+            "file+stdout" | "stdout+file" => {
+                audit.output = crate::audit::AuditOutput::FileAndStdout
+            }
+            "file+stderr" | "stderr+file" => {
+                audit.output = crate::audit::AuditOutput::FileAndStderr
+            }
             _ => {}
         }
     }
