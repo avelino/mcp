@@ -426,10 +426,12 @@ fn apply_audit_env_overrides(mut audit: AuditConfig) -> AuditConfig {
         }
     }
     if let Some(v) = non_empty_env("MCP_AUDIT_OUTPUT") {
-        // Single source of truth: `AuditOutput::from_str`. Ignored when
-        // the value is unrecognized (keeps the config-file value).
+        // Single source of truth: `AuditOutput::from_str`. A valid
+        // value marks `output` as explicit (`Some(...)`) so `mcp serve`
+        // won't auto-promote it. Unrecognized values are ignored,
+        // keeping whatever the config file set.
         if let Ok(o) = v.parse::<crate::audit::AuditOutput>() {
-            audit.output = o;
+            audit.output = Some(o);
         }
     }
     if let Some(v) = non_empty_env("MCP_AUDIT_PATH") {

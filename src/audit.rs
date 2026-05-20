@@ -22,29 +22,23 @@ fn write_line_to<W: Write>(line: &str, w: &mut W) -> std::io::Result<()> {
 /// when the destination is a pipe (typical in containers), so audit
 /// entries can stall in the buffer. Flushing makes them visible to
 /// log drivers in real time.
-fn write_mirror_line(line: &str, use_stderr: bool) {
+///
+/// Returns the underlying I/O error instead of swallowing it so the
+/// caller can decide how to surface broken-pipe / permission failures
+/// (the writer task logs once via tracing and suppresses subsequent
+/// failures to avoid flooding logs).
+fn write_mirror_line(line: &str, use_stderr: bool) -> std::io::Result<()> {
     if use_stderr {
         let stderr = std::io::stderr();
-        let _ = write_line_to(line, &mut stderr.lock());
+        write_line_to(line, &mut stderr.lock())
     } else {
         let stdout = std::io::stdout();
-        let _ = write_line_to(line, &mut stdout.lock());
+        write_line_to(line, &mut stdout.lock())
     }
 }
 
 fn default_true() -> bool {
     true
-}
-
-fn default_output() -> AuditOutput {
-    // Global default is `File` (chrondb-only, silent on stdout). CLI
-    // subcommands like `mcp roam get_daily_note` emit their result on
-    // stdout — emitting audit JSON on the same stream would corrupt
-    // pipelines (`mcp ... | jq`). `mcp serve` upgrades this to
-    // `FileAndStdout`/`FileAndStderr` via `AuditOutput::promote_for_serve`
-    // so audit is visible in the container log driver without an extra
-    // command.
-    AuditOutput::File
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -66,7 +60,7 @@ pub enum AuditOutput {
 }
 
 /// Discriminates the two transports `mcp serve` can run as. Drives the
-/// auto-promotion rule in [`AuditOutput::promote_for_serve`]: HTTP mode
+/// auto-promotion rule in [`AuditOutput::resolve_for_serve`]: HTTP mode
 /// mirrors to stdout; stdio mode mirrors to stderr because stdout is
 /// the JSON-RPC channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,20 +76,33 @@ impl AuditOutput {
         matches!(self, Self::File | Self::FileAndStdout | Self::FileAndStderr)
     }
 
-    /// Apply the serve-mode default promotion rule. In `mcp serve`,
-    /// the default `File` is upgraded so audit entries are visible in
-    /// the container log driver without running `mcp logs` in a second
-    /// shell. Any non-`File` value is respected as-is so explicit user
-    /// choices (config or `MCP_AUDIT_OUTPUT`) are not overwritten.
+    /// Resolve the effective output for a non-serve (CLI) context.
+    /// CLI subcommands print their result on stdout, so the default
+    /// stays chrondb-only (`File`) to avoid interleaving audit JSON
+    /// with command output. Any explicit value the user set is
+    /// returned as-is.
+    pub fn resolve_for_cli(explicit: Option<Self>) -> Self {
+        explicit.unwrap_or(Self::File)
+    }
+
+    /// Resolve the effective output for `mcp serve`. When the user
+    /// did not set anything (`None`), auto-promote to a dual-sink
+    /// mode so audit is visible in the container log driver without
+    /// running `mcp logs` in a second shell. When the user did set
+    /// something (`Some(_)`), honor it verbatim — including explicit
+    /// `Some(File)`, which means "chrondb-only, no mirror, even in
+    /// serve".
     ///
     /// HTTP transport promotes to `FileAndStdout`. Stdio transport
     /// promotes to `FileAndStderr` because stdout carries the JSON-RPC
     /// channel and must stay clean.
-    pub fn promote_for_serve(self, ctx: ServeContext) -> Self {
-        match (self, ctx) {
-            (Self::File, ServeContext::Http) => Self::FileAndStdout,
-            (Self::File, ServeContext::Stdio) => Self::FileAndStderr,
-            (other, _) => other,
+    pub fn resolve_for_serve(explicit: Option<Self>, ctx: ServeContext) -> Self {
+        match explicit {
+            Some(o) => o,
+            None => match ctx {
+                ServeContext::Http => Self::FileAndStdout,
+                ServeContext::Stdio => Self::FileAndStderr,
+            },
         }
     }
 }
@@ -131,8 +138,14 @@ pub struct AuditConfig {
     pub index_path: Option<String>,
     #[serde(default)]
     pub log_arguments: bool,
-    #[serde(default = "default_output")]
-    pub output: AuditOutput,
+    /// Audit output destination. `None` means the user did not set
+    /// anything explicitly (neither config field nor `MCP_AUDIT_OUTPUT`
+    /// env var). Resolved to a concrete `AuditOutput` per-context via
+    /// `AuditOutput::resolve_for_cli` or `resolve_for_serve` — keeping
+    /// the explicit-vs-default distinction so `mcp serve` can avoid
+    /// promoting an operator's deliberate `file` choice.
+    #[serde(default)]
+    pub output: Option<AuditOutput>,
 }
 
 impl Default for AuditConfig {
@@ -142,7 +155,7 @@ impl Default for AuditConfig {
             path: None,
             index_path: None,
             log_arguments: false,
-            output: AuditOutput::File,
+            output: None,
         }
     }
 }
@@ -311,13 +324,24 @@ impl AuditLogger {
             return Ok(AuditLogger::Disabled);
         }
 
-        // Check effective output mode (env var overrides config).
-        // Parsing delegates to `AuditOutput::from_str` so the accepted
-        // vocabulary cannot drift between here and `config.rs`.
-        let output = std::env::var("MCP_AUDIT_OUTPUT")
+        // Resolve the effective output. `mcp serve` is expected to have
+        // already baked in its serve-context resolution before reaching
+        // here (so `config.output` is `Some(...)`). Callers that hit
+        // this directly (CLI subcommands, tests) fall back to the
+        // CLI-safe default (`File`) which keeps stdout clean for
+        // command output.
+        //
+        // The MCP_AUDIT_OUTPUT env-var override is also re-checked here
+        // so callers that build an `AuditConfig` without going through
+        // the full config loader still respect it. Parsing delegates to
+        // `AuditOutput::from_str` so the accepted vocabulary cannot
+        // drift between here and `config.rs`.
+        let env_output = std::env::var("MCP_AUDIT_OUTPUT")
             .ok()
-            .and_then(|v| v.parse::<AuditOutput>().ok())
-            .unwrap_or_else(|| config.output.clone());
+            .and_then(|v| v.parse::<AuditOutput>().ok());
+        let output = env_output
+            .or_else(|| config.output.clone())
+            .unwrap_or(AuditOutput::File);
 
         match output {
             AuditOutput::None => Ok(AuditLogger::Disabled),
@@ -325,9 +349,21 @@ impl AuditLogger {
                 let use_stderr = output == AuditOutput::Stderr;
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AuditEntry>();
                 tokio::task::spawn_blocking(move || {
+                    // Surface mirror-write failures once (broken pipe,
+                    // permission denied) so operators have a signal,
+                    // without flooding logs on every audit entry.
+                    let mut mirror_failure_warned = false;
                     while let Some(entry) = rx.blocking_recv() {
                         if let Ok(line) = serde_json::to_string(&entry) {
-                            write_mirror_line(&line, use_stderr);
+                            if let Err(e) = write_mirror_line(&line, use_stderr) {
+                                if !mirror_failure_warned {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "audit mirror write failed (further failures suppressed)"
+                                    );
+                                    mirror_failure_warned = true;
+                                }
+                            }
                         }
                     }
                 });
@@ -359,6 +395,10 @@ impl AuditLogger {
                             None
                         }
                     };
+                    // Surface mirror-write failures once so operators
+                    // notice broken-pipe / permission issues, without
+                    // flooding logs on every audit entry afterwards.
+                    let mut mirror_failure_warned = false;
 
                     while let Some(entry) = rx.blocking_recv() {
                         // Serialize once; reuse for both chrondb and stdout/stderr mirror.
@@ -374,7 +414,15 @@ impl AuditLogger {
                         // if the chrondb write fails (best-effort observability).
                         if let Some(use_stderr) = mirror {
                             if let Ok(line) = serde_json::to_string(&doc) {
-                                write_mirror_line(&line, use_stderr);
+                                if let Err(e) = write_mirror_line(&line, use_stderr) {
+                                    if !mirror_failure_warned {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "audit mirror write failed (further failures suppressed)"
+                                        );
+                                        mirror_failure_warned = true;
+                                    }
+                                }
                             }
                         }
 
@@ -691,13 +739,14 @@ mod tests {
         assert!(config.path.is_none());
         assert!(config.index_path.is_none());
         assert!(!config.log_arguments);
-        // Global default MUST be `File` (chrondb-only). CLI subcommands
-        // emit their result on stdout — mirroring audit JSON there would
-        // corrupt pipelines like `mcp ... | jq`. `mcp serve` upgrades
-        // via `promote_for_serve`. If this assertion ever flips back to
-        // a dual-sink default, the regression you're chasing is the one
-        // reviewed in PR #99 (copilot comment, src/audit.rs:18).
-        assert_eq!(config.output, AuditOutput::File);
+        // `output` MUST default to `None` — the absence-of-value marker.
+        // CLI subcommands resolve this to `File` via `resolve_for_cli`;
+        // `mcp serve` promotes it to a dual-sink mode via
+        // `resolve_for_serve`. If this assertion ever flips to a
+        // concrete `Some(...)`, the explicit-vs-default distinction is
+        // lost and operators can no longer force chrondb-only in serve
+        // mode by setting `audit.output = "file"`.
+        assert_eq!(config.output, None);
     }
 
     #[test]
@@ -713,8 +762,9 @@ mod tests {
         assert_eq!(config.path.unwrap(), "/tmp/audit/data");
         assert_eq!(config.index_path.unwrap(), "/tmp/audit/index");
         assert!(config.log_arguments);
-        // Missing output field falls back to default_output() = File
-        assert_eq!(config.output, AuditOutput::File);
+        // Missing `output` field stays `None`; per-context resolution
+        // is the caller's job.
+        assert_eq!(config.output, None);
     }
 
     #[test]
@@ -724,7 +774,9 @@ mod tests {
             "output": "stdout"
         });
         let config: AuditConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(config.output, AuditOutput::Stdout);
+        // Present field deserializes as `Some(...)` — marks the value
+        // as explicit so serve-mode auto-promotion is skipped.
+        assert_eq!(config.output, Some(AuditOutput::Stdout));
     }
 
     #[test]
@@ -734,7 +786,21 @@ mod tests {
             "output": "none"
         });
         let config: AuditConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(config.output, AuditOutput::None);
+        assert_eq!(config.output, Some(AuditOutput::None));
+    }
+
+    #[test]
+    fn test_audit_config_output_explicit_file_is_some() {
+        // Operator setting `"output": "file"` deliberately. This MUST
+        // deserialize to `Some(File)` so serve-mode resolution can
+        // honor it (chrondb-only, no mirror) instead of treating it
+        // like the absent-value default.
+        let json = json!({
+            "enabled": true,
+            "output": "file"
+        });
+        let config: AuditConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.output, Some(AuditOutput::File));
     }
 
     #[test]
@@ -764,7 +830,7 @@ mod tests {
             "output": "file+stdout"
         });
         let config: AuditConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(config.output, AuditOutput::FileAndStdout);
+        assert_eq!(config.output, Some(AuditOutput::FileAndStdout));
     }
 
     #[test]
@@ -774,7 +840,7 @@ mod tests {
             "output": "file+stderr"
         });
         let config: AuditConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(config.output, AuditOutput::FileAndStderr);
+        assert_eq!(config.output, Some(AuditOutput::FileAndStderr));
     }
 
     #[test]
@@ -787,7 +853,7 @@ mod tests {
         assert!(!AuditOutput::None.writes_to_file());
     }
 
-    // --- FromStr (PR #99 / copilot comment 4) ---
+    // --- FromStr ---
 
     #[test]
     fn test_audit_output_from_str_basic_variants() {
@@ -850,7 +916,7 @@ mod tests {
         assert!(AuditOutput::from_str("stdout+stderr").is_err());
     }
 
-    // --- write_line_to (PR #99 / copilot comment 2) ---
+    // --- write_line_to: buffered output discipline ---
 
     #[test]
     fn test_write_line_to_appends_newline_and_flushes() {
@@ -873,80 +939,108 @@ mod tests {
         assert_eq!(std::str::from_utf8(&buf).unwrap(), "first\nsecond\nthird\n");
     }
 
-    // --- promote_for_serve (PR #99 / copilot comment 1) ---
+    // --- output resolution: CLI default and serve auto-promotion ---
 
     #[test]
-    fn test_promote_for_serve_http_promotes_file_to_file_and_stdout() {
-        // `mcp serve --http` makes audit visible in the container log
+    fn test_resolve_for_cli_defaults_to_file_when_absent() {
+        // No explicit value means the user did not set anything. CLI
+        // mode must default to `File` (chrondb-only) so audit JSON
+        // does not interleave with stdout command output.
+        assert_eq!(AuditOutput::resolve_for_cli(None), AuditOutput::File);
+    }
+
+    #[test]
+    fn test_resolve_for_cli_honors_explicit_values() {
+        // Whatever the operator set wins, including explicit `File`.
+        assert_eq!(
+            AuditOutput::resolve_for_cli(Some(AuditOutput::File)),
+            AuditOutput::File
+        );
+        assert_eq!(
+            AuditOutput::resolve_for_cli(Some(AuditOutput::Stdout)),
+            AuditOutput::Stdout
+        );
+        assert_eq!(
+            AuditOutput::resolve_for_cli(Some(AuditOutput::FileAndStderr)),
+            AuditOutput::FileAndStderr
+        );
+        assert_eq!(
+            AuditOutput::resolve_for_cli(Some(AuditOutput::None)),
+            AuditOutput::None
+        );
+    }
+
+    #[test]
+    fn test_resolve_for_serve_http_auto_promotes_when_absent() {
+        // `mcp serve --http` with no explicit `audit.output` should
+        // emit audit on stdout so it shows up in the container log
         // driver without an extra `mcp logs` call.
         assert_eq!(
-            AuditOutput::File.promote_for_serve(ServeContext::Http),
+            AuditOutput::resolve_for_serve(None, ServeContext::Http),
             AuditOutput::FileAndStdout
         );
     }
 
     #[test]
-    fn test_promote_for_serve_stdio_promotes_file_to_file_and_stderr() {
-        // In stdio transport stdout is the JSON-RPC channel, so mirror
-        // goes to stderr to keep the protocol stream clean.
+    fn test_resolve_for_serve_stdio_auto_promotes_when_absent() {
+        // Stdio transport: stdout is the JSON-RPC channel, so the
+        // auto-promotion picks stderr for the mirror.
         assert_eq!(
-            AuditOutput::File.promote_for_serve(ServeContext::Stdio),
+            AuditOutput::resolve_for_serve(None, ServeContext::Stdio),
             AuditOutput::FileAndStderr
         );
     }
 
     #[test]
-    fn test_promote_for_serve_respects_explicit_user_choices() {
-        // Explicit user choices (config file or MCP_AUDIT_OUTPUT env)
-        // MUST NOT be overwritten by the promotion rule. Any value other
-        // than `File` is treated as explicit.
+    fn test_resolve_for_serve_preserves_explicit_file_for_chrondb_only() {
+        // Regression guard for the explicit-vs-default distinction:
+        // an operator who sets `audit.output = "file"` (or env
+        // `MCP_AUDIT_OUTPUT=file`) MUST get chrondb-only output in
+        // serve mode, with no stdout/stderr mirror. If this assertion
+        // breaks, serve has started overwriting deliberate operator
+        // choices again.
+        assert_eq!(
+            AuditOutput::resolve_for_serve(Some(AuditOutput::File), ServeContext::Http),
+            AuditOutput::File
+        );
+        assert_eq!(
+            AuditOutput::resolve_for_serve(Some(AuditOutput::File), ServeContext::Stdio),
+            AuditOutput::File
+        );
+    }
+
+    #[test]
+    fn test_resolve_for_serve_preserves_all_other_explicit_values() {
+        // Any non-File explicit value must also pass through untouched.
         for ctx in [ServeContext::Http, ServeContext::Stdio] {
-            assert_eq!(
-                AuditOutput::Stdout.promote_for_serve(ctx),
-                AuditOutput::Stdout
-            );
-            assert_eq!(
-                AuditOutput::Stderr.promote_for_serve(ctx),
-                AuditOutput::Stderr
-            );
-            assert_eq!(AuditOutput::None.promote_for_serve(ctx), AuditOutput::None);
-            assert_eq!(
-                AuditOutput::FileAndStdout.promote_for_serve(ctx),
-                AuditOutput::FileAndStdout
-            );
-            assert_eq!(
-                AuditOutput::FileAndStderr.promote_for_serve(ctx),
-                AuditOutput::FileAndStderr
-            );
+            for value in [
+                AuditOutput::Stdout,
+                AuditOutput::Stderr,
+                AuditOutput::None,
+                AuditOutput::FileAndStdout,
+                AuditOutput::FileAndStderr,
+            ] {
+                assert_eq!(
+                    AuditOutput::resolve_for_serve(Some(value.clone()), ctx),
+                    value
+                );
+            }
         }
     }
 
-    #[test]
-    fn test_promote_for_serve_is_idempotent_on_already_promoted_values() {
-        // Calling promote twice (e.g. by a future refactor) must be a no-op.
-        let promoted = AuditOutput::File.promote_for_serve(ServeContext::Http);
-        assert_eq!(
-            promoted.promote_for_serve(ServeContext::Http),
-            AuditOutput::FileAndStdout
-        );
-        let promoted_stdio = AuditOutput::File.promote_for_serve(ServeContext::Stdio);
-        assert_eq!(
-            promoted_stdio.promote_for_serve(ServeContext::Stdio),
-            AuditOutput::FileAndStderr
-        );
-    }
-
-    // --- AuditLogger::open with disabled pool (PR #99 / copilot comment 3) ---
+    // --- AuditLogger::open with disabled pool: degraded mirror-only mode ---
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_open_file_mode_with_disabled_pool_does_not_panic() {
-        // Comment 3: when the DbPool is disabled (db init failed /
-        // read-only fs), the writer should cache `None` once at startup
-        // and run in degraded mode without panicking. Older code path
-        // would call `acquire()` per entry and emit a warn per audit
-        // entry — flooding logs under load.
+        // When the DbPool is disabled (db init failed / read-only fs),
+        // the writer caches `None` once at startup and runs in degraded
+        // mirror-only mode. Previous behavior called `acquire()` per
+        // entry and emitted a warn per audit entry, flooding logs under
+        // load.
         let config = AuditConfig {
-            output: AuditOutput::File, // no stdout/stderr mirror — test stays quiet
+            // Explicit `File` — no stdout/stderr mirror — keeps the
+            // test process output clean.
+            output: Some(AuditOutput::File),
             ..AuditConfig::default()
         };
         let pool = Arc::new(crate::db::DbPool::disabled());

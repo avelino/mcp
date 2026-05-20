@@ -15,33 +15,39 @@ use super::dispatch::dispatch_request;
 use super::proxy::{shutdown_clients_in_parallel, ProxyServer, SharedProxy};
 
 pub async fn run_stdio(mut config: Config) -> Result<()> {
-    // Serve-mode default promotion: `File` is upgraded to `FileAndStderr`
-    // (not `FileAndStdout`) because in stdio mode stdout carries the
-    // JSON-RPC channel. Explicit user choices are preserved here.
-    config.audit.output = config
-        .audit
-        .output
-        .promote_for_serve(crate::audit::ServeContext::Stdio);
+    // Serve-mode default resolution: when `audit.output` is unset
+    // (`None`), auto-promote to `FileAndStderr` (not `FileAndStdout`)
+    // because in stdio mode stdout carries the JSON-RPC channel. Any
+    // explicit value the operator set is honored verbatim.
+    let mut resolved_audit = crate::audit::AuditOutput::resolve_for_serve(
+        config.audit.output.clone(),
+        crate::audit::ServeContext::Stdio,
+    );
 
-    // If the user explicitly picked Stdout or FileAndStdout, redirect to
-    // the stderr variant for the same JSON-RPC safety reason.
-    match config.audit.output {
+    // Stdio-channel safety net: if the operator explicitly picked a
+    // stdout-bound mode, redirect to its stderr equivalent with a
+    // warning. This applies regardless of whether the value came from
+    // auto-promotion (impossible in stdio context — promotion picks
+    // stderr) or from the user.
+    match resolved_audit {
         crate::audit::AuditOutput::Stdout => {
             tracing::warn!(
                 "audit output=stdout conflicts with stdio transport, redirecting to stderr"
             );
-            config.audit.output = crate::audit::AuditOutput::Stderr;
+            resolved_audit = crate::audit::AuditOutput::Stderr;
         }
         crate::audit::AuditOutput::FileAndStdout => {
             tracing::warn!(
                 "audit output=file+stdout conflicts with stdio transport, redirecting to file+stderr"
             );
-            config.audit.output = crate::audit::AuditOutput::FileAndStderr;
+            resolved_audit = crate::audit::AuditOutput::FileAndStderr;
         }
         _ => {}
     }
 
-    let pool = if config.audit.output.writes_to_file() {
+    config.audit.output = Some(resolved_audit.clone());
+
+    let pool = if resolved_audit.writes_to_file() {
         crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
             tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
             Arc::new(crate::db::DbPool::disabled())

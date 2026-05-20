@@ -91,7 +91,7 @@ async fn run() -> Result<()> {
     let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--json").collect();
     let fmt = OutputFormat::detect(json_flag);
 
-    let cfg = config::load_config()?;
+    let mut cfg = config::load_config()?;
     let conflicts = config::validate_server_names(&cfg);
     for name in &conflicts {
         tracing::warn!(
@@ -150,8 +150,12 @@ async fn run() -> Result<()> {
     }
 
     // Shared database pool for audit logging and tool cache.
-    // Skip heavy DB init when audit output goes to stdout/stderr/none only.
-    let db_pool = if cfg.audit.output.writes_to_file() {
+    // CLI subcommands resolve their effective output via
+    // `resolve_for_cli` — explicit user values are honored, missing
+    // ones fall back to `File`. Skip heavy DB init only when the
+    // resolved mode doesn't persist (`stdout`/`stderr`/`none`).
+    let cli_audit_output = audit::AuditOutput::resolve_for_cli(cfg.audit.output.clone());
+    let db_pool = if cli_audit_output.writes_to_file() {
         db::create_pool(&cfg.audit).unwrap_or_else(|e| {
             tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
             Arc::new(db::DbPool::disabled())
@@ -159,6 +163,9 @@ async fn run() -> Result<()> {
     } else {
         Arc::new(db::DbPool::disabled())
     };
+    // Bake the resolved value back into config so `AuditLogger::open`
+    // doesn't have to re-derive it.
+    cfg.audit.output = Some(cli_audit_output);
 
     // Audit logger shared across all commands
     let audit = Arc::new(

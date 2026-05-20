@@ -282,7 +282,7 @@ When Kubernetes sends `SIGTERM` (during rolling updates or scale-down):
 | `MCP_LOG_LEVEL` | `info` | `tracing` `EnvFilter` (e.g. `mcp=debug,hyper=warn,reqwest=warn,h2=warn`) |
 | `MCP_LOG_FORMAT` | `text` | `json` for newline-delimited JSON to stderr (log drivers) |
 | `MCP_AUDIT_ENABLED` | `false` | Enable audit logging |
-| `MCP_AUDIT_OUTPUT` | `file` (auto-promoted to `file+stdout` in `mcp serve --http`) | `stdout` for cluster log pipeline only, `file` for PVC only (skips auto-promotion), `file+stdout` for both PVC and pipeline (the auto-promoted default in serve), `none` to disable |
+| `MCP_AUDIT_OUTPUT` | unset (→ `file+stdout` in `mcp serve --http`) | `stdout` for cluster log pipeline only, `file` for PVC only (setting this env var is treated as explicit and skips auto-promotion), `file+stdout` for both PVC and pipeline (the auto-promoted default in serve), `none` to disable |
 | `MCP_AUDIT_PATH` | `/data/audit/data` | Audit data directory (app default: `~/.config/mcp/db/data`) |
 | `MCP_AUDIT_INDEX_PATH` | `/data/audit/index` | Audit index directory (app default: `~/.config/mcp/db/index`) |
 | `MCP_CLASSIFIER_CACHE` | `/tmp/tool-classification.json` | Tool classification cache (app default: `~/.config/mcp/tool-classification.json`) |

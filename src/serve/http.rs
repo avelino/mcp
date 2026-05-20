@@ -151,15 +151,18 @@ pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Re
     let auth_provider = server_auth::build_auth_provider(&config.server_auth, as_state.as_ref())?;
     let acl = config.server_auth.acl.clone();
 
-    // Serve-mode default promotion: `File` is upgraded to `FileAndStdout`
-    // so audit entries also stream to stdout for the container log
-    // driver. Explicit user choices (config or env) are preserved.
-    config.audit.output = config
-        .audit
-        .output
-        .promote_for_serve(crate::audit::ServeContext::Http);
+    // Serve-mode default resolution: when `audit.output` is unset
+    // (`None`), auto-promote to `FileAndStdout` so audit also streams
+    // to stdout for the container log driver. Any explicit value the
+    // operator set (including a deliberate `Some(File)` for chrondb-only)
+    // is honored verbatim.
+    let resolved_audit = crate::audit::AuditOutput::resolve_for_serve(
+        config.audit.output.clone(),
+        crate::audit::ServeContext::Http,
+    );
+    config.audit.output = Some(resolved_audit.clone());
 
-    let pool = if config.audit.output.writes_to_file() {
+    let pool = if resolved_audit.writes_to_file() {
         crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
             tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
             Arc::new(crate::db::DbPool::disabled())
