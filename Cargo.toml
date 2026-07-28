@@ -49,7 +49,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_r
 # Suporta gRPC (tonic) e HTTP/protobuf (reqwest) — operador escolhe via
 # OTEL_EXPORTER_OTLP_PROTOCOL. Reqwest reutiliza nossa stack já existente.
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
   "rt-tokio",
   "trace",
   "metrics",
