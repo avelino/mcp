@@ -81,7 +81,9 @@ HTTP servers are remote endpoints. The CLI sends POST requests with JSON-RPC pay
 | `url` | string | yes | The server endpoint URL |
 | `headers` | object | no | HTTP headers to include in every request |
 
-`mcp` handles both standard JSON responses and [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) responses automatically. It also maintains session IDs when the server returns `Mcp-Session-Id` headers.
+`mcp` handles both standard JSON responses and [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) responses automatically. It also maintains session IDs when the server returns `Mcp-Session-Id` headers — unless the server speaks MCP `2026-07-28`, which removed sessions; against those, the header is neither sent nor stored.
+
+Every request also carries `Mcp-Method` and, when it targets a single tool/prompt/resource, `Mcp-Name` — plus `MCP-Protocol-Version` once the negotiated revision is `2026-07-28`. These are additive HTTP metadata for gateways; servers that don't know them ignore them. A `Mcp-Name` that isn't header-safe (a URI with UTF-8 or spaces, say) travels in the spec's Base64 sentinel form, `=?base64?…?=`, which the server decodes before comparing it to the body.
 
 ## Environment variable substitution
 

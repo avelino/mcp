@@ -10,7 +10,10 @@ use crate::classifier::{classify, Kind, ToolClassification};
 use crate::classifier_cache::{cache_key, ClassifierCache};
 use crate::client::McpClient;
 use crate::config::{parse_duration_str, IdleTimeoutPolicy, ServerConfig};
-use crate::protocol::{JsonRpcResponse, Prompt, Resource, Tool, PROTOCOL_VERSION};
+use crate::protocol::{
+    error_codes, JsonRpcResponse, Prompt, Resource, ServerDiscoverResult, ServerInfo, Tool,
+    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+};
 use crate::server_auth::{self, AclConfig, AuthIdentity};
 
 pub(crate) const SEPARATOR: &str = "__";
@@ -29,6 +32,132 @@ pub(crate) fn infer_backend_name<'a>(
     } else {
         None
     }
+}
+
+/// Capabilities this proxy advertises. Shared by `initialize` and
+/// `server/discover` so the two answers can never drift apart.
+pub(crate) fn proxy_capabilities() -> Value {
+    json!({
+        "tools": {},
+        "resources": {},
+        "prompts": {}
+    })
+}
+
+pub(crate) fn proxy_server_info() -> ServerInfo {
+    ServerInfo {
+        name: "mcp-proxy".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// `server/discover` (2026-07-28): the stateless replacement for the
+/// `initialize` handshake. We advertise every revision we accept, newest
+/// first, so a client can pick without a round-trip negotiation.
+pub(crate) fn handle_server_discover(id: Value) -> JsonRpcResponse {
+    let result = ServerDiscoverResult {
+        supported_versions: SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        capabilities: proxy_capabilities(),
+        instructions: None,
+        // Identity belongs in `_meta`, not at the top level.
+        meta: Some(serde_json::json!({
+            crate::protocol::meta_keys::SERVER_INFO: proxy_server_info(),
+        })),
+    };
+    JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap())
+}
+
+/// Fields a [MRTR][mrtr] retry carries so the backend can resume the
+/// exchange it started. Both are opaque to the proxy: `requestState` is
+/// explicitly "meaningful only to the server", and `inputResponses` is the
+/// client's answers to that server's questions.
+///
+/// [mrtr]: https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr
+pub(crate) const MRTR_CONTINUATION_FIELDS: [&str; 2] = ["inputResponses", "requestState"];
+
+/// Which MRTR continuation fields a client's params carry, for the audit
+/// entry. A relayed continuation is still a privileged call, so it has to
+/// stay attributable rather than looking like a fresh one.
+pub(crate) fn mrtr_continuation_fields(params: Option<&Value>) -> Vec<&'static str> {
+    let Some(params) = params else {
+        return Vec::new();
+    };
+    MRTR_CONTINUATION_FIELDS
+        .into_iter()
+        .filter(|f| params.get(f).is_some())
+        .collect()
+}
+
+/// Copy the MRTR continuation fields, when present, into params bound for a
+/// backend.
+fn copy_mrtr_continuation(params: Option<&Value>, out: &mut serde_json::Map<String, Value>) {
+    let Some(params) = params else { return };
+    for field in MRTR_CONTINUATION_FIELDS {
+        if let Some(value) = params.get(field) {
+            out.insert(field.to_string(), value.clone());
+        }
+    }
+}
+
+/// Rebuild `tools/call` params for the backend: the namespaced tool name
+/// swapped for the backend's own, plus exactly the fields the spec defines
+/// for this method.
+///
+/// Forwarding `inputResponses`/`requestState` is what makes [MRTR][mrtr]
+/// work through the proxy — a retry carries them alongside `arguments`, and
+/// rebuilding from `{name, arguments}` alone would drop them silently.
+///
+/// The list is an allowlist rather than "everything except `_meta`" so a
+/// client cannot smuggle an arbitrary top-level key into a backend request
+/// through us: the proxy is the peer on that hop, and a backend must only
+/// ever see fields this hop actually means.
+///
+/// `_meta` is excluded for the same reason it always was: it is per-hop
+/// state (our client's protocol version, its client info). Backends never
+/// received it before, and a legacy backend must not suddenly start seeing
+/// 2026-07-28 keys it cannot interpret.
+///
+/// [mrtr]: https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr
+pub(crate) fn backend_tool_call_params(params: &Value, original_name: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("name".to_string(), Value::String(original_name.to_string()));
+    // Backends have always been handed an `arguments` object, even when the
+    // client omitted one. Keep that so this stays a no-op for legacy peers.
+    out.insert(
+        "arguments".to_string(),
+        params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+    );
+    copy_mrtr_continuation(Some(params), &mut out);
+    Value::Object(out)
+}
+
+/// `resources/read` params for the backend: the un-namespaced URI plus any
+/// MRTR continuation. `resources/read` may return an `InputRequiredResult`
+/// too, so a retry's answers have to reach the backend the same way a
+/// `tools/call` retry's do.
+pub(crate) fn backend_resource_read_params(params: Option<&Value>, original_uri: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("uri".to_string(), Value::String(original_uri.to_string()));
+    copy_mrtr_continuation(params, &mut out);
+    Value::Object(out)
+}
+
+/// `prompts/get` params for the backend. `arguments` is omitted when the
+/// client omitted it — that is the shape every backend has always seen.
+pub(crate) fn backend_prompt_get_params(params: Option<&Value>, original_name: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("name".to_string(), Value::String(original_name.to_string()));
+    if let Some(arguments) = params.and_then(|p| p.get("arguments")) {
+        out.insert("arguments".to_string(), arguments.clone());
+    }
+    copy_mrtr_continuation(params, &mut out);
+    Value::Object(out)
 }
 
 /// Tracks per-backend usage patterns for adaptive idle timeout.
@@ -139,7 +268,8 @@ impl DiscoveryFailure {
 pub(crate) type SharedProxy = Arc<Mutex<ProxyServer>>;
 
 /// Result of resolving a `tools/call` request: server name, original tool
-/// name, arguments, and (optionally) an already-connected client.
+/// name, the params to forward to the backend, and (optionally) an
+/// already-connected client.
 pub(crate) type ResolvedCall = (
     String,
     String,
@@ -147,7 +277,8 @@ pub(crate) type ResolvedCall = (
     Option<Arc<McpClient>>,
     server_auth::Decision,
 );
-/// Ok: (server, tool, args, decision). Err: (optional decision for audit, error response).
+/// Ok: (server, tool, backend params, decision). Err: (optional decision for
+/// audit, error response).
 pub(crate) type ResolveResult = std::result::Result<
     (String, String, Value, server_auth::Decision),
     (Option<server_auth::Decision>, JsonRpcResponse),
@@ -159,11 +290,14 @@ pub(crate) type ResolvedResourceRead = (
     Option<Arc<McpClient>>,
     server_auth::Decision,
 );
-/// Resolved prompt get: (server, original_name, arguments, client, decision).
+/// Resolved prompt get: (server, original_name, backend params, client,
+/// decision). The third element is the whole params object rewritten for the
+/// backend (see [`backend_prompt_get_params`]), not just `arguments`, so an
+/// MRTR retry's continuation fields travel with it.
 pub(crate) type ResolvedPromptGet = (
     String,
     String,
-    Option<Value>,
+    Value,
     Option<Arc<McpClient>>,
     server_auth::Decision,
 );
@@ -642,26 +776,38 @@ impl ProxyServer {
         clients
     }
 
-    pub(crate) fn handle_initialize(&self, id: Value) -> JsonRpcResponse {
+    /// Answer `initialize`, echoing back a revision the **client** can
+    /// speak rather than blindly the newest one we know.
+    ///
+    /// A 2025-06-18 client that gets told "2026-07-28" has to either
+    /// disconnect or guess; echoing its own revision back is what keeps
+    /// every pre-2026-07-28 client working untouched. `None` (no params,
+    /// or params without `protocolVersion`) and an unknown revision both
+    /// fall back to our newest, which is the pre-existing behavior.
+    pub(crate) fn handle_initialize(
+        &self,
+        id: Value,
+        requested_version: Option<&str>,
+    ) -> JsonRpcResponse {
+        let negotiated = match requested_version {
+            Some(v) if crate::protocol::is_version_supported(v) => v,
+            _ => PROTOCOL_VERSION,
+        };
         JsonRpcResponse::success(
             id,
             json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {},
-                    "resources": {},
-                    "prompts": {}
-                },
-                "serverInfo": {
-                    "name": "mcp-proxy",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
+                "protocolVersion": negotiated,
+                "capabilities": proxy_capabilities(),
+                "serverInfo": proxy_server_info(),
             }),
         )
     }
 
-    /// Resolve a tool name to (server, original_name, args, ACL decision).
-    /// Returns Err(JsonRpcResponse) if the call should be rejected immediately.
+    /// Resolve a tool name to (server, original_name, backend params, ACL
+    /// decision). The third element is the **whole** params object rewritten
+    /// for the backend (see [`backend_tool_call_params`]), not just
+    /// `arguments`. Returns Err(JsonRpcResponse) if the call should be
+    /// rejected immediately.
     #[allow(clippy::result_large_err)]
     pub(crate) fn resolve_tool_call(
         &self,
@@ -675,7 +821,11 @@ impl ProxyServer {
             None => {
                 return Err((
                     None,
-                    JsonRpcResponse::error(id.clone(), -32602, "missing params for tools/call"),
+                    JsonRpcResponse::error(
+                        id.clone(),
+                        error_codes::INVALID_PARAMS,
+                        "missing params for tools/call",
+                    ),
                 ));
             }
         };
@@ -687,14 +837,12 @@ impl ProxyServer {
                     None,
                     JsonRpcResponse::error(
                         id.clone(),
-                        -32602,
+                        error_codes::INVALID_PARAMS,
                         "missing 'name' in tools/call params",
                     ),
                 ));
             }
         };
-
-        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
         let (server_name, original_name) = match self.tool_map.get(&tool_name) {
             Some(mapping) => mapping.clone(),
@@ -703,7 +851,7 @@ impl ProxyServer {
                     None,
                     JsonRpcResponse::error(
                         id.clone(),
-                        -32602,
+                        error_codes::INVALID_PARAMS,
                         &format!("unknown tool: {tool_name}"),
                     ),
                 ));
@@ -723,7 +871,7 @@ impl ProxyServer {
                 Some(decision),
                 JsonRpcResponse::error(
                     id.clone(),
-                    -32603,
+                    error_codes::INTERNAL_ERROR,
                     &format!(
                         "access denied: '{}' cannot use tool '{tool_name}'",
                         identity.subject
@@ -732,7 +880,8 @@ impl ProxyServer {
             ));
         }
 
-        Ok((server_name, original_name, arguments, decision))
+        let backend_params = backend_tool_call_params(&params, &original_name);
+        Ok((server_name, original_name, backend_params, decision))
     }
 
     /// Drain all connected backends and return them so they can be shut down
@@ -824,7 +973,7 @@ mod tests {
     #[test]
     fn test_proxy_server_initialize_response() {
         let server = test_server();
-        let resp = server.handle_initialize(Value::from(1));
+        let resp = server.handle_initialize(Value::from(1), None);
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
@@ -835,7 +984,7 @@ mod tests {
     #[test]
     fn test_proxy_server_initialize_with_string_id() {
         let server = test_server();
-        let resp = server.handle_initialize(Value::String("req-1".to_string()));
+        let resp = server.handle_initialize(Value::String("req-1".to_string()), None);
         assert!(resp.error.is_none());
         assert_eq!(resp.id, Some(Value::String("req-1".to_string())));
     }
@@ -1081,7 +1230,7 @@ mod tests {
     #[test]
     fn test_initialize_includes_resources_and_prompts_capabilities() {
         let server = test_server();
-        let resp = server.handle_initialize(Value::from(1));
+        let resp = server.handle_initialize(Value::from(1), None);
         let result = resp.result.unwrap();
         assert!(result["capabilities"]["resources"].is_object());
         assert!(result["capabilities"]["prompts"].is_object());
@@ -1179,5 +1328,219 @@ mod tests {
     fn test_is_backend_undiscovered_not_in_configs() {
         let server = test_server_with_configs(&["gh"]);
         assert!(!server.is_backend_undiscovered("nonexistent"));
+    }
+
+    // --- initialize version negotiation ---
+
+    #[test]
+    fn test_initialize_echoes_a_revision_the_client_speaks() {
+        let server = test_server();
+        for requested in SUPPORTED_PROTOCOL_VERSIONS {
+            let resp = server.handle_initialize(Value::from(1), Some(requested));
+            assert_eq!(resp.result.unwrap()["protocolVersion"], *requested);
+        }
+    }
+
+    #[test]
+    fn test_initialize_without_a_request_answers_newest() {
+        let server = test_server();
+        // A client that sends no protocolVersion gets the pre-existing
+        // answer — this is the shape every legacy handshake had.
+        let resp = server.handle_initialize(Value::from(1), None);
+        assert_eq!(resp.result.unwrap()["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn test_initialize_ignores_a_revision_we_cannot_speak() {
+        let server = test_server();
+        for bogus in ["1999-01-01", "", "not-a-date"] {
+            let resp = server.handle_initialize(Value::from(1), Some(bogus));
+            assert_eq!(resp.result.unwrap()["protocolVersion"], PROTOCOL_VERSION);
+        }
+    }
+
+    // --- server/discover ---
+
+    #[test]
+    fn test_server_discover_shape() {
+        let resp = handle_server_discover(Value::from(7));
+        assert_eq!(resp.id, Some(Value::from(7)));
+        let raw = resp.result.unwrap();
+        // Pin the wire shape, not just the round trip through our own types.
+        assert!(raw.get("supportedVersions").is_some());
+        assert!(raw.get("protocolVersions").is_none());
+        assert_eq!(
+            raw["_meta"][crate::protocol::meta_keys::SERVER_INFO]["name"],
+            "mcp-proxy"
+        );
+
+        let result: ServerDiscoverResult = serde_json::from_value(raw).unwrap();
+        let info = result.server_info().expect("serverInfo in _meta");
+        assert_eq!(info.name, "mcp-proxy");
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        // A legacy-only client still finds common ground with us.
+        let legacy_only = ServerDiscoverResult {
+            supported_versions: vec![crate::protocol::PROTOCOL_VERSION_LEGACY.to_string()],
+            ..result
+        };
+        assert_eq!(
+            legacy_only.best_common_version(),
+            Some(crate::protocol::PROTOCOL_VERSION_LEGACY)
+        );
+    }
+
+    // --- backend_tool_call_params (MRTR passthrough) ---
+
+    #[test]
+    fn test_backend_params_preserve_mrtr_fields() {
+        let params = json!({
+            "name": "stub__ask",
+            "arguments": {"q": 1},
+            "inputResponses": [{"id": "confirm", "value": true}],
+            "requestState": "opaque",
+        });
+        let out = backend_tool_call_params(&params, "ask");
+        assert_eq!(out["name"], "ask");
+        assert_eq!(out["arguments"]["q"], 1);
+        assert_eq!(out["inputResponses"][0]["value"], true);
+        assert_eq!(out["requestState"], "opaque");
+    }
+
+    /// Legacy shape must come out byte-for-byte as before: `{name, arguments}`
+    /// with `arguments` defaulted to an empty object.
+    #[test]
+    fn test_backend_params_legacy_shape_is_unchanged() {
+        assert_eq!(
+            backend_tool_call_params(&json!({"name": "sentry__search"}), "search"),
+            json!({"name": "search", "arguments": {}})
+        );
+        assert_eq!(
+            backend_tool_call_params(&json!({"name": "s__t", "arguments": {"a": 1}}), "t"),
+            json!({"name": "t", "arguments": {"a": 1}})
+        );
+    }
+
+    /// `_meta` is our hop's state. Forwarding a 2026-07-28 protocolVersion to
+    /// a 2025-11-25 backend is exactly the kind of leak that breaks it.
+    #[test]
+    fn test_backend_params_drop_client_meta() {
+        let params = json!({
+            "name": "s__t",
+            "arguments": {},
+            "_meta": {crate::protocol::meta_keys::PROTOCOL_VERSION: "2026-07-28"},
+        });
+        let out = backend_tool_call_params(&params, "t");
+        assert!(out.get("_meta").is_none());
+    }
+
+    #[test]
+    fn test_backend_params_tolerate_non_object_params() {
+        let out = backend_tool_call_params(&json!([1, 2]), "t");
+        assert_eq!(out, json!({"name": "t", "arguments": {}}));
+    }
+
+    /// Defense in depth: only the fields the spec defines for `tools/call`
+    /// cross the hop. A client cannot use us as a courier for a top-level key
+    /// a backend might act on.
+    #[test]
+    fn test_backend_params_forward_only_spec_fields() {
+        let params = json!({
+            "name": "s__t",
+            "arguments": {"a": 1},
+            "inputResponses": {"k": {}},
+            "requestState": "opaque",
+            // Not defined for tools/call — must stop at the proxy.
+            "elicitation": {"bypass": true},
+            "cursor": "sneaky",
+            "_meta": {"anything": 1},
+        });
+        let out = backend_tool_call_params(&params, "t");
+        let keys: Vec<&str> = out
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["arguments", "inputResponses", "name", "requestState"]
+        );
+    }
+
+    // --- resources/read + prompts/get backend params (MRTR) ---
+
+    #[test]
+    fn test_backend_resource_read_params_legacy_shape_is_unchanged() {
+        assert_eq!(
+            backend_resource_read_params(Some(&json!({"uri": "sentry__issue://1"})), "issue://1"),
+            json!({"uri": "issue://1"})
+        );
+        assert_eq!(
+            backend_resource_read_params(None, "issue://1"),
+            json!({"uri": "issue://1"})
+        );
+    }
+
+    #[test]
+    fn test_backend_resource_read_params_carry_mrtr_continuation() {
+        let out = backend_resource_read_params(
+            Some(&json!({
+                "uri": "sentry__issue://1",
+                "inputResponses": {"login": {"action": "accept"}},
+                "requestState": "opaque",
+                "smuggled": true,
+            })),
+            "issue://1",
+        );
+        assert_eq!(out["uri"], "issue://1");
+        assert_eq!(out["inputResponses"]["login"]["action"], "accept");
+        assert_eq!(out["requestState"], "opaque");
+        assert!(out.get("smuggled").is_none());
+    }
+
+    #[test]
+    fn test_backend_prompt_get_params_legacy_shape_is_unchanged() {
+        assert_eq!(
+            backend_prompt_get_params(Some(&json!({"name": "ai__sum"})), "sum"),
+            json!({"name": "sum"})
+        );
+        assert_eq!(
+            backend_prompt_get_params(
+                Some(&json!({"name": "ai__sum", "arguments": {"a": 1}})),
+                "sum"
+            ),
+            json!({"name": "sum", "arguments": {"a": 1}})
+        );
+    }
+
+    #[test]
+    fn test_backend_prompt_get_params_carry_mrtr_continuation() {
+        let out = backend_prompt_get_params(
+            Some(&json!({
+                "name": "ai__sum",
+                "arguments": {"a": 1},
+                "requestState": "opaque",
+                "smuggled": true,
+            })),
+            "sum",
+        );
+        assert_eq!(
+            out,
+            json!({"name": "sum", "arguments": {"a": 1}, "requestState": "opaque"})
+        );
+    }
+
+    #[test]
+    fn test_mrtr_continuation_fields_reports_presence() {
+        assert!(mrtr_continuation_fields(None).is_empty());
+        assert!(mrtr_continuation_fields(Some(&json!({"name": "x"}))).is_empty());
+        assert_eq!(
+            mrtr_continuation_fields(Some(&json!({"requestState": "s"}))),
+            vec!["requestState"]
+        );
+        assert_eq!(
+            mrtr_continuation_fields(Some(&json!({"inputResponses": {}, "requestState": "s"}))),
+            vec!["inputResponses", "requestState"]
+        );
     }
 }

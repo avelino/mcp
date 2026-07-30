@@ -39,9 +39,31 @@ graph LR
     Proxy --> N["server N<br/>(stdio/http)"]
 ```
 
-1. Client sends `initialize` — the proxy responds immediately with capabilities (tools, resources, prompts)
+1. Client announces itself — either `server/discover` (MCP 2026-07-28) or `initialize` (every earlier revision). Both answer immediately with the same capabilities (tools, resources, prompts)
 2. Client calls `tools/list`, `resources/list`, or `prompts/list` — the proxy returns items instantly from persistent cache (tools) or discovery (resources/prompts), aggregated across all backends. Each item is namespaced with `{server}__` prefix.
 3. Client calls `tools/call`, `resources/read`, or `prompts/get` — the proxy reconnects the target backend on demand (if it was shut down), routes the request, and tracks usage for adaptive timeout
+
+## Protocol revisions
+
+`mcp serve` speaks MCP **2026-07-28** and every earlier revision it knows, on the same endpoint. It advertises, newest first: `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`.
+
+What it accepts:
+
+- **`server/discover`** — the 2026-07-28 replacement for the handshake. Returns the list above as `supportedVersions`, plus `capabilities`, plus the proxy's `serverInfo` under `_meta["io.modelcontextprotocol/serverInfo"]` (not at the top level, where `initialize` puts it).
+- **`initialize`** — still served, for every client that predates 2026-07-28. The proxy echoes back the revision *the client asked for* (when it's one we speak) instead of the newest one, so a 2025-06-18 client isn't told something it can't parse. A client that sends no `protocolVersion` gets the newest, exactly as before.
+- **Per-request revision** — a 2026-07-28 client declares its revision in `params._meta` on each request. Absent means a legacy client and is never an error; present-but-unknown is rejected with `-32022`.
+- **`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers** — validated **only when present**. Legacy clients send none of them and are not penalized. A header that contradicts the body is rejected with `-32020`, because that means a gateway routed or metered on a lie. Both `Mcp-Method` and `Mcp-Name` are decoded first when they arrive in the Base64 sentinel form `=?base64?…?=` (which is how a tool name or resource URI that isn't header-safe travels); a sentinel that won't decode is itself a rejection. A `MCP-Protocol-Version` naming a revision we don't speak is rejected with `-32022`, the same as one declared in `params._meta` — otherwise a future date would silently select 2026-07-28 semantics.
+
+What it puts in responses **for a client that declared the new revision** — either in `params._meta` or via `MCP-Protocol-Version`. A client that declared neither gets exactly the bytes it got before this revision existed; these fields don't exist in the revision it negotiated, and a client validating results against a closed schema is a real client:
+
+- `resultType` on every result, plus `serverInfo` under `_meta`.
+- `ttlMs` and `cacheScope: "private"` on `tools/list`, `prompts/list`, `resources/list`, `resources/read` and `server/discover`. The scope is always private: those results are ACL-filtered per identity, so a shared cache would hand one identity another's tool list.
+- Deterministic ordering of `tools/list`, `prompts/list` and `resources/list`, so the same set of primitives always serializes identically.
+- HTTP status codes the 2026-07-28 transport pins: `-32020` and `-32022` answer `400`, and an unknown method answers `404` — the last one **only** for a client that declared the new revision, since every legacy client has always received `-32601` on a `200` and still does.
+
+`tools/call`, `resources/read` and `prompts/get` are relayed to the backend, so a backend that answers with an interim `input_required` result (Multi Round-Trip Request) passes through intact, along with the `inputResponses` / `requestState` the client sends on the retry. The relay is not blind: whatever `ttlMs` / `cacheScope` a backend puts on such a result is stripped, because the proxy — not the backend — is the one that knows the answer was ACL-filtered. An `input_required` is preserved for every client, including a legacy one — dropping it would report an unfinished exchange as finished.
+
+Backends are untouched by any of this: the proxy talks to each one with whatever revision *that* backend negotiated. A backend that never went past `initialize` gets no `_meta` and no `Mcp-Method` / `Mcp-Name` / `MCP-Protocol-Version` headers either — one hop cannot be half on each revision. The only exception is the `server/discover` probe that asks the backend which revision it speaks, a method that did not exist before 2026-07-28.
 
 ## Concurrency model
 
@@ -159,14 +181,21 @@ mcp serve --http 0.0.0.0:9090 --insecure
 | `GET` | `/mcp/sse` | SSE stream (old HTTP+SSE transport) |
 | `GET` | `/health` | Health check (JSON) |
 
-The proxy supports both the **Streamable HTTP** transport (protocol version `2025-11-25`) and the older **HTTP+SSE** transport (`2024-11-05`) for backward compatibility.
+The proxy supports both the **Streamable HTTP** transport and the older **HTTP+SSE** transport for backward compatibility. See [Protocol revisions](#protocol-revisions) for which MCP revisions each speaks.
+
+> **Deprecation:** MCP 2026-07-28 formally deprecates the HTTP+SSE transport with a 12-month removal window. The proxy keeps serving it unchanged and logs a warning on connect — nothing is gated. Move clients to `POST /mcp` when you can.
 
 ### POST /mcp
 
 Send any MCP JSON-RPC request and get the response. Supports both requests (with `id`) and notifications (without `id`):
 
 ```bash
-# Initialize
+# Discover (MCP 2026-07-28 — no handshake needed afterwards)
+curl -s http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover"}'
+
+# Initialize (every revision before 2026-07-28)
 curl -s http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}'

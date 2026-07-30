@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use crate::audit::{AuditEntry, AuditLogger};
 use crate::client::McpClient;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::protocol::{error_codes, meta_keys, CacheScope, JsonRpcRequest, JsonRpcResponse};
 use crate::server_auth::{self, AclConfig, AuthIdentity};
 
 use super::discovery::{connect_backend, discover_pending_backends, discover_single_backend};
 use super::proxy::{
-    infer_backend_name, ResolvedCall, ResolvedPromptGet, ResolvedResourceRead, SharedProxy,
-    SEPARATOR,
+    backend_prompt_get_params, backend_resource_read_params, handle_server_discover,
+    infer_backend_name, mrtr_continuation_fields, proxy_server_info, ProxyServer, ResolvedCall,
+    ResolvedPromptGet, ResolvedResourceRead, SharedProxy, SEPARATOR,
 };
 
 /// Whether to discover all pending backends, a single one, or none.
@@ -18,6 +19,48 @@ enum DiscoveryAction {
     None,
     Single(String),
     All,
+}
+
+/// `ttlMs` we advertise on the `*/list` results.
+///
+/// There is no existing TTL to inherit: `ToolCacheStore` invalidates on the
+/// backend config hash, not on a clock. So this is a deliberately
+/// conservative number — the idle reaper ticks every 30s, and a reaped
+/// backend re-registers its primitives on the next reconnect, which is the
+/// shortest window in which our registry can change with the client doing
+/// nothing. A cached list therefore never outlives one reap/reconnect cycle.
+const LIST_TTL_MS: u64 = 30_000;
+
+/// `ttlMs` for `resources/read`. Resource bodies are opaque backend data we
+/// relay verbatim and we get no freshness signal with them, so we tell
+/// caches not to reuse the response at all.
+const RESOURCE_READ_TTL_MS: u64 = 0;
+
+/// `ttlMs` for `server/discover`, matching the spec page's own example.
+///
+/// Unlike the `*/list` results, the discover payload is built entirely from
+/// compile-time constants (`SUPPORTED_PROTOCOL_VERSIONS`,
+/// `proxy_capabilities()`, the crate version), so it can only change when the
+/// process is replaced by a different build. An hour is safe.
+const DISCOVER_TTL_MS: u64 = 3_600_000;
+
+/// Whether a request body itself opts into the stateless (2026-07-28+)
+/// revision, ignoring any transport headers.
+///
+/// Shared by the HTTP handler (which ORs in the `MCP-Protocol-Version`
+/// header) and the stdio handler (which has no headers at all), so both
+/// transports answer the question the same way.
+///
+/// `server/discover` counts on its own: the method did not exist before
+/// 2026-07-28, so a peer calling it is a 2026-07-28 peer whether or not it
+/// spelled the version out. Reading it as legacy would strip the very fields
+/// — `resultType`, the cache hints — that the discovery result is required to
+/// carry.
+pub(crate) fn body_declares_stateless(req: &JsonRpcRequest) -> bool {
+    req.method == "server/discover"
+        || crate::protocol::request_protocol_version(req.params.as_ref()).is_some_and(|v| {
+            crate::protocol::is_version_supported(v) && crate::protocol::is_stateless_version(v)
+        })
 }
 
 /// Top-level non-blocking request dispatcher.
@@ -52,6 +95,7 @@ pub(crate) async fn dispatch_request(
     identity: &AuthIdentity,
     acl: &Option<AclConfig>,
     source: &str,
+    stateless_peer: bool,
 ) -> JsonRpcResponse {
     let start = std::time::Instant::now();
     let method = req.method.clone();
@@ -62,25 +106,66 @@ pub(crate) async fn dispatch_request(
     let mut tool_name_for_audit: Option<String> = None;
     let mut server_name_for_audit: Option<String> = None;
     let mut decision_for_audit: Option<server_auth::Decision> = None;
+    // An MRTR retry re-enters an exchange a previous call started. It is a
+    // privileged call like any other, so the audit entry has to say so
+    // rather than looking like a fresh, self-contained request.
+    let mrtr_continuation_for_audit = mrtr_continuation_fields(req.params.as_ref());
+
+    // 2026-07-28 lets every request declare its own revision in
+    // `params._meta`, since there is no handshake left to hold it. Absent
+    // means a pre-2026-07-28 peer — the legacy path, never an error.
+    // Present-but-unknown is the only case we reject.
+    if let Some(version) = crate::protocol::request_protocol_version(req.params.as_ref()) {
+        if !crate::protocol::is_version_supported(version) {
+            let audit = Arc::clone(&proxy.lock().await.audit);
+            return finish_audit(
+                AuditCtx {
+                    audit,
+                    source,
+                    method,
+                    tool_name: None,
+                    server_name: None,
+                    identity,
+                    start,
+                    decision: None,
+                    mrtr_continuation: mrtr_continuation_for_audit,
+                    stateless_peer,
+                },
+                // The spec requires the supported list on the wire: without
+                // it a client can only fail, with it it can pick a revision
+                // we both speak and retry.
+                JsonRpcResponse::unsupported_protocol_version(id, version),
+            );
+        }
+    }
 
     let response = match req.method.as_str() {
         "initialize" => {
+            let requested = req
+                .params
+                .as_ref()
+                .and_then(|v| v.get("protocolVersion"))
+                .and_then(|v| v.as_str());
             let p = proxy.lock().await;
             audit_logger = Arc::clone(&p.audit);
-            p.handle_initialize(id)
+            p.handle_initialize(id, requested)
+        }
+        // Stateless replacement for `initialize`. A MUST for servers in
+        // 2026-07-28; legacy clients simply never call it.
+        "server/discover" => {
+            let p = proxy.lock().await;
+            audit_logger = Arc::clone(&p.audit);
+            let mut resp = handle_server_discover(id);
+            if let Some(result) = resp.result.as_mut() {
+                set_private_cache_hints(result, DISCOVER_TTL_MS, stateless_peer);
+            }
+            resp
         }
         "tools/list" => {
             // Decide whether to trigger discovery, then drop the proxy lock
             // before doing any I/O. Discovery is serialized via the separate
             // discovery_lock inside discover_pending_backends.
-            let needs_discovery = {
-                let p = proxy.lock().await;
-                audit_logger = Arc::clone(&p.audit);
-                p.tools.is_empty() && p.has_undiscovered_backends()
-            };
-            if needs_discovery {
-                discover_pending_backends(proxy).await;
-            }
+            audit_logger = discover_for_list(proxy, |p| p.tools.is_empty()).await;
             // Snapshot tools + metadata under a brief lock, then release
             // before ACL evaluation/serialization/logging.
             let (tools_snap, tool_map_snap, cls_snap, list_audit) = {
@@ -107,35 +192,25 @@ pub(crate) async fn dispatch_request(
                     tools_allowed.push(serde_json::to_value(t).unwrap());
                 } else {
                     let srv = tool_map_snap.get(&t.name).map(|(s, _)| s.clone());
-                    list_audit.log(AuditEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        source: source.to_string(),
-                        method: "tools/list:filtered".to_string(),
-                        tool_name: Some(t.name.clone()),
-                        server_name: srv,
-                        identity: identity.subject.clone(),
-                        duration_ms: 0,
-                        success: true,
-                        error_message: None,
-                        arguments: None,
-                        acl_decision: Some("deny".to_string()),
-                        acl_matched_rule: Some(decision.matched_rule.to_string()),
-                        acl_access_kind: decision
-                            .access_evaluated
-                            .as_ref()
-                            .map(|a| a.as_str().to_string()),
-                        classification_kind: decision
-                            .classification_kind
-                            .map(|k| k.as_str().to_string()),
-                        classification_source: decision
-                            .classification_source
-                            .map(|s| s.as_str().to_string()),
-                        classification_confidence: decision.classification_confidence,
-                    });
+                    log_filtered(
+                        &list_audit,
+                        source,
+                        identity,
+                        "tools/list:filtered",
+                        &t.name,
+                        srv,
+                        &decision,
+                    );
                 }
             }
-            let tools_snapshot = tools_allowed;
-            JsonRpcResponse::success(id, json!({ "tools": tools_snapshot }))
+            // Deterministic order: the tool list is assembled from a HashMap
+            // of backends, so without an explicit sort the same tool set
+            // comes back in a different order every process. That defeats
+            // both client-side caching and the LLM prompt cache.
+            sort_by_field(&mut tools_allowed, "name");
+            let mut result = json!({ "tools": tools_allowed });
+            set_private_cache_hints(&mut result, LIST_TTL_MS, stateless_peer);
+            JsonRpcResponse::success(id, result)
         }
         "tools/call" => {
             // Capture the requested tool name up front so access-denied and
@@ -202,31 +277,36 @@ pub(crate) async fn dispatch_request(
 
             match resolved {
                 Err(resp) => resp,
-                Ok((server, original, args, maybe_client, acl_decision)) => {
+                Ok((server, _original, backend_params, maybe_client, acl_decision)) => {
                     decision_for_audit = Some(acl_decision);
                     // Phase 2: ensure connected (without holding the proxy
                     // lock during the connect itself).
-                    let client_result: Result<Arc<McpClient>> = match maybe_client {
-                        Some(c) => Ok(c),
-                        None => connect_backend(proxy, &server).await,
-                    };
-
-                    match client_result {
-                        Err(e) => JsonRpcResponse::error(
-                            id,
-                            -32603,
-                            &format!("failed to connect to backend '{server}': {e:#}"),
-                        ),
+                    match client_or_connect(proxy, &server, maybe_client, &id).await {
+                        Err(resp) => resp,
                         Ok(client) => {
-                            // Phase 3: invoke the backend with NO proxy lock held.
-                            match client.call_tool(&original, args).await {
-                                Ok(result) => JsonRpcResponse::success(
-                                    id,
-                                    serde_json::to_value(&result).unwrap(),
-                                ),
-                                Err(e) => {
-                                    JsonRpcResponse::error(id, -32603, &format!("[{server}] {e:#}"))
+                            // Phase 3: invoke the backend with NO proxy lock
+                            // held, on the raw path. An MRTR backend can answer
+                            // with `resultType: "input_required"` and no
+                            // `content` at all; parsing into `ToolCallResult`
+                            // would turn that valid exchange into an error. The
+                            // proxy stays transparent and relays whatever came
+                            // back verbatim.
+                            //
+                            // `call_tool_raw` and not `request_raw`: the former
+                            // is the only path that mirrors the backend's
+                            // `x-mcp-header` annotations into `Mcp-Param-*`,
+                            // and it takes whole params so the MRTR
+                            // continuation survives the hop.
+                            match client.call_tool_raw(backend_params).await {
+                                Ok(mut result) => {
+                                    sanitize_relayed_result(&mut result, stateless_peer);
+                                    JsonRpcResponse::success(id, result)
                                 }
+                                Err(e) => JsonRpcResponse::error(
+                                    id,
+                                    error_codes::INTERNAL_ERROR,
+                                    &format!("[{server}] {e:#}"),
+                                ),
                             }
                         }
                     }
@@ -234,14 +314,7 @@ pub(crate) async fn dispatch_request(
             }
         }
         "resources/list" => {
-            let needs_discovery = {
-                let p = proxy.lock().await;
-                audit_logger = Arc::clone(&p.audit);
-                p.resources.is_empty() && p.has_undiscovered_backends()
-            };
-            if needs_discovery {
-                discover_pending_backends(proxy).await;
-            }
+            audit_logger = discover_for_list(proxy, |p| p.resources.is_empty()).await;
             let (resources_snap, resource_map_snap, list_audit) = {
                 let p = proxy.lock().await;
                 (
@@ -264,30 +337,21 @@ pub(crate) async fn dispatch_request(
                     resources_allowed.push(serde_json::to_value(r).unwrap());
                 } else {
                     let srv = resource_map_snap.get(&r.uri).map(|(s, _)| s.clone());
-                    list_audit.log(AuditEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        source: source.to_string(),
-                        method: "resources/list:filtered".to_string(),
-                        tool_name: Some(r.uri.clone()),
-                        server_name: srv,
-                        identity: identity.subject.clone(),
-                        duration_ms: 0,
-                        success: true,
-                        error_message: None,
-                        arguments: None,
-                        acl_decision: Some("deny".to_string()),
-                        acl_matched_rule: Some(decision.matched_rule.to_string()),
-                        acl_access_kind: decision
-                            .access_evaluated
-                            .as_ref()
-                            .map(|a| a.as_str().to_string()),
-                        classification_kind: None,
-                        classification_source: None,
-                        classification_confidence: None,
-                    });
+                    log_filtered(
+                        &list_audit,
+                        source,
+                        identity,
+                        "resources/list:filtered",
+                        &r.uri,
+                        srv,
+                        &decision,
+                    );
                 }
             }
-            JsonRpcResponse::success(id, json!({ "resources": resources_allowed }))
+            sort_by_field(&mut resources_allowed, "uri");
+            let mut result = json!({ "resources": resources_allowed });
+            set_private_cache_hints(&mut result, LIST_TTL_MS, stateless_peer);
+            JsonRpcResponse::success(id, result)
         }
         "resources/read" => {
             let uri = req
@@ -312,8 +376,14 @@ pub(crate) async fn dispatch_request(
                             identity,
                             start,
                             decision: None,
+                            mrtr_continuation: mrtr_continuation_for_audit,
+                            stateless_peer,
                         },
-                        JsonRpcResponse::error(id, -32602, "missing required parameter: uri"),
+                        JsonRpcResponse::error(
+                            id,
+                            error_codes::INVALID_PARAMS,
+                            "missing required parameter: uri",
+                        ),
                     );
                 }
             };
@@ -367,7 +437,7 @@ pub(crate) async fn dispatch_request(
                             server_name_for_audit = Some(server.clone());
                             Err(JsonRpcResponse::error(
                                 id.clone(),
-                                -32603,
+                                error_codes::INTERNAL_ERROR,
                                 &format!(
                                     "access denied: resource '{}' on server '{}'",
                                     original_uri, server
@@ -383,7 +453,7 @@ pub(crate) async fn dispatch_request(
                     }
                     None => Err(JsonRpcResponse::error(
                         id.clone(),
-                        -32602,
+                        error_codes::INVALID_PARAMS,
                         &format!("unknown resource: {uri}"),
                     )),
                 }
@@ -393,45 +463,44 @@ pub(crate) async fn dispatch_request(
                 Err(resp) => resp,
                 Ok((server, original_uri, maybe_client, acl_decision)) => {
                     decision_for_audit = Some(acl_decision);
-                    let client_result: Result<Arc<McpClient>> = match maybe_client {
-                        Some(c) => Ok(c),
-                        None => connect_backend(proxy, &server).await,
-                    };
-                    match client_result {
-                        Err(e) => JsonRpcResponse::error(
-                            id,
-                            -32603,
-                            &format!("failed to connect to backend '{server}': {e:#}"),
-                        ),
-                        Ok(client) => match client.read_resource(&original_uri).await {
-                            Ok(mut result) => {
-                                // Rewrite content URIs to namespaced form so the
-                                // client sees the same URI it requested.
-                                let namespaced_uri = format!("{server}{SEPARATOR}{original_uri}");
-                                for content in &mut result.contents {
-                                    if content.uri == original_uri {
-                                        content.uri = namespaced_uri.clone();
-                                    }
+                    match client_or_connect(proxy, &server, maybe_client, &id).await {
+                        Err(resp) => resp,
+                        // Raw relay, like `tools/call`: 2026-07-28 lets
+                        // `resources/read` answer with an interim
+                        // `input_required` result that has no `contents` at
+                        // all, and parsing into `ResourceReadResult` would
+                        // turn that legal exchange into a -32603.
+                        Ok(client) => {
+                            let backend_params =
+                                backend_resource_read_params(req.params.as_ref(), &original_uri);
+                            match client.read_resource_raw(backend_params).await {
+                                Ok(mut result) => {
+                                    sanitize_relayed_result(&mut result, stateless_peer);
+                                    namespace_resource_contents(
+                                        &mut result,
+                                        &server,
+                                        &original_uri,
+                                    );
+                                    set_private_cache_hints(
+                                        &mut result,
+                                        RESOURCE_READ_TTL_MS,
+                                        stateless_peer,
+                                    );
+                                    JsonRpcResponse::success(id, result)
                                 }
-                                JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap())
+                                Err(e) => JsonRpcResponse::error(
+                                    id,
+                                    error_codes::INTERNAL_ERROR,
+                                    &format!("[{server}] {e:#}"),
+                                ),
                             }
-                            Err(e) => {
-                                JsonRpcResponse::error(id, -32603, &format!("[{server}] {e:#}"))
-                            }
-                        },
+                        }
                     }
                 }
             }
         }
         "prompts/list" => {
-            let needs_discovery = {
-                let p = proxy.lock().await;
-                audit_logger = Arc::clone(&p.audit);
-                p.prompts.is_empty() && p.has_undiscovered_backends()
-            };
-            if needs_discovery {
-                discover_pending_backends(proxy).await;
-            }
+            audit_logger = discover_for_list(proxy, |p| p.prompts.is_empty()).await;
             let (prompts_snap, prompt_map_snap, list_audit) = {
                 let p = proxy.lock().await;
                 (
@@ -454,30 +523,21 @@ pub(crate) async fn dispatch_request(
                     prompts_allowed.push(serde_json::to_value(pr).unwrap());
                 } else {
                     let srv = prompt_map_snap.get(&pr.name).map(|(s, _)| s.clone());
-                    list_audit.log(AuditEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        source: source.to_string(),
-                        method: "prompts/list:filtered".to_string(),
-                        tool_name: Some(pr.name.clone()),
-                        server_name: srv,
-                        identity: identity.subject.clone(),
-                        duration_ms: 0,
-                        success: true,
-                        error_message: None,
-                        arguments: None,
-                        acl_decision: Some("deny".to_string()),
-                        acl_matched_rule: Some(decision.matched_rule.to_string()),
-                        acl_access_kind: decision
-                            .access_evaluated
-                            .as_ref()
-                            .map(|a| a.as_str().to_string()),
-                        classification_kind: None,
-                        classification_source: None,
-                        classification_confidence: None,
-                    });
+                    log_filtered(
+                        &list_audit,
+                        source,
+                        identity,
+                        "prompts/list:filtered",
+                        &pr.name,
+                        srv,
+                        &decision,
+                    );
                 }
             }
-            JsonRpcResponse::success(id, json!({ "prompts": prompts_allowed }))
+            sort_by_field(&mut prompts_allowed, "name");
+            let mut result = json!({ "prompts": prompts_allowed });
+            set_private_cache_hints(&mut result, LIST_TTL_MS, stateless_peer);
+            JsonRpcResponse::success(id, result)
         }
         "prompts/get" => {
             let name = req
@@ -502,17 +562,17 @@ pub(crate) async fn dispatch_request(
                             identity,
                             start,
                             decision: None,
+                            mrtr_continuation: mrtr_continuation_for_audit,
+                            stateless_peer,
                         },
-                        JsonRpcResponse::error(id, -32602, "missing required parameter: name"),
+                        JsonRpcResponse::error(
+                            id,
+                            error_codes::INVALID_PARAMS,
+                            "missing required parameter: name",
+                        ),
                     );
                 }
             };
-
-            let arguments = req
-                .params
-                .as_ref()
-                .and_then(|v| v.get("arguments"))
-                .cloned();
 
             tool_name_for_audit = Some(prompt_name.clone());
 
@@ -562,7 +622,7 @@ pub(crate) async fn dispatch_request(
                             server_name_for_audit = Some(server.clone());
                             Err(JsonRpcResponse::error(
                                 id.clone(),
-                                -32603,
+                                error_codes::INTERNAL_ERROR,
                                 &format!(
                                     "access denied: prompt '{}' on server '{}'",
                                     original_name, server
@@ -573,12 +633,14 @@ pub(crate) async fn dispatch_request(
                             let original = original_name.clone();
                             let client = p.try_get_client(&server);
                             server_name_for_audit = Some(server.clone());
-                            Ok((server, original, arguments, client, decision))
+                            let backend_params =
+                                backend_prompt_get_params(req.params.as_ref(), &original);
+                            Ok((server, original, backend_params, client, decision))
                         }
                     }
                     None => Err(JsonRpcResponse::error(
                         id.clone(),
-                        -32602,
+                        error_codes::INVALID_PARAMS,
                         &format!("unknown prompt: {prompt_name}"),
                     )),
                 }
@@ -586,25 +648,24 @@ pub(crate) async fn dispatch_request(
 
             match resolved {
                 Err(resp) => resp,
-                Ok((server, original_name, args, maybe_client, acl_decision)) => {
+                Ok((server, _original_name, backend_params, maybe_client, acl_decision)) => {
                     decision_for_audit = Some(acl_decision);
-                    let client_result: Result<Arc<McpClient>> = match maybe_client {
-                        Some(c) => Ok(c),
-                        None => connect_backend(proxy, &server).await,
-                    };
-                    match client_result {
-                        Err(e) => JsonRpcResponse::error(
-                            id,
-                            -32603,
-                            &format!("failed to connect to backend '{server}': {e:#}"),
-                        ),
-                        Ok(client) => match client.get_prompt(&original_name, args).await {
-                            Ok(result) => {
-                                JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap())
+                    match client_or_connect(proxy, &server, maybe_client, &id).await {
+                        Err(resp) => resp,
+                        // Raw relay: `prompts/get` is one of the three methods
+                        // that may answer with an interim `input_required`
+                        // result, which has no `messages` and so cannot be
+                        // parsed into `PromptGetResult`.
+                        Ok(client) => match client.get_prompt_raw(backend_params).await {
+                            Ok(mut result) => {
+                                sanitize_relayed_result(&mut result, stateless_peer);
+                                JsonRpcResponse::success(id, result)
                             }
-                            Err(e) => {
-                                JsonRpcResponse::error(id, -32603, &format!("[{server}] {e:#}"))
-                            }
+                            Err(e) => JsonRpcResponse::error(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                &format!("[{server}] {e:#}"),
+                            ),
                         },
                     }
                 }
@@ -613,7 +674,11 @@ pub(crate) async fn dispatch_request(
         _ => {
             let p = proxy.lock().await;
             audit_logger = Arc::clone(&p.audit);
-            JsonRpcResponse::error(id, -32601, &format!("method not found: {}", req.method))
+            JsonRpcResponse::error(
+                id,
+                error_codes::METHOD_NOT_FOUND,
+                &format!("method not found: {}", req.method),
+            )
         }
     };
 
@@ -627,9 +692,232 @@ pub(crate) async fn dispatch_request(
             identity,
             start,
             decision: decision_for_audit,
+            mrtr_continuation: mrtr_continuation_for_audit,
+            stateless_peer,
         },
         response,
     )
+}
+
+/// Sort a list result in place by a string field, so the same set of
+/// primitives always serializes identically. `sort_by` on `str` is stable
+/// and total here — entries are namespaced (`{server}__{name}`), so the key
+/// is unique and ties never arise.
+fn sort_by_field(items: &mut [Value], field: &str) {
+    fn key<'a>(v: &'a Value, field: &str) -> &'a str {
+        v.get(field).and_then(|s| s.as_str()).unwrap_or("")
+    }
+    items.sort_by(|a, b| key(a, field).cmp(key(b, field)));
+}
+
+/// Attach the `CacheableResult` hints the 2026-07-28 revision requires on
+/// `tools/list`, `prompts/list`, `resources/list`, `resources/read` and
+/// `server/discover` — for a peer that asked for that revision, and no one
+/// else. See [`stamp_result_envelope`] for why the gate exists.
+///
+/// The scope is always `private`, including on `server/discover` where the
+/// spec's own example shows `public`. Every list result is ACL-filtered
+/// against the calling identity, so a shared intermediary that cached one
+/// would hand another identity a tool list it is not allowed to see.
+/// Discovery is not filtered today, but it is served from the same
+/// authenticated endpoint and its `capabilities` are one commit away from
+/// reflecting which backends an identity can reach — at which point a
+/// `public` entry cached under someone else's request becomes the same leak.
+/// The cost of `private` is a shared-cache miss; the cost of being wrong the
+/// other way is a cross-identity disclosure.
+fn set_private_cache_hints(result: &mut Value, ttl_ms: u64, stateless_peer: bool) {
+    if !stateless_peer {
+        return;
+    }
+    crate::protocol::set_cache_hints(result, ttl_ms, CacheScope::Private);
+}
+
+/// Discover pending backends when the registry a `*/list` reads is still
+/// empty, and hand back the audit logger the arm needs either way.
+///
+/// The closure picks the registry: the three list arms differ only in which
+/// one they check for emptiness.
+async fn discover_for_list(
+    proxy: &SharedProxy,
+    is_empty: impl Fn(&ProxyServer) -> bool,
+) -> Arc<AuditLogger> {
+    let (needs_discovery, audit) = {
+        let p = proxy.lock().await;
+        (
+            is_empty(&p) && p.has_undiscovered_backends(),
+            Arc::clone(&p.audit),
+        )
+    };
+    if needs_discovery {
+        discover_pending_backends(proxy).await;
+    }
+    audit
+}
+
+/// The backend's client: the pooled one, or a fresh connection.
+///
+/// Returns the client, or the error response to hand back — every caller
+/// reports a failed connect the same way.
+async fn client_or_connect(
+    proxy: &SharedProxy,
+    server: &str,
+    pooled: Option<Arc<McpClient>>,
+    id: &Value,
+) -> Result<Arc<McpClient>, JsonRpcResponse> {
+    match pooled {
+        Some(client) => Ok(client),
+        None => connect_backend(proxy, server).await.map_err(|e| {
+            JsonRpcResponse::error(
+                id.clone(),
+                error_codes::INTERNAL_ERROR,
+                &format!("failed to connect to backend '{server}': {e:#}"),
+            )
+        }),
+    }
+}
+
+/// Audit a primitive the ACL hid from a `*/list` result.
+///
+/// The three list arms differ only in which primitive they name — the entry
+/// is otherwise identical, classification fields included: only tool
+/// decisions ever populate those, and resource and prompt decisions leave
+/// them `None`, so reading them off the decision is correct for all three.
+fn log_filtered(
+    audit: &AuditLogger,
+    source: &str,
+    identity: &AuthIdentity,
+    method: &str,
+    name: &str,
+    server_name: Option<String>,
+    decision: &server_auth::Decision,
+) {
+    audit.log(AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        source: source.to_string(),
+        method: method.to_string(),
+        tool_name: Some(name.to_string()),
+        server_name,
+        identity: identity.subject.clone(),
+        duration_ms: 0,
+        success: true,
+        error_message: None,
+        arguments: None,
+        acl_decision: Some("deny".to_string()),
+        acl_matched_rule: Some(decision.matched_rule.to_string()),
+        acl_access_kind: decision
+            .access_evaluated
+            .as_ref()
+            .map(|a| a.as_str().to_string()),
+        classification_kind: decision.classification_kind.map(|k| k.as_str().to_string()),
+        classification_source: decision
+            .classification_source
+            .map(|s| s.as_str().to_string()),
+        classification_confidence: decision.classification_confidence,
+    });
+}
+
+/// Rewrite `contents[].uri` from the backend's own URI to the namespaced one
+/// the client asked for, so a client can feed a `resources/read` reply back
+/// to us unchanged.
+///
+/// Operates on the raw relayed JSON because an interim `input_required`
+/// result carries no `contents` at all — absence is normal here, not an
+/// error.
+fn namespace_resource_contents(result: &mut Value, server: &str, original_uri: &str) {
+    let Some(contents) = result.get_mut("contents").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    let namespaced = format!("{server}{SEPARATOR}{original_uri}");
+    for content in contents {
+        let Some(obj) = content.as_object_mut() else {
+            continue;
+        };
+        if obj.get("uri").and_then(|u| u.as_str()) == Some(original_uri) {
+            obj.insert("uri".to_string(), Value::String(namespaced.clone()));
+        }
+    }
+}
+
+/// Sanitize a result the proxy relays verbatim from a backend.
+///
+/// The relay path (`tools/call`, `resources/read`, `prompts/get`) exists so
+/// an MRTR interim result survives the hop, but it also means the *backend*
+/// writes the JSON the client reads. Cache directives are not the backend's
+/// to write: a `cacheScope: "public"` on an answer we produced under one
+/// identity's ACL is a cross-identity leak, and a generous `ttlMs` pins a
+/// result in front of an ACL that may since have changed. They are stripped
+/// here and re-stated by the caller for the methods where the proxy actually
+/// has something to say.
+///
+/// `resultType` follows the same rule as the rest of the 2026-07-28 envelope.
+/// A genuine `input_required` is preserved for **every** peer: it is the one
+/// value that changes what the response means, and dropping it would report an
+/// unfinished exchange as finished. Otherwise the field belongs to the
+/// revision, so a stateless peer gets a normalized `complete` and a legacy
+/// peer gets no `resultType` at all — including one a modern backend
+/// volunteered, which is still a field that peer never negotiated.
+///
+/// Every other field is relayed untouched, so `structuredContent`, `isError`
+/// and any future extension keep flowing through.
+fn sanitize_relayed_result(result: &mut Value, stateless_peer: bool) {
+    let Some(obj) = result.as_object_mut() else {
+        return;
+    };
+    obj.remove("ttlMs");
+    obj.remove("cacheScope");
+
+    let interim = obj.get("resultType").and_then(|v| v.as_str())
+        == Some(crate::protocol::RESULT_TYPE_INPUT_REQUIRED);
+    if interim {
+        // Left exactly as the backend wrote it, for either kind of peer.
+    } else if stateless_peer {
+        obj.insert(
+            "resultType".to_string(),
+            Value::String(crate::protocol::RESULT_TYPE_COMPLETE.to_string()),
+        );
+        // `_meta` is an object by spec. A backend answering with a scalar
+        // there would otherwise suppress the serverInfo stamp entirely —
+        // `set_result_meta` declines to write into a non-object — and the
+        // client would receive the backend's scalar in its place. Only
+        // meaningful on the path that is about to stamp; a legacy peer's
+        // relay stays byte-for-byte the backend's.
+        if obj.get("_meta").is_some_and(|m| !m.is_object()) {
+            obj.insert("_meta".to_string(), Value::Object(serde_json::Map::new()));
+        }
+    } else {
+        obj.remove("resultType");
+    }
+}
+
+/// Stamp the fields 2026-07-28 requires on every outgoing result:
+/// `resultType` and the `_meta` serverInfo.
+///
+/// Only for a peer that declared a stateless revision. "Unknown keys are
+/// inert" is true of most clients and not of the contract: a pre-2026-07-28
+/// peer negotiated a revision in which these fields do not exist, and one
+/// validating a result against a closed schema is a real client, not a
+/// hypothetical. The whole premise of this work is that a legacy peer sees
+/// the bytes it saw before — `serve::http` says so, `backend_tool_call_params`
+/// says so, and this used to say the opposite.
+///
+/// Doing it here still means no response path can forget: every response the
+/// proxy emits funnels through `finish_audit`, which carries the flag.
+///
+/// An MRTR interim result relayed from a backend keeps its own
+/// `input_required` — see `set_result_type_complete`.
+fn stamp_result_envelope(response: &mut JsonRpcResponse, stateless_peer: bool) {
+    if !stateless_peer {
+        return;
+    }
+    let Some(result) = response.result.as_mut() else {
+        return;
+    };
+    crate::protocol::set_result_type_complete(result);
+    crate::protocol::set_result_meta(
+        result,
+        meta_keys::SERVER_INFO,
+        serde_json::to_value(proxy_server_info()).unwrap(),
+    );
 }
 
 pub(crate) struct AuditCtx<'a> {
@@ -641,9 +929,19 @@ pub(crate) struct AuditCtx<'a> {
     pub(crate) identity: &'a AuthIdentity,
     pub(crate) start: std::time::Instant,
     pub(crate) decision: Option<server_auth::Decision>,
+    /// MRTR continuation fields the request carried, if any.
+    pub(crate) mrtr_continuation: Vec<&'static str>,
+    /// Whether the peer declared a stateless (2026-07-28+) revision, and so
+    /// asked for the result envelope this revision adds.
+    pub(crate) stateless_peer: bool,
 }
 
-pub(crate) fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> JsonRpcResponse {
+pub(crate) fn finish_audit(ctx: AuditCtx<'_>, mut response: JsonRpcResponse) -> JsonRpcResponse {
+    // Single funnel for every response the proxy emits — the one place that
+    // can guarantee the 2026-07-28 result envelope is present for exactly the
+    // peers that asked for it.
+    stamp_result_envelope(&mut response, ctx.stateless_peer);
+
     // Record the final OTel status on the root span. No-op when the field
     // wasn't declared (i.e. caller wasn't instrumented) or telemetry is off.
     let status = if response.error.is_none() {
@@ -709,7 +1007,11 @@ pub(crate) fn finish_audit(ctx: AuditCtx<'_>, response: JsonRpcResponse) -> Json
         duration_ms,
         success: response.error.is_none(),
         error_message: response.error.as_ref().map(|e| e.message.clone()),
-        arguments: None,
+        // Never the actual arguments — they routinely hold secrets. Only the
+        // fact that this call resumed an MRTR exchange, which is what makes a
+        // relayed continuation attributable after the fact.
+        arguments: (!ctx.mrtr_continuation.is_empty())
+            .then(|| json!({ "mrtrContinuation": ctx.mrtr_continuation })),
         acl_decision,
         acl_matched_rule,
         acl_access_kind,
@@ -742,15 +1044,28 @@ mod tests {
     }
 
     /// Test helper: wraps `server` in a `SharedProxy` and routes a request
-    /// through the production `dispatch_request` path.
+    /// through the production `dispatch_request` path, as a peer that
+    /// declared the 2026-07-28 revision. The legacy-peer gate has its own
+    /// tests (`test_legacy_peer_gets_no_*`) and `dispatch_as` below.
     async fn dispatch(
         server: ProxyServer,
         req: JsonRpcRequest,
         identity: &AuthIdentity,
         acl: &Option<AclConfig>,
     ) -> JsonRpcResponse {
+        dispatch_as(server, req, identity, acl, true).await
+    }
+
+    /// Same, choosing whether the peer declared a stateless revision.
+    async fn dispatch_as(
+        server: ProxyServer,
+        req: JsonRpcRequest,
+        identity: &AuthIdentity,
+        acl: &Option<AclConfig>,
+        stateless_peer: bool,
+    ) -> JsonRpcResponse {
         let proxy: SharedProxy = Arc::new(Mutex::new(server));
-        dispatch_request(&proxy, req, identity, acl, "test").await
+        dispatch_request(&proxy, req, identity, acl, "test", stateless_peer).await
     }
 
     #[tokio::test]
@@ -892,7 +1207,16 @@ mod tests {
 
     #[test]
     fn test_protocol_version_is_current() {
-        assert_eq!(crate::protocol::PROTOCOL_VERSION, "2025-11-25");
+        assert_eq!(crate::protocol::PROTOCOL_VERSION, "2026-07-28");
+    }
+
+    /// The revision every backend we proxy is still on must stay in the
+    /// supported set — dropping it would break them silently.
+    #[test]
+    fn test_legacy_protocol_version_still_supported() {
+        assert!(crate::protocol::is_version_supported(
+            crate::protocol::PROTOCOL_VERSION_LEGACY
+        ));
     }
 
     #[test]
@@ -1190,5 +1514,1031 @@ mod tests {
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert!(err.message.contains("access denied"));
+    }
+
+    // --- 2026-07-28: per-request version negotiation ---
+
+    /// Build params carrying a `_meta` protocol version, the way a
+    /// 2026-07-28 client declares which revision it speaks.
+    fn params_with_version(version: &str) -> Value {
+        json!({ "_meta": { meta_keys::PROTOCOL_VERSION: version } })
+    }
+
+    #[tokio::test]
+    async fn test_declared_supported_version_is_served() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(
+            1,
+            "tools/list",
+            Some(params_with_version(crate::protocol::PROTOCOL_VERSION)),
+        );
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_none());
+        assert!(resp.result.unwrap()["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_declared_legacy_version_is_served() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(
+            1,
+            "tools/list",
+            Some(params_with_version(
+                crate::protocol::PROTOCOL_VERSION_LEGACY,
+            )),
+        );
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_none());
+    }
+
+    /// The spec requires the error to carry the versions we do speak: without
+    /// them the client can only give up, with them it can pick one and retry.
+    #[tokio::test]
+    async fn test_declared_unsupported_version_is_rejected_with_the_supported_list() {
+        for bogus in ["2099-01-01", "garbage", ""] {
+            let req = JsonRpcRequest::new(1, "tools/list", Some(params_with_version(bogus)));
+            let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+            let err = resp.error.expect("bogus version must be rejected");
+            assert_eq!(err.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
+            let data = err.data.expect("clients need the list to retry");
+            assert_eq!(data["requested"], bogus);
+            let supported: Vec<&str> = data["supported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(supported, crate::protocol::SUPPORTED_PROTOCOL_VERSIONS);
+        }
+    }
+
+    /// The compat hinge: no `_meta` at all is a pre-2026-07-28 peer and must
+    /// take exactly the old path, never an error.
+    #[tokio::test]
+    async fn test_absent_version_takes_the_legacy_path() {
+        let mut server = test_server();
+        server.tools.push(Tool {
+            name: "sentry__search".to_string(),
+            description: None,
+            input_schema: None,
+            annotations: None,
+        });
+        let req = JsonRpcRequest::new(1, "tools/list", None);
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["tools"][0]["name"], "sentry__search");
+    }
+
+    /// Params present but carrying no `_meta` (the shape every legacy
+    /// `tools/call` has) must not be mistaken for a version declaration.
+    #[tokio::test]
+    async fn test_params_without_meta_are_not_a_version_declaration() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "ghost__x"})));
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, error_codes::INVALID_PARAMS);
+        assert!(err.message.contains("unknown tool"));
+    }
+
+    // --- 2026-07-28: server/discover ---
+
+    /// Asserted against the RAW wire JSON, not a round trip through our own
+    /// `ServerDiscoverResult`: a struct that both encodes and decodes the
+    /// wrong field name round-trips perfectly against itself while failing
+    /// against every real peer. That is exactly the bug this pins.
+    #[tokio::test]
+    async fn test_server_discover_advertises_every_supported_revision() {
+        let req = JsonRpcRequest::new(1, "server/discover", None);
+        let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+
+        let versions: Vec<&str> = result["supportedVersions"]
+            .as_array()
+            .expect("spec field name is `supportedVersions`")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(versions, crate::protocol::SUPPORTED_PROTOCOL_VERSIONS);
+        assert!(versions.contains(&crate::protocol::PROTOCOL_VERSION_LEGACY));
+
+        // The pre-release shape we shipped by mistake must not come back.
+        assert!(result.get("protocolVersions").is_none());
+        assert!(result.get("serverInfo").is_none());
+
+        assert!(result["capabilities"]["tools"].is_object());
+        // Identity lives in `_meta`, keyed by the reverse-DNS name.
+        let info = &result["_meta"][meta_keys::SERVER_INFO];
+        assert_eq!(info["name"], "mcp-proxy");
+        assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// The spec page says discovery supports caching and its example even
+    /// carries `cacheScope: "public"`. Ours is `private` on purpose — see
+    /// `set_private_cache_hints`.
+    #[tokio::test]
+    async fn test_server_discover_is_cacheable_but_never_public() {
+        let req = JsonRpcRequest::new(1, "server/discover", None);
+        let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+        let result = resp.result.unwrap();
+        assert_eq!(result["resultType"], crate::protocol::RESULT_TYPE_COMPLETE);
+        assert_eq!(result["ttlMs"], DISCOVER_TTL_MS);
+        assert_eq!(result["cacheScope"], "private");
+    }
+
+    #[tokio::test]
+    async fn test_server_discover_capabilities_match_initialize() {
+        let discover = dispatch(
+            test_server(),
+            JsonRpcRequest::new(1, "server/discover", None),
+            &AuthIdentity::anonymous(),
+            &None,
+        )
+        .await
+        .result
+        .unwrap();
+        let init = dispatch(
+            test_server(),
+            JsonRpcRequest::new(1, "initialize", None),
+            &AuthIdentity::anonymous(),
+            &None,
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(discover["capabilities"], init["capabilities"]);
+        // `initialize` keeps identity at the top level (that is its 2025-era
+        // shape); `server/discover` moves it into `_meta`. Same value, two
+        // envelopes — they must never drift.
+        assert_eq!(
+            discover["_meta"][meta_keys::SERVER_INFO],
+            init["serverInfo"]
+        );
+    }
+
+    // --- 2026-07-28: initialize stays legacy-friendly ---
+
+    #[tokio::test]
+    async fn test_initialize_echoes_the_clients_revision() {
+        for requested in ["2025-11-25", "2025-06-18", "2024-11-05"] {
+            let req =
+                JsonRpcRequest::new(1, "initialize", Some(json!({"protocolVersion": requested})));
+            let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+            assert_eq!(
+                resp.result.unwrap()["protocolVersion"],
+                requested,
+                "a {requested} client must be answered in its own revision"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_initialize_falls_back_to_newest_for_unknown_revision() {
+        let req = JsonRpcRequest::new(
+            1,
+            "initialize",
+            Some(json!({"protocolVersion": "1999-01-01"})),
+        );
+        let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+        assert_eq!(
+            resp.result.unwrap()["protocolVersion"],
+            crate::protocol::PROTOCOL_VERSION
+        );
+    }
+
+    // --- 2026-07-28: CacheableResult hints ---
+
+    /// A shared intermediary that cached one identity's list would hand it to
+    /// the next identity — our lists are ACL-filtered, so the scope MUST be
+    /// private on every one of them.
+    #[tokio::test]
+    async fn test_list_results_are_private_and_carry_a_ttl() {
+        for method in ["tools/list", "resources/list", "prompts/list"] {
+            let req = JsonRpcRequest::new(1, method, None);
+            let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+            let result = resp.result.unwrap();
+            assert_eq!(result["cacheScope"], "private", "{method} must be private");
+            assert_eq!(result["ttlMs"], LIST_TTL_MS, "{method} must carry a ttl");
+        }
+    }
+
+    #[test]
+    fn test_cache_hints_helper_never_marks_a_result_public() {
+        let mut result = json!({"contents": []});
+        set_private_cache_hints(&mut result, RESOURCE_READ_TTL_MS, true);
+        assert_eq!(result["cacheScope"], "private");
+        assert_eq!(result["ttlMs"], 0);
+    }
+
+    // --- 2026-07-28: result envelope ---
+
+    #[tokio::test]
+    async fn test_results_carry_result_type_and_server_info() {
+        for method in [
+            "initialize",
+            "tools/list",
+            "prompts/list",
+            "server/discover",
+        ] {
+            let req = JsonRpcRequest::new(1, method, None);
+            let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+            let result = resp.result.unwrap();
+            assert_eq!(
+                result["resultType"],
+                crate::protocol::RESULT_TYPE_COMPLETE,
+                "{method} must declare a resultType"
+            );
+            assert_eq!(result["_meta"][meta_keys::SERVER_INFO]["name"], "mcp-proxy");
+        }
+    }
+
+    /// The envelope is additive: everything a legacy client already read is
+    /// still exactly where it was.
+    #[tokio::test]
+    async fn test_result_envelope_does_not_disturb_legacy_fields() {
+        let mut server = test_server();
+        server.tools.push(Tool {
+            name: "sentry__search".to_string(),
+            description: Some("[sentry] Search".to_string()),
+            input_schema: Some(json!({"type": "object"})),
+            annotations: None,
+        });
+        let req = JsonRpcRequest::new(1, "tools/list", None);
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        let result = resp.result.unwrap();
+        assert_eq!(
+            result["tools"],
+            json!([{
+                "name": "sentry__search",
+                "description": "[sentry] Search",
+                "inputSchema": {"type": "object"}
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_responses_get_no_result_envelope() {
+        let req = JsonRpcRequest::new(1, "unknown/method", None);
+        let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, error_codes::METHOD_NOT_FOUND);
+    }
+
+    // --- 2026-07-28: deterministic list ordering ---
+
+    #[tokio::test]
+    async fn test_tools_list_is_sorted_regardless_of_registration_order() {
+        let mut server = test_server();
+        for name in ["zeta__b", "alpha__z", "zeta__a", "alpha__a"] {
+            server.tools.push(Tool {
+                name: name.to_string(),
+                description: None,
+                input_schema: None,
+                annotations: None,
+            });
+        }
+        let req = JsonRpcRequest::new(1, "tools/list", None);
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        let result = resp.result.unwrap();
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["alpha__a", "alpha__z", "zeta__a", "zeta__b"]);
+    }
+
+    #[tokio::test]
+    async fn test_prompts_and_resources_lists_are_sorted() {
+        let mut server = test_server();
+        server.register_prompts(
+            "zz",
+            &[Prompt {
+                name: "p".to_string(),
+                description: None,
+                arguments: None,
+            }],
+        );
+        server.register_prompts(
+            "aa",
+            &[Prompt {
+                name: "p".to_string(),
+                description: None,
+                arguments: None,
+            }],
+        );
+        server.register_resources(
+            "zz",
+            &[Resource {
+                uri: "r://1".to_string(),
+                name: "r".to_string(),
+                description: None,
+                mime_type: None,
+                annotations: None,
+            }],
+        );
+        server.register_resources(
+            "aa",
+            &[Resource {
+                uri: "r://1".to_string(),
+                name: "r".to_string(),
+                description: None,
+                mime_type: None,
+                annotations: None,
+            }],
+        );
+        let proxy: SharedProxy = Arc::new(Mutex::new(server));
+        let id = AuthIdentity::anonymous();
+
+        let prompts = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(1, "prompts/list", None),
+            &id,
+            &None,
+            "test",
+            true,
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(prompts["prompts"][0]["name"], "aa__p");
+
+        let resources = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(2, "resources/list", None),
+            &id,
+            &None,
+            "test",
+            true,
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(resources["resources"][0]["uri"], "aa__r://1");
+    }
+
+    // --- 2026-07-28: MRTR relay through the proxy ---
+
+    /// Params every `tools/call` the stub backend saw, in order.
+    type SeenParams = Arc<Mutex<Vec<Value>>>;
+
+    /// Spawn a minimal MCP backend over HTTP that answers `tools/call` with
+    /// an MRTR interim result until the client comes back with
+    /// `inputResponses`. Returns its URL and the params it observed.
+    async fn spawn_mrtr_backend() -> (String, SeenParams) {
+        use axum::extract::State;
+        use axum::routing::post;
+
+        let seen: SeenParams = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/",
+                post(|State(seen): State<SeenParams>, body: String| async move {
+                    let msg: Value = serde_json::from_str(&body).unwrap();
+                    let Some(id) = msg.get("id").cloned() else {
+                        // notifications/initialized
+                        return axum::Json(Value::Null);
+                    };
+                    let params = msg.get("params").cloned().unwrap_or(json!({}));
+                    let result = match msg["method"].as_str().unwrap() {
+                        "initialize" => json!({
+                            "protocolVersion": crate::protocol::PROTOCOL_VERSION_LEGACY,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "stub", "version": "0"}
+                        }),
+                        // All three methods the spec allows an
+                        // `InputRequiredResult` on behave identically here.
+                        "tools/call" | "resources/read" | "prompts/get" => {
+                            seen.lock().await.push(params.clone());
+                            if let Some(responses) = params.get("inputResponses") {
+                                json!({
+                                    "resultType": "complete",
+                                    "content": [{"type": "text", "text": responses.to_string()}],
+                                    // A `resources/read` reply's real payload,
+                                    // so URI namespacing stays exercised.
+                                    "contents": [{"uri": "doc://1", "text": "body"}],
+                                    "messages": [],
+                                    "echoedState": params.get("requestState"),
+                                })
+                            } else {
+                                json!({
+                                    "resultType": "input_required",
+                                    "inputRequests": [{"id": "confirm", "prompt": "sure?"}],
+                                    "requestState": "opaque-token"
+                                })
+                            }
+                        }
+                        other => panic!("stub backend got unexpected method {other}"),
+                    };
+                    axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+                }),
+            )
+            .with_state(Arc::clone(&seen));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/"), seen)
+    }
+
+    /// A backend whose `tools/call` result carries a **scalar** `_meta`.
+    /// `_meta` is an object by spec, but a backend is not obliged to be
+    /// correct, and a scalar there used to silently swallow the proxy's own
+    /// serverInfo stamp.
+    async fn spawn_scalar_meta_backend() -> (String, SeenParams) {
+        use axum::extract::State;
+        use axum::routing::post;
+
+        let seen: SeenParams = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/",
+                post(|State(seen): State<SeenParams>, body: String| async move {
+                    let msg: Value = serde_json::from_str(&body).unwrap();
+                    let Some(id) = msg.get("id").cloned() else {
+                        return axum::Json(Value::Null);
+                    };
+                    let params = msg.get("params").cloned().unwrap_or(json!({}));
+                    let result = match msg["method"].as_str().unwrap() {
+                        "initialize" => json!({
+                            "protocolVersion": crate::protocol::PROTOCOL_VERSION_LEGACY,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "stub", "version": "0"}
+                        }),
+                        "tools/call" => {
+                            seen.lock().await.push(params.clone());
+                            json!({
+                                "content": [{"type": "text", "text": "hi"}],
+                                "_meta": "scalar",
+                            })
+                        }
+                        other => panic!("stub backend got unexpected method {other}"),
+                    };
+                    axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+                }),
+            )
+            .with_state(Arc::clone(&seen));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/"), seen)
+    }
+
+    /// Install a live client for `stub` exposing one primitive of each kind,
+    /// so every method the spec allows an `InputRequiredResult` on is
+    /// reachable through the real dispatch path.
+    async fn proxy_with_stub_backend(url: &str) -> SharedProxy {
+        let client = Arc::new(McpClient::connect_via_proxy(url).await.unwrap());
+        let mut server = test_server();
+        server.install_client(
+            "stub",
+            client,
+            &[Tool {
+                name: "ask".to_string(),
+                description: None,
+                input_schema: None,
+                annotations: None,
+            }],
+            &[Resource {
+                uri: "doc://1".to_string(),
+                name: "doc".to_string(),
+                description: None,
+                mime_type: None,
+                annotations: None,
+            }],
+            &[Prompt {
+                name: "brief".to_string(),
+                description: None,
+                arguments: None,
+            }],
+        );
+        Arc::new(Mutex::new(server))
+    }
+
+    #[tokio::test]
+    async fn test_mrtr_round_trip_relays_both_directions() {
+        let (url, seen) = spawn_mrtr_backend().await;
+        let proxy = proxy_with_stub_backend(&url).await;
+        let identity = AuthIdentity::anonymous();
+
+        // Leg 1: the backend asks for more input. The proxy must hand that
+        // back untouched instead of failing to parse a result with no
+        // `content`.
+        let first = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(
+                1,
+                "tools/call",
+                Some(json!({"name": "stub__ask", "arguments": {"q": "delete?"}})),
+            ),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert!(first.error.is_none(), "MRTR interim result must not error");
+        let interim = first.result.unwrap();
+        assert!(crate::protocol::is_input_required(&interim));
+        assert_eq!(interim["inputRequests"][0]["id"], "confirm");
+        assert_eq!(interim["requestState"], "opaque-token");
+
+        // Leg 2: the client retries the original request carrying its
+        // answers plus the opaque state it was given.
+        let second = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(
+                2,
+                "tools/call",
+                Some(json!({
+                    "name": "stub__ask",
+                    "arguments": {"q": "delete?"},
+                    "inputResponses": [{"id": "confirm", "value": true}],
+                    "requestState": interim["requestState"],
+                })),
+            ),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert!(second.error.is_none());
+        let final_result = second.result.unwrap();
+        assert_eq!(
+            final_result["resultType"],
+            crate::protocol::RESULT_TYPE_COMPLETE
+        );
+        assert_eq!(final_result["echoedState"], "opaque-token");
+
+        // And the backend really received the MRTR fields, un-namespaced.
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["name"], "ask");
+        assert_eq!(seen[0]["arguments"]["q"], "delete?");
+        assert!(seen[0].get("inputResponses").is_none());
+        assert_eq!(seen[1]["name"], "ask");
+        assert_eq!(seen[1]["arguments"]["q"], "delete?");
+        assert_eq!(seen[1]["inputResponses"][0]["value"], true);
+        assert_eq!(seen[1]["requestState"], "opaque-token");
+    }
+
+    /// The interim result is relayed verbatim — in particular the envelope
+    /// stamping must not overwrite `input_required` with `complete`.
+    #[tokio::test]
+    async fn test_relayed_interim_result_keeps_its_result_type() {
+        let (url, _seen) = spawn_mrtr_backend().await;
+        let proxy = proxy_with_stub_backend(&url).await;
+        let resp = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "stub__ask"}))),
+            &AuthIdentity::anonymous(),
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert_eq!(
+            resp.result.unwrap()["resultType"],
+            crate::protocol::RESULT_TYPE_INPUT_REQUIRED
+        );
+    }
+
+    // --- 2026-07-28: MRTR on resources/read and prompts/get ---
+
+    /// The spec permits an `InputRequiredResult` on `resources/read` and
+    /// `prompts/get` too. Parsing them eagerly turned a legal interim result
+    /// into a -32603, and a retry's answers never reached the backend.
+    #[tokio::test]
+    async fn test_mrtr_round_trip_on_resources_read() {
+        let (url, seen) = spawn_mrtr_backend().await;
+        let proxy = proxy_with_stub_backend(&url).await;
+        let identity = AuthIdentity::anonymous();
+
+        let first = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(1, "resources/read", Some(json!({"uri": "stub__doc://1"}))),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert!(first.error.is_none(), "an interim result must not error");
+        let interim = first.result.unwrap();
+        assert!(crate::protocol::is_input_required(&interim));
+        assert_eq!(interim["requestState"], "opaque-token");
+
+        let second = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(
+                2,
+                "resources/read",
+                Some(json!({
+                    "uri": "stub__doc://1",
+                    "inputResponses": {"confirm": {"action": "accept"}},
+                    "requestState": interim["requestState"],
+                })),
+            ),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert!(second.error.is_none());
+        let final_result = second.result.unwrap();
+        assert_eq!(final_result["echoedState"], "opaque-token");
+        // Namespacing still happens on the raw relay path.
+        assert_eq!(final_result["contents"][0]["uri"], "stub__doc://1");
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 2);
+        // Un-namespaced URI, and the retry carried the continuation.
+        assert_eq!(seen[0]["uri"], "doc://1");
+        assert!(seen[0].get("inputResponses").is_none());
+        assert_eq!(seen[1]["uri"], "doc://1");
+        assert_eq!(seen[1]["inputResponses"]["confirm"]["action"], "accept");
+        assert_eq!(seen[1]["requestState"], "opaque-token");
+    }
+
+    #[tokio::test]
+    async fn test_mrtr_round_trip_on_prompts_get() {
+        let (url, seen) = spawn_mrtr_backend().await;
+        let proxy = proxy_with_stub_backend(&url).await;
+        let identity = AuthIdentity::anonymous();
+
+        let first = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(
+                1,
+                "prompts/get",
+                Some(json!({"name": "stub__brief", "arguments": {"topic": "x"}})),
+            ),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert!(first.error.is_none(), "an interim result must not error");
+        let interim = first.result.unwrap();
+        assert!(crate::protocol::is_input_required(&interim));
+
+        let second = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(
+                2,
+                "prompts/get",
+                Some(json!({
+                    "name": "stub__brief",
+                    "arguments": {"topic": "x"},
+                    "inputResponses": {"confirm": {"action": "accept"}},
+                    "requestState": interim["requestState"],
+                })),
+            ),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert!(second.error.is_none());
+        assert_eq!(second.result.unwrap()["echoedState"], "opaque-token");
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["name"], "brief");
+        assert_eq!(seen[0]["arguments"]["topic"], "x");
+        assert_eq!(seen[1]["inputResponses"]["confirm"]["action"], "accept");
+        assert_eq!(seen[1]["requestState"], "opaque-token");
+    }
+
+    // --- 2026-07-28: the relay path is not the backend's megaphone ---
+
+    /// A backend that dictates cache directives defeats the whole
+    /// "never public" invariant: the proxy, not the backend, decides who may
+    /// cache an ACL-gated answer.
+    async fn spawn_hostile_backend() -> String {
+        use axum::routing::post;
+
+        let app = axum::Router::new().route(
+            "/",
+            post(|body: String| async move {
+                let msg: Value = serde_json::from_str(&body).unwrap();
+                let Some(id) = msg.get("id").cloned() else {
+                    return axum::Json(Value::Null);
+                };
+                let result = match msg["method"].as_str().unwrap() {
+                    "initialize" => json!({
+                        "protocolVersion": crate::protocol::PROTOCOL_VERSION_LEGACY,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "hostile", "version": "0"}
+                    }),
+                    _ => json!({
+                        "resultType": "definitely-not-a-real-result-type",
+                        "cacheScope": "public",
+                        "ttlMs": 86_400_000u64,
+                        "content": [{"type": "text", "text": "ok"}],
+                        "contents": [{"uri": "doc://1", "text": "body"}],
+                        // Unknown/extension fields must survive untouched.
+                        "structuredContent": {"rows": [1, 2]},
+                        "isError": false,
+                        "_meta": {
+                            crate::protocol::meta_keys::SERVER_INFO:
+                                {"name": "totally-the-proxy", "version": "9.9.9"}
+                        },
+                    }),
+                };
+                axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn test_backend_cannot_dictate_cache_hints_or_identity() {
+        let url = spawn_hostile_backend().await;
+        let proxy = proxy_with_stub_backend(&url).await;
+        let identity = AuthIdentity::anonymous();
+
+        let call = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "stub__ask"}))),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await
+        .result
+        .unwrap();
+        // `tools/call` is not a CacheableResult, so no hints at all.
+        assert!(call.get("cacheScope").is_none());
+        assert!(call.get("ttlMs").is_none());
+        // An unrecognized resultType is normalized, never relayed.
+        assert_eq!(call["resultType"], crate::protocol::RESULT_TYPE_COMPLETE);
+        // Identity is ours, not whatever the backend claimed.
+        assert_eq!(call["_meta"][meta_keys::SERVER_INFO]["name"], "mcp-proxy");
+        // Everything else still passes through.
+        assert_eq!(call["structuredContent"]["rows"][1], 2);
+        assert_eq!(call["isError"], false);
+        assert_eq!(call["content"][0]["text"], "ok");
+
+        // `resources/read` is cacheable — the proxy re-stamps its own hints
+        // over the backend's.
+        let read = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(2, "resources/read", Some(json!({"uri": "stub__doc://1"}))),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await
+        .result
+        .unwrap();
+        assert_eq!(read["cacheScope"], "private");
+        assert_eq!(read["ttlMs"], RESOURCE_READ_TTL_MS);
+        assert_eq!(read["structuredContent"]["rows"][0], 1);
+
+        let get = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(3, "prompts/get", Some(json!({"name": "stub__brief"}))),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await
+        .result
+        .unwrap();
+        assert!(get.get("cacheScope").is_none());
+        assert!(get.get("ttlMs").is_none());
+        assert_eq!(get["resultType"], crate::protocol::RESULT_TYPE_COMPLETE);
+    }
+
+    /// The sanitizer must not be able to swallow a genuine MRTR interim
+    /// result — that is the one `resultType` a client has to see.
+    #[test]
+    fn test_sanitize_keeps_input_required_and_strips_cache_hints() {
+        let interim = json!({
+            "resultType": "input_required",
+            "inputRequests": {"confirm": {}},
+            "requestState": "opaque",
+            "cacheScope": "public",
+            "ttlMs": 999,
+        });
+        // Preserved for BOTH kinds of peer: dropping it would report an
+        // unfinished exchange as finished.
+        for stateless_peer in [true, false] {
+            let mut interim = interim.clone();
+            sanitize_relayed_result(&mut interim, stateless_peer);
+            assert_eq!(
+                interim["resultType"],
+                crate::protocol::RESULT_TYPE_INPUT_REQUIRED,
+                "stateless_peer={stateless_peer}"
+            );
+            assert_eq!(interim["requestState"], "opaque");
+            // Cache directives are never the backend's to write, whoever asked.
+            assert!(interim.get("cacheScope").is_none());
+            assert!(interim.get("ttlMs").is_none());
+        }
+
+        // A pre-2026-07-28 backend omits the field entirely; that reads as
+        // `complete`, exactly as it always did.
+        let mut legacy = json!({"content": [{"type": "text", "text": "hi"}]});
+        sanitize_relayed_result(&mut legacy, true);
+        assert_eq!(legacy["resultType"], crate::protocol::RESULT_TYPE_COMPLETE);
+        assert_eq!(legacy["content"][0]["text"], "hi");
+
+        // Non-object results must not panic.
+        let mut scalar = json!("nope");
+        sanitize_relayed_result(&mut scalar, true);
+        assert_eq!(scalar, json!("nope"));
+    }
+
+    /// Finding 7: a backend that answers with a scalar `_meta` must not be
+    /// able to suppress the proxy's own serverInfo. `set_result_meta` refuses
+    /// to write into a non-object, so without normalization the client got the
+    /// backend's scalar and no serverInfo at all.
+    #[tokio::test]
+    async fn test_backend_scalar_meta_cannot_suppress_the_server_info_stamp() {
+        let (url, _seen) = spawn_scalar_meta_backend().await;
+        let proxy = proxy_with_stub_backend(&url).await;
+        let resp = dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "stub__ask"}))),
+            &AuthIdentity::anonymous(),
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        let result = resp.result.expect("the call succeeded");
+        assert_eq!(
+            result["_meta"][meta_keys::SERVER_INFO]["name"],
+            "mcp-proxy",
+            "the backend's scalar _meta swallowed the stamp: {result}"
+        );
+        assert_eq!(result["content"][0]["text"], "hi");
+    }
+
+    /// Finding 2: a peer that never declared 2026-07-28 must not receive the
+    /// fields that revision added. Two extra keys are not "inert" — the peer
+    /// negotiated a revision in which they do not exist.
+    #[tokio::test]
+    async fn test_legacy_peer_gets_no_result_envelope_or_cache_hints() {
+        for method in ["initialize", "tools/list", "prompts/list", "resources/list"] {
+            let req = JsonRpcRequest::new(1, method, None);
+            let result = dispatch_as(test_server(), req, &AuthIdentity::anonymous(), &None, false)
+                .await
+                .result
+                .expect("{method} succeeded");
+            for field in ["resultType", "ttlMs", "cacheScope"] {
+                assert!(
+                    result.get(field).is_none(),
+                    "{method} sent a legacy peer a {field}: {result}"
+                );
+            }
+            assert!(
+                result
+                    .get("_meta")
+                    .and_then(|m| m.get(meta_keys::SERVER_INFO))
+                    .is_none(),
+                "{method} sent a legacy peer _meta.serverInfo: {result}"
+            );
+        }
+    }
+
+    /// What each transport hands `dispatch_request` as `stateless_peer`.
+    /// `server/discover` did not exist before 2026-07-28, so a peer calling it
+    /// is a 2026-07-28 peer whether or not it spelled the version out — and
+    /// its result is required to carry the envelope.
+    #[test]
+    fn test_body_declares_stateless_reads_meta_and_the_discover_method() {
+        let bare = |m: &str| JsonRpcRequest::new(1, m, None);
+        let versioned = |v: &str| {
+            JsonRpcRequest::new(
+                1,
+                "tools/list",
+                Some(json!({"_meta": {meta_keys::PROTOCOL_VERSION: v}})),
+            )
+        };
+
+        assert!(body_declares_stateless(&bare("server/discover")));
+        assert!(body_declares_stateless(&versioned(
+            crate::protocol::PROTOCOL_VERSION
+        )));
+
+        assert!(!body_declares_stateless(&bare("tools/list")));
+        assert!(!body_declares_stateless(&bare("initialize")));
+        assert!(!body_declares_stateless(&versioned(
+            crate::protocol::PROTOCOL_VERSION_LEGACY
+        )));
+        assert!(!body_declares_stateless(&versioned("2024-11-05")));
+        // A later date we do not speak must not buy 2026-07-28 semantics:
+        // `is_stateless_version` is an ordering test, not a membership one.
+        assert!(!body_declares_stateless(&versioned("2099-01-01")));
+    }
+
+    #[test]
+    fn test_namespace_resource_contents_only_rewrites_the_uri_it_read() {
+        let mut result = json!({
+            "contents": [
+                {"uri": "doc://1", "text": "a"},
+                {"uri": "doc://other", "text": "b"},
+                "not-an-object"
+            ]
+        });
+        namespace_resource_contents(&mut result, "stub", "doc://1");
+        assert_eq!(result["contents"][0]["uri"], "stub__doc://1");
+        assert_eq!(result["contents"][1]["uri"], "doc://other");
+
+        // An interim result has no `contents` at all — absence is normal.
+        let mut interim = json!({"resultType": "input_required"});
+        namespace_resource_contents(&mut interim, "stub", "doc://1");
+        assert!(interim.get("contents").is_none());
+    }
+
+    /// A relayed continuation is still a privileged call. The audit entry has
+    /// to say the request resumed an MRTR exchange, without ever recording
+    /// the answers themselves.
+    #[tokio::test]
+    async fn test_mrtr_continuation_is_recorded_in_the_audit_entry() {
+        let (url, _seen) = spawn_mrtr_backend().await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = Arc::new(McpClient::connect_via_proxy(&url).await.unwrap());
+        let mut server = ProxyServer::new(
+            Arc::new(AuditLogger::Stream { sender: tx }),
+            HashMap::new(),
+            HashMap::new(),
+            ToolCacheStore::new(Arc::new(crate::db::DbPool::disabled())),
+        );
+        server.install_client(
+            "stub",
+            client,
+            &[Tool {
+                name: "ask".to_string(),
+                description: None,
+                input_schema: None,
+                annotations: None,
+            }],
+            &[],
+            &[],
+        );
+        let proxy: SharedProxy = Arc::new(Mutex::new(server));
+        let identity = AuthIdentity::anonymous();
+
+        // A plain call is not a continuation and records nothing.
+        dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "stub__ask"}))),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        assert!(rx.recv().await.unwrap().arguments.is_none());
+
+        // The retry is, and it must stay attributable as one.
+        dispatch_request(
+            &proxy,
+            JsonRpcRequest::new(
+                2,
+                "tools/call",
+                Some(json!({
+                    "name": "stub__ask",
+                    "inputResponses": {"confirm": {"secret": "hunter2"}},
+                    "requestState": "opaque",
+                })),
+            ),
+            &identity,
+            &None,
+            "test",
+            true,
+        )
+        .await;
+        let recorded = rx
+            .recv()
+            .await
+            .unwrap()
+            .arguments
+            .expect("continuation must be recorded");
+        assert_eq!(
+            recorded,
+            json!({"mrtrContinuation": ["inputResponses", "requestState"]})
+        );
+        // Never the payload itself — those answers routinely hold secrets.
+        assert!(!recorded.to_string().contains("hunter2"));
     }
 }

@@ -461,6 +461,82 @@ async fn e2e_acl_discriminates_oauth_vs_admin_roles() {
 }
 
 #[tokio::test]
+async fn e2e_authorize_iss_matches_advertised_issuer() {
+    // RFC 9207 end to end: the `iss` on the authorization redirect is what
+    // an MCP client compares against the issuer it recorded from
+    // discovery. If the two ever drift apart every compliant client aborts
+    // the flow, so pin them together here rather than in isolation.
+    let _g = InlineSaveGuard::acquire();
+    let cfg = cfg_for_e2e();
+    let state = Arc::new(AsState::default());
+    let chain = build_chain(cfg.clone(), state.clone(), None);
+
+    let harness = Harness::start(cfg, state, chain, None).await;
+
+    let asm: Value = Client::new()
+        .get(format!(
+            "{}/.well-known/oauth-authorization-server",
+            harness.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let advertised_issuer = asm["issuer"].as_str().unwrap().to_string();
+
+    let dcr: Value = Client::new()
+        .post(format!("{}/register", harness.base))
+        .json(&serde_json::json!({
+            "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+            "application_type": "native"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let client_id = dcr["client_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        dcr["application_type"], "native",
+        "AS must accept SEP-837 application_type: {dcr}"
+    );
+
+    let (_, challenge) = crate::auth::oauth_primitives::generate_pkce();
+    let no_redirect = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = no_redirect
+        .get(format!("{}/authorize", harness.base))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", "https://claude.ai/api/mcp/auth_callback"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("state", "csrf-state"),
+        ])
+        .header("X-Forwarded-User", "alice@example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    let url = url::Url::parse(loc).unwrap();
+    let iss = url
+        .query_pairs()
+        .find(|(k, _)| k == "iss")
+        .expect("authorization redirect must carry RFC 9207 iss")
+        .1
+        .to_string();
+    assert_eq!(iss, advertised_issuer);
+}
+
+#[tokio::test]
 async fn e2e_mcp_rejects_invalid_jwt() {
     let _g = InlineSaveGuard::acquire();
     let cfg = cfg_for_e2e();

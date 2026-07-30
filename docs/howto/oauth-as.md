@@ -205,6 +205,61 @@ contract as `MCP_AUTH_CONFIG` for the client store.
 - **Refresh tokens rotate** on every successful refresh. A captured
   refresh token is valid for one use at most.
 
+- **Authorization responses carry `iss`** ([RFC 9207][rfc9207]). The
+  redirect back to the client appends `iss=<issuerUrl>` next to `code`
+  and `state`, normalized the same way the metadata endpoint
+  normalizes it (trailing slash trimmed), so the client's string
+  comparison matches. This closes the AS mix-up attack: a client
+  running flows against several authorization servers can prove the
+  code came from the one it started with.
+
+  The `mcp` client validates `iss` **when it is present** and fails
+  the flow on a mismatch. An authorization server that sends no `iss`
+  keeps working unchanged.
+
+- **Discovery documents are validated against where they came from**
+  ([RFC 8414][rfc8414] §3.3). The `issuer` inside
+  `/.well-known/oauth-authorization-server` must be identical to the
+  origin the document was fetched from, or the client aborts. Without
+  that check, a hostile server could declare any issuer it liked — and
+  the issuer is exactly what the `iss` comparison above and the client
+  registration key below are built on. A document that omits `issuer`
+  altogether is still accepted: hand-rolled metadata routinely does,
+  and there is no identity to reject on.
+
+## Client registrations are bound to the issuer
+
+On the client side, `mcp` stores the `client_id` it obtained from
+Dynamic Client Registration keyed by the **authorization server's
+`issuer`**, not by the MCP server URL. One AS's `client_id` is never
+replayed against another, even for the same MCP server. Access and
+refresh tokens stay keyed by MCP server URL — they are scoped to the
+resource server, not the issuer.
+
+Stores written by older builds keyed registrations by MCP server URL.
+They are migrated in place on first read: `auth.json` gains a
+`version` field and the old entries move to `legacy_clients`, where
+they keep working. Each one is re-keyed under an issuer only once a
+token exchange with that issuer has actually succeeded — a server
+merely *claiming* an issuer never gets to adopt a credential, which
+would let it overwrite that issuer's registration. **Nothing has to be
+re-registered and nobody has to re-login.**
+
+Registration requests now also send `application_type: "native"`
+(SEP-837), which is what stops OIDC-flavored authorization servers
+from rejecting localhost redirect URIs. `mcp serve`'s own AS accepts
+the field, echoes it back per RFC 7591 §3.2.1 when sent, and imposes
+no redirect constraints from it — clients that omit it are equally
+fine.
+
+## DCR is deprecated (but still supported)
+
+MCP 2026-07-28 deprecates Dynamic Client Registration in favour of
+Client ID Metadata Documents (CIMD), with a 12-month window before
+removal. `mcp serve` **keeps its `/register` endpoint working** and
+the client keeps using it — nothing in this guide changes today. CIMD
+is not implemented yet.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -213,6 +268,8 @@ contract as `MCP_AUTH_CONFIG` for the client store.
 | `400 redirect_uri rejected: …` | URI not in `redirectUriAllowlist` *or* not registered by the client. |
 | `400 invalid_grant` on `/token` | Code expired (60s default), already used, or PKCE verifier doesn't match. |
 | Claude.ai: "couldn't connect" with no error | The discovery endpoints returned non-JSON or 5xx. Curl them. |
+| `issuer mismatch in OAuth callback` | The AS returned an `iss` that doesn't match its advertised `issuer`. Check `issuerUrl` against what `/.well-known/oauth-authorization-server` publishes. |
+| `authorization server metadata declares issuer … but was fetched from …` | RFC 8414 §3.3 violation: `issuerUrl` doesn't match the origin serving the metadata. Usually a reverse proxy rewriting the host. |
 | Boot fails: `oauthAs.jwtSecret must be at least 32 bytes` | The env var is empty or shorter. |
 | Boot fails: `oauthAs.trustedSourceCidrs must list at least one CIDR` | The anti-spoof list was left empty. |
 
@@ -222,10 +279,13 @@ contract as `MCP_AUTH_CONFIG` for the client store.
 - RFC 7591 — Dynamic Client Registration: <https://www.rfc-editor.org/rfc/rfc7591>
 - RFC 8414 — Authorization Server Metadata: <https://www.rfc-editor.org/rfc/rfc8414>
 - RFC 9728 — Protected Resource Metadata: <https://www.rfc-editor.org/rfc/rfc9728>
+- RFC 9207 — Authorization Server Issuer Identification: <https://www.rfc-editor.org/rfc/rfc9207>
 - RFC 7636 — PKCE: <https://www.rfc-editor.org/rfc/rfc7636>
 - Claude.ai Custom Connectors: <https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp>
 
 [rfc7591]: https://www.rfc-editor.org/rfc/rfc7591
+[rfc9207]: https://www.rfc-editor.org/rfc/rfc9207
+[rfc8414]: https://www.rfc-editor.org/rfc/rfc8414
 [mcp-auth]: https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization
 [oauth2-proxy]: https://oauth2-proxy.github.io/oauth2-proxy/
 [src-chain]: https://github.com/avelino/mcp/blob/main/src/server_auth/providers.rs
