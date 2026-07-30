@@ -6,6 +6,7 @@ use crate::client;
 use crate::config;
 use crate::output;
 use crate::output::OutputFormat;
+use crate::protocol::Tool;
 use crate::spinner;
 
 pub async fn handle_server_command(
@@ -20,14 +21,38 @@ pub async fn handle_server_command(
         .get(server_name)
         .ok_or_else(|| anyhow::anyhow!("server \"{server_name}\" not found in config"))?;
 
+    // Route through a running `mcp serve` proxy (which keeps backends warm) when
+    // MCP_PROXY_URL is set — avoids the per-call cold start of spawning a fresh
+    // backend. The proxy namespaces tools as `{server}__{tool}`, so we prefix on
+    // calls and strip the prefix from listings. Falls back to a local spawn if
+    // the proxy is unreachable.
+    let proxy_url = std::env::var("MCP_PROXY_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty());
+    let mut via_proxy = false;
     let sp = spinner::Spinner::start(&format!("connecting to {server_name}..."));
-    let client = client::McpClient::connect(server_config).await?;
+    let client = match &proxy_url {
+        Some(url) => match client::McpClient::connect_via_proxy(url).await {
+            Ok(c) => {
+                via_proxy = true;
+                c
+            }
+            Err(e) => {
+                eprintln!("mcp: proxy {url} unreachable ({e}); spawning {server_name} locally");
+                client::McpClient::connect(server_config).await?
+            }
+        },
+        None => client::McpClient::connect(server_config).await?,
+    };
     sp.stop();
 
     if args.len() == 1 || (args.len() >= 2 && args[1] == "--list") {
         let start = std::time::Instant::now();
         let sp = spinner::Spinner::start("listing tools...");
-        let result = client.list_tools().await;
+        let result = client
+            .list_tools()
+            .await
+            .map(|tools| filter_if_proxy(tools, via_proxy, server_name));
         sp.stop();
 
         let (tools, success, error_message) = match &result {
@@ -85,13 +110,23 @@ pub async fn handle_server_command(
             classification_confidence: None,
         });
 
+        // The revision we agreed on is the single most useful thing a health
+        // check can report once two revisions are in play: it says whether we
+        // fell back to the legacy handshake or negotiated 2026-07-28. Added
+        // as a JSON field only — the text line stays byte-identical for
+        // whatever is already grepping it.
+        let protocol_version = client.protocol_version().to_string();
         client.shutdown().await?;
 
         match fmt {
             OutputFormat::Json => {
                 println!(
                     "{}",
-                    serde_json::json!({"server": server_name, "status": "ok"})
+                    serde_json::json!({
+                        "server": server_name,
+                        "status": "ok",
+                        "protocolVersion": protocol_version,
+                    })
                 );
             }
             OutputFormat::Text => {
@@ -104,7 +139,10 @@ pub async fn handle_server_command(
     if args.len() >= 2 && args[1] == "--info" {
         let start = std::time::Instant::now();
         let sp = spinner::Spinner::start("listing tools...");
-        let result = client.list_tools().await;
+        let result = client
+            .list_tools()
+            .await
+            .map(|tools| filter_if_proxy(tools, via_proxy, server_name));
         sp.stop();
 
         let (tools, success, error_message) = match &result {
@@ -147,9 +185,15 @@ pub async fn handle_server_command(
         crate::read_stdin_or_empty()?
     };
 
+    // The proxy addresses tools by their namespaced `{server}__{tool}` name.
+    let call_name = if via_proxy {
+        format!("{server_name}__{tool_name}")
+    } else {
+        tool_name.clone()
+    };
     let start = std::time::Instant::now();
     let sp = spinner::Spinner::start(&format!("calling {tool_name}..."));
-    let result = client.call_tool(tool_name, json_args.clone()).await;
+    let result = client.call_tool(&call_name, json_args.clone()).await;
     sp.stop();
 
     let (call_result, success, error_message) = match &result {
@@ -198,4 +242,87 @@ pub async fn handle_server_command(
     client.shutdown().await?;
 
     Ok(())
+}
+
+/// Strip a `{server}__` namespace prefix, returning the bare tool name when the
+/// prefix matches this exact server (not a longer one). `None` for tools that
+/// belong to a different backend or carry no namespace.
+fn strip_server_prefix<'a>(name: &'a str, server: &str) -> Option<&'a str> {
+    name.strip_prefix(server)
+        .and_then(|rest| rest.strip_prefix("__"))
+}
+
+/// Keep only this server's tools and strip the `{server}__` prefix so proxy-routed
+/// listings match the shape of a direct-spawn listing.
+fn filter_server_tools(tools: Vec<Tool>, server: &str) -> Vec<Tool> {
+    tools
+        .into_iter()
+        .filter_map(|mut t| {
+            let bare = strip_server_prefix(&t.name, server).map(str::to_string);
+            bare.map(|name| {
+                t.name = name;
+                t
+            })
+        })
+        .collect()
+}
+
+/// No-op unless routing through the proxy, where every backend's tools come back
+/// namespaced and must be narrowed to the requested server.
+fn filter_if_proxy(tools: Vec<Tool>, via_proxy: bool, server: &str) -> Vec<Tool> {
+    if via_proxy {
+        filter_server_tools(tools, server)
+    } else {
+        tools
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_prefix_matches_exact_server_only() {
+        assert_eq!(
+            strip_server_prefix("roam__get_page", "roam"),
+            Some("get_page")
+        );
+        assert_eq!(strip_server_prefix("roam__a__b", "roam"), Some("a__b"));
+        // different backend
+        assert_eq!(strip_server_prefix("github__gh_pr", "roam"), None);
+        // longer server name that merely starts with the prefix
+        assert_eq!(strip_server_prefix("roamx__t", "roam"), None);
+        // no namespace at all
+        assert_eq!(strip_server_prefix("bare", "roam"), None);
+    }
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn filter_keeps_only_this_server_and_strips_prefix() {
+        let tools = vec![
+            tool("roam__get_page"),
+            tool("github__gh_pr"),
+            tool("roam__search"),
+            tool("bare"),
+        ];
+        let names: Vec<_> = filter_server_tools(tools, "roam")
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["get_page", "search"]);
+    }
+
+    #[test]
+    fn filter_if_proxy_is_noop_when_local() {
+        let tools = vec![tool("roam__get_page"), tool("bare")];
+        let got = filter_if_proxy(tools, false, "roam");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "roam__get_page");
+    }
 }

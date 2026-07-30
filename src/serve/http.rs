@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::audit::{AuditEntry, AuditLogger};
 use crate::cache::ToolCacheStore;
 use crate::config::Config;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::protocol::{error_codes, JsonRpcRequest, JsonRpcResponse};
 use crate::server_auth::oauth_as::{self, AsState};
 use crate::server_auth::{self, AclConfig, AuthIdentity, AuthProvider, Credentials};
 use crate::telemetry::extract_parent_context;
@@ -79,10 +79,189 @@ async fn authenticate_request(
                 classification_source: None,
                 classification_confidence: None,
             });
-            let err =
-                JsonRpcResponse::error(Value::Null, -32000, &format!("authentication failed: {e}"));
+            let err = JsonRpcResponse::error(
+                Value::Null,
+                error_codes::PROXY_ERROR,
+                &format!("authentication failed: {e}"),
+            );
             Err((StatusCode::UNAUTHORIZED, Json(json!(err))))
         }
+    }
+}
+
+/// A `400 Bad Request` carrying a JSON-RPC parse error, for a body we could
+/// not read far enough to know its id.
+fn parse_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    let err = JsonRpcResponse::error(
+        Value::Null,
+        error_codes::PARSE_ERROR,
+        &format!("parse error: {e}"),
+    );
+    (StatusCode::BAD_REQUEST, Json(json!(err)))
+}
+
+/// Decode a routing header, or give back the rejection message for a
+/// sentinel that will not decode.
+///
+/// The spec lists "a header value contains invalid characters" as its own
+/// rejection condition, and both routing headers answer it the same way.
+fn decoded_header(declared: &str, header_name: &str) -> Result<String, String> {
+    crate::protocol::decode_header_value(declared)
+        .ok_or_else(|| format!("{header_name} header '{declared}' is a malformed Base64 sentinel"))
+}
+
+/// Validate the `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` request
+/// metadata headers against the JSON-RPC body. Returns the mismatch message,
+/// or `None` when everything lines up.
+///
+/// 2026-07-28 requires clients to *send* these on Streamable HTTP POSTs, but
+/// we deliberately only validate what is actually present: every
+/// pre-2026-07-28 client sends neither routing header, and clients from
+/// 2025-06-18 onwards send `MCP-Protocol-Version` with no `_meta` to compare
+/// it against. Demanding the full set would break all of them at once. A
+/// header that contradicts the body, on the other hand, means a gateway
+/// routed or metered on a lie — that we reject.
+fn check_routing_headers(headers: &HeaderMap, req: &JsonRpcRequest) -> Option<String> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    // The spec requires the header to agree with `_meta`'s protocolVersion.
+    // Only comparable when the body actually declares one; a header alone is
+    // the 2025-06-18-through-2025-11-25 shape and stays valid.
+    if let (Some(declared), Some(body_version)) = (
+        header(crate::protocol::HEADER_MCP_PROTOCOL_VERSION),
+        crate::protocol::request_protocol_version(req.params.as_ref()),
+    ) {
+        if declared != body_version {
+            return Some(format!(
+                "{} header '{declared}' does not match request _meta protocol version '{body_version}'",
+                crate::protocol::HEADER_MCP_PROTOCOL_VERSION
+            ));
+        }
+    }
+
+    // Decoded before comparing, exactly like `Mcp-Name` below. A method name
+    // is header-safe in practice, so this decode is never *needed* today —
+    // but the client runs every routing header through `protocol::header_value`
+    // on the way out, and an encode with no matching decode is the precise
+    // shape of the bug that already rejected every real `resources/read` once.
+    // Symmetry is cheaper than a reachability argument.
+    if let Some(declared) = header(crate::protocol::HEADER_MCP_METHOD) {
+        let decoded = match decoded_header(declared, crate::protocol::HEADER_MCP_METHOD) {
+            Ok(decoded) => decoded,
+            Err(message) => return Some(message),
+        };
+        if decoded != req.method {
+            return Some(format!(
+                "{} header '{declared}' does not match request method '{}'",
+                crate::protocol::HEADER_MCP_METHOD,
+                req.method
+            ));
+        }
+    }
+
+    if let Some(declared) = header(crate::protocol::HEADER_MCP_NAME) {
+        // "Servers MUST decode an encoded Mcp-Name value before comparing it
+        // to the corresponding request body value."
+        let decoded = match decoded_header(declared, crate::protocol::HEADER_MCP_NAME) {
+            Ok(decoded) => decoded,
+            Err(message) => return Some(message),
+        };
+        let expected = crate::protocol::mcp_name_for(&req.method, req.params.as_ref());
+        match expected {
+            Some(expected) if decoded == expected => {}
+            Some(expected) => {
+                return Some(format!(
+                    "{} header '{declared}' does not match request target '{expected}'",
+                    crate::protocol::HEADER_MCP_NAME
+                ))
+            }
+            // The method targets no primitive, so any name is a lie.
+            None => {
+                return Some(format!(
+                    "{} header '{declared}' sent for method '{}', which targets no primitive",
+                    crate::protocol::HEADER_MCP_NAME,
+                    req.method
+                ))
+            }
+        }
+    }
+
+    None
+}
+
+/// Reject an `MCP-Protocol-Version` header naming a revision we do not speak.
+///
+/// `dispatch_request` already does this for the version declared in
+/// `params._meta`, but the header is a second, independent way to select
+/// 2026-07-28 semantics — `declares_stateless_revision` reads it, and
+/// `is_stateless_version` is a bare date compare with no membership test. So
+/// without this, `MCP-Protocol-Version: 2099-01-01` bought the new behavior
+/// and never got the `-32022` that tells the client what we actually speak.
+fn check_protocol_version_header(
+    headers: &HeaderMap,
+    req: &JsonRpcRequest,
+) -> Option<JsonRpcResponse> {
+    let declared = headers
+        .get(crate::protocol::HEADER_MCP_PROTOCOL_VERSION)
+        .and_then(|v| v.to_str().ok())?;
+    if crate::protocol::is_version_supported(declared) {
+        return None;
+    }
+    Some(JsonRpcResponse::unsupported_protocol_version(
+        req.id.clone(),
+        declared,
+    ))
+}
+
+/// Whether a peer opted into the revision whose HTTP status codes and result
+/// envelope differ from what we have always returned.
+///
+/// Declaring the revision is the opt-in: either in the body's `_meta` (the
+/// stateless shape) or in the `MCP-Protocol-Version` header. A peer that does
+/// neither is on a pre-2026-07-28 revision and must keep seeing byte-identical
+/// behavior.
+///
+/// The version has to be one we actually speak, not merely a later date:
+/// `is_stateless_version` is an ordering test, so an unknown future revision
+/// would otherwise select 2026-07-28 semantics for a peer we cannot talk to.
+/// `check_protocol_version_header` rejects that case outright on the HTTP
+/// path; requiring support here means this function is still right when read
+/// on its own.
+fn declares_stateless_revision(headers: &HeaderMap, req: &JsonRpcRequest) -> bool {
+    let from_header = headers
+        .get(crate::protocol::HEADER_MCP_PROTOCOL_VERSION)
+        .and_then(|v| v.to_str().ok());
+    super::dispatch::body_declares_stateless(req)
+        || from_header.is_some_and(|v| {
+            crate::protocol::is_version_supported(v) && crate::protocol::is_stateless_version(v)
+        })
+}
+
+/// HTTP status for a JSON-RPC error the 2026-07-28 transport pins to a
+/// specific status code.
+///
+/// This is not pedantry: the spec's era-detection algorithm has clients
+/// inspect the *body* of a `400` to decide whether to fall back to
+/// `initialize`. Answering `200` makes us invisible to that logic and breaks
+/// other clients' compatibility handling.
+///
+/// `-32020` and `-32022` are unreachable for a legacy peer by construction:
+/// the first needs a routing header no pre-2026-07-28 client sends, the
+/// second needs a `_meta` protocol version no pre-2026-07-28 client sends.
+/// `-32601` is reachable by anyone — every legacy client asking for a method
+/// we never implemented gets one — so it only becomes a `404` for a peer that
+/// declared the new revision. Everything else keeps riding on `200`, which is
+/// what JSON-RPC-over-HTTP has always done here.
+fn status_for_response(response: &JsonRpcResponse, stateless_peer: bool) -> StatusCode {
+    let Some(error) = response.error.as_ref() else {
+        return StatusCode::OK;
+    };
+    match error.code {
+        error_codes::HEADER_MISMATCH | error_codes::UNSUPPORTED_PROTOCOL_VERSION => {
+            StatusCode::BAD_REQUEST
+        }
+        error_codes::METHOD_NOT_FOUND if stateless_peer => StatusCode::NOT_FOUND,
+        _ => StatusCode::OK,
     }
 }
 
@@ -427,8 +606,11 @@ async fn mcp_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !content_type.is_empty() && !content_type.contains("application/json") {
-        let err =
-            JsonRpcResponse::error(Value::Null, -32700, "content-type must be application/json");
+        let err = JsonRpcResponse::error(
+            Value::Null,
+            error_codes::PARSE_ERROR,
+            "content-type must be application/json",
+        );
         return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!(err)));
     }
 
@@ -441,10 +623,7 @@ async fn mcp_handler(
     // Parse JSON-RPC message (request or notification)
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => {
-            let err = JsonRpcResponse::error(Value::Null, -32700, &format!("parse error: {e}"));
-            return (StatusCode::BAD_REQUEST, Json(json!(err)));
-        }
+        Err(e) => return parse_error(e),
     };
 
     // Notifications have no "id" field — accept and return 202
@@ -454,11 +633,24 @@ async fn mcp_handler(
 
     let req: JsonRpcRequest = match serde_json::from_value(msg) {
         Ok(r) => r,
-        Err(e) => {
-            let err = JsonRpcResponse::error(Value::Null, -32700, &format!("parse error: {e}"));
-            return (StatusCode::BAD_REQUEST, Json(json!(err)));
-        }
+        Err(e) => return parse_error(e),
     };
+
+    if let Some(mismatch) = check_routing_headers(&headers, &req) {
+        let err = JsonRpcResponse::error(
+            req.id.clone(),
+            crate::protocol::error_codes::HEADER_MISMATCH,
+            &mismatch,
+        );
+        return (StatusCode::BAD_REQUEST, Json(json!(err)));
+    }
+
+    // A version we do not speak is rejected wherever it was declared. The
+    // body's `_meta` is checked in `dispatch_request`; the header has to be
+    // checked here, before it is allowed to select any behavior.
+    if let Some(err) = check_protocol_version_header(&headers, &req) {
+        return (StatusCode::BAD_REQUEST, Json(json!(err)));
+    }
 
     // Per-request timeout: a single hung backend or dead client must NEVER
     // be able to wedge other in-flight requests. The actual backend hang is
@@ -471,27 +663,35 @@ async fn mcp_handler(
             .unwrap_or(120),
     );
     let req_id = req.id.clone();
+    // Decided before `req` is consumed by dispatch.
+    let stateless_peer = declares_stateless_revision(&headers, &req);
     // W3C parent context from inbound headers. When the client is OTel-aware
     // (Claude.ai, an instrumented gateway), this stitches the proxy span
     // under the caller's trace. With telemetry off, this is a no-op.
     use opentelemetry::trace::FutureExt as _;
     let parent_cx = extract_parent_context(&headers);
-    let dispatch_fut = dispatch_request(&state.proxy, req, &identity, &state.acl, "serve:http")
-        .with_context(parent_cx);
-    let response_json = match tokio::time::timeout(request_timeout, dispatch_fut).await {
-        Ok(resp) => serde_json::to_value(&resp).unwrap(),
-        Err(_) => {
-            let err = JsonRpcResponse::error(
-                req_id,
-                -32000,
-                &format!(
-                    "proxy request timed out after {}s",
-                    request_timeout.as_secs()
-                ),
-            );
-            serde_json::to_value(&err).unwrap()
-        }
+    let dispatch_fut = dispatch_request(
+        &state.proxy,
+        req,
+        &identity,
+        &state.acl,
+        "serve:http",
+        stateless_peer,
+    )
+    .with_context(parent_cx);
+    let response = match tokio::time::timeout(request_timeout, dispatch_fut).await {
+        Ok(resp) => resp,
+        Err(_) => JsonRpcResponse::error(
+            req_id,
+            error_codes::PROXY_ERROR,
+            &format!(
+                "proxy request timed out after {}s",
+                request_timeout.as_secs()
+            ),
+        ),
     };
+    let status = status_for_response(&response, stateless_peer);
+    let response_json = serde_json::to_value(&response).unwrap();
 
     // If this POST came from an SSE session, send the response over the SSE
     // stream and return 202 Accepted (old HTTP+SSE transport).
@@ -528,7 +728,7 @@ async fn mcp_handler(
     }
 
     // Streamable HTTP transport: return response directly
-    (StatusCode::OK, Json(response_json))
+    (status, Json(response_json))
 }
 
 // GET /mcp/sse — SSE endpoint for streaming (old HTTP+SSE transport)
@@ -539,6 +739,13 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
     if let Err(resp) = authenticate_request(&state, &headers, "serve:http").await {
         return resp.into_response();
     }
+
+    // Formally deprecated by 2026-07-28 with a 12-month offramp. Clients on
+    // it keep working exactly as before — this is a nudge, not a gate.
+    tracing::warn!(
+        "client connected over the deprecated HTTP+SSE transport; \
+         migrate to Streamable HTTP (POST /mcp) before it is removed"
+    );
 
     // Buffer 256 absorbs bursts (e.g. tools/list snapshot of ~200 tools).
     // Combined with the 5s send timeout in the POST handler, no individual
@@ -619,6 +826,35 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
     Sse::new(ReceiverStream::new(rx)).into_response()
 }
 
+/// The production `/health` + `/mcp` router, built around an already-running
+/// proxy instead of booting one from a `Config`.
+///
+/// `run_http` owns process-level concerns an integration test must not take
+/// on (signal handlers, the audit DB pool, global OTel observers, background
+/// reapers). Everything on the request path — authentication, routing-header
+/// validation, `dispatch_request`, the SSE fallback — is shared with it, so a
+/// test driving this router is driving the real thing.
+#[cfg(test)]
+pub(super) fn test_router(
+    proxy: SharedProxy,
+    auth_provider: Arc<dyn AuthProvider>,
+    acl: Option<AclConfig>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Router {
+    let state = AppState {
+        proxy,
+        auth_provider,
+        acl,
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        shutdown,
+    };
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/mcp", post(mcp_handler).get(mcp_sse_handler))
+        .route("/mcp/sse", get(mcp_sse_handler))
+        .with_state(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +880,314 @@ mod tests {
     #[test]
     fn test_validate_bind_addr_invalid() {
         assert!(validate_bind_addr("not-an-address", false).is_err());
+    }
+
+    // --- Mcp-Method / Mcp-Name validation ---
+
+    fn routing_headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (k, v) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// Every pre-2026-07-28 client sends neither header. Absence is never a
+    /// mismatch.
+    #[test]
+    fn absent_routing_headers_are_not_a_mismatch() {
+        let req = JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"})));
+        assert!(check_routing_headers(&HeaderMap::new(), &req).is_none());
+    }
+
+    #[test]
+    fn agreeing_routing_headers_pass() {
+        let req = JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"})));
+        let headers = routing_headers(&[
+            (crate::protocol::HEADER_MCP_METHOD, "tools/call"),
+            (crate::protocol::HEADER_MCP_NAME, "search"),
+        ]);
+        assert!(check_routing_headers(&headers, &req).is_none());
+    }
+
+    /// A URI that cannot travel verbatim arrives Base64-sentinel encoded, and
+    /// the spec makes decoding before comparison a MUST. Skipping the decode
+    /// rejects `resources/read` on any URI with a space or non-ASCII in it.
+    #[test]
+    fn sentinel_encoded_name_matches_the_uri_it_encodes() {
+        for uri in [
+            "file:///weekly%20report.txt",
+            "file:///a b.txt",
+            "https://x/café",
+            "s3://bucket/100%",
+            "=?base64?literal?=",
+        ] {
+            let req = JsonRpcRequest::new(1, "resources/read", Some(json!({"uri": uri})));
+            let encoded = crate::protocol::header_value(uri).expect("encodable");
+            let headers = routing_headers(&[(crate::protocol::HEADER_MCP_NAME, &encoded)]);
+            assert!(
+                check_routing_headers(&headers, &req).is_none(),
+                "{uri} sent as {encoded} was rejected"
+            );
+        }
+    }
+
+    /// A `%` is a legal header character, so a URI carrying one travels
+    /// verbatim. Re-encoding it is the bug that broke `resources/read` on
+    /// most real URIs; nothing here may reintroduce it.
+    #[test]
+    fn raw_name_still_matches() {
+        let req = JsonRpcRequest::new(
+            1,
+            "resources/read",
+            Some(json!({"uri": "file:///weekly%20report.txt"})),
+        );
+        let headers = routing_headers(&[(
+            crate::protocol::HEADER_MCP_NAME,
+            "file:///weekly%20report.txt",
+        )]);
+        assert!(check_routing_headers(&headers, &req).is_none());
+    }
+
+    /// A sentinel we cannot decode is its own rejection condition in the
+    /// spec ("a header value contains invalid characters"), not a value to
+    /// fall back to comparing literally.
+    #[test]
+    fn malformed_sentinel_is_rejected() {
+        for declared in [
+            "=?base64?!!!not-base64!!!?=",
+            // Valid Base64, invalid UTF-8.
+            "=?base64?/w==?=",
+            // A plain value that merely *looks* like the sentinel: clients
+            // MUST encode it, so seeing it raw means the value is malformed.
+            "=?base64?literal?=",
+        ] {
+            let req = JsonRpcRequest::new(1, "resources/read", Some(json!({"uri": "file:///x"})));
+            let headers = routing_headers(&[(crate::protocol::HEADER_MCP_NAME, declared)]);
+            let msg = check_routing_headers(&headers, &req)
+                .unwrap_or_else(|| panic!("{declared} was accepted"));
+            assert!(msg.contains("malformed"), "unexpected message: {msg}");
+        }
+    }
+
+    /// Decoding must widen the *encoding* accepted, never the target: an
+    /// encoded header still has to name the primitive the body names.
+    #[test]
+    fn sentinel_encoding_does_not_widen_the_target() {
+        let req = JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"})));
+        let encoded = crate::protocol::header_value("delete_everything").expect("encodable");
+        // `delete_everything` is header-safe, so force the sentinel form.
+        let forced = crate::protocol::header_value("delete_everything\n").expect("encodable");
+        for declared in [encoded.as_str(), forced.as_str()] {
+            let headers = routing_headers(&[(crate::protocol::HEADER_MCP_NAME, declared)]);
+            assert!(
+                check_routing_headers(&headers, &req).is_some(),
+                "{declared} was accepted for tools/call on 'search'"
+            );
+        }
+    }
+
+    // --- MCP-Protocol-Version header vs body `_meta` ---
+
+    #[test]
+    fn protocol_version_header_agreeing_with_meta_passes() {
+        let req = JsonRpcRequest::new(
+            1,
+            "tools/list",
+            Some(json!({"_meta": {crate::protocol::meta_keys::PROTOCOL_VERSION: "2026-07-28"}})),
+        );
+        let headers =
+            routing_headers(&[(crate::protocol::HEADER_MCP_PROTOCOL_VERSION, "2026-07-28")]);
+        assert!(check_routing_headers(&headers, &req).is_none());
+    }
+
+    #[test]
+    fn protocol_version_header_disagreeing_with_meta_is_rejected() {
+        let req = JsonRpcRequest::new(
+            1,
+            "tools/list",
+            Some(json!({"_meta": {crate::protocol::meta_keys::PROTOCOL_VERSION: "2026-07-28"}})),
+        );
+        let headers =
+            routing_headers(&[(crate::protocol::HEADER_MCP_PROTOCOL_VERSION, "2025-11-25")]);
+        assert!(check_routing_headers(&headers, &req).is_some());
+    }
+
+    /// Compat: 2025-06-18 through 2025-11-25 clients send the header and no
+    /// `_meta` at all. There is nothing to compare it against, and rejecting
+    /// them would break every one of them.
+    #[test]
+    fn protocol_version_header_without_meta_is_accepted() {
+        for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+            let req = JsonRpcRequest::new(1, "tools/list", None);
+            let headers =
+                routing_headers(&[(crate::protocol::HEADER_MCP_PROTOCOL_VERSION, version)]);
+            assert!(check_routing_headers(&headers, &req).is_none());
+        }
+    }
+
+    // --- HTTP status codes (2026-07-28) ---
+
+    fn versioned(version: &str) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            1,
+            "tools/list",
+            Some(json!({"_meta": {crate::protocol::meta_keys::PROTOCOL_VERSION: version}})),
+        )
+    }
+
+    #[test]
+    fn stateless_revision_is_detected_from_body_or_header() {
+        let empty = HeaderMap::new();
+        assert!(declares_stateless_revision(
+            &empty,
+            &versioned(crate::protocol::PROTOCOL_VERSION)
+        ));
+        assert!(!declares_stateless_revision(
+            &empty,
+            &versioned(crate::protocol::PROTOCOL_VERSION_LEGACY)
+        ));
+
+        let legacy_req = JsonRpcRequest::new(1, "tools/list", None);
+        assert!(!declares_stateless_revision(&empty, &legacy_req));
+        assert!(declares_stateless_revision(
+            &routing_headers(&[(
+                crate::protocol::HEADER_MCP_PROTOCOL_VERSION,
+                crate::protocol::PROTOCOL_VERSION
+            )]),
+            &legacy_req
+        ));
+        assert!(!declares_stateless_revision(
+            &routing_headers(&[(
+                crate::protocol::HEADER_MCP_PROTOCOL_VERSION,
+                crate::protocol::PROTOCOL_VERSION_LEGACY
+            )]),
+            &legacy_req
+        ));
+    }
+
+    #[test]
+    fn spec_pinned_errors_get_their_status_codes() {
+        let mismatch =
+            JsonRpcResponse::error(json!(1), error_codes::HEADER_MISMATCH, "header mismatch");
+        let unsupported = JsonRpcResponse::unsupported_protocol_version(json!(1), "1999-01-01");
+        for resp in [&mismatch, &unsupported] {
+            // Unreachable for a legacy peer, so the status does not depend on
+            // the peer's declared revision.
+            assert_eq!(status_for_response(resp, true), StatusCode::BAD_REQUEST);
+            assert_eq!(status_for_response(resp, false), StatusCode::BAD_REQUEST);
+        }
+
+        let unknown_method =
+            JsonRpcResponse::error(json!(1), error_codes::METHOD_NOT_FOUND, "method not found");
+        assert_eq!(
+            status_for_response(&unknown_method, true),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The compat guarantee: a legacy peer must not start seeing 4xx where it
+    /// saw 200. Every legacy client that ever asked for a method we do not
+    /// implement got a 200 with a `-32601` body.
+    #[test]
+    fn legacy_peers_keep_seeing_200() {
+        let unknown_method =
+            JsonRpcResponse::error(json!(1), error_codes::METHOD_NOT_FOUND, "method not found");
+        assert_eq!(status_for_response(&unknown_method, false), StatusCode::OK);
+
+        for code in [
+            error_codes::INVALID_PARAMS,
+            error_codes::INTERNAL_ERROR,
+            error_codes::PROXY_ERROR,
+        ] {
+            let resp = JsonRpcResponse::error(json!(1), code, "boom");
+            assert_eq!(status_for_response(&resp, false), StatusCode::OK);
+            assert_eq!(status_for_response(&resp, true), StatusCode::OK);
+        }
+
+        let ok = JsonRpcResponse::success(json!(1), json!({"tools": []}));
+        assert_eq!(status_for_response(&ok, true), StatusCode::OK);
+        assert_eq!(status_for_response(&ok, false), StatusCode::OK);
+    }
+
+    /// Accepting the encoded form must not accept a *different* primitive.
+    #[test]
+    fn disagreeing_routing_headers_are_rejected() {
+        let call = JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"})));
+        let cases: Vec<(JsonRpcRequest, Vec<(&str, &str)>)> = vec![
+            // Method lies.
+            (
+                JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"}))),
+                vec![(crate::protocol::HEADER_MCP_METHOD, "tools/list")],
+            ),
+            // Name lies.
+            (
+                JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "delete_everything")],
+            ),
+            // Name is a *prefix* of the target, not the target.
+            (
+                JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "sear")],
+            ),
+            // Sentinel decoding must not make these equal: the body says
+            // `%20`, the header says a literal space. `%` is a legal header
+            // character and carries no encoding meaning here.
+            (
+                JsonRpcRequest::new(1, "resources/read", Some(json!({"uri": "f:///a%20b"}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "f:///a b")],
+            ),
+            // Percent-escaping a value that needed the sentinel is not the
+            // same value either.
+            (
+                JsonRpcRequest::new(1, "resources/read", Some(json!({"uri": "f:///a b"}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "f:///a%2520b")],
+            ),
+            // A name on a method that targets no primitive.
+            (
+                JsonRpcRequest::new(1, "tools/list", None),
+                vec![(crate::protocol::HEADER_MCP_NAME, "search")],
+            ),
+            // Params present but nameless — nothing to match against.
+            (
+                JsonRpcRequest::new(1, "tools/call", Some(json!({"arguments": {}}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "search")],
+            ),
+            // A non-string name cannot be matched, so any header is a lie.
+            (
+                JsonRpcRequest::new(1, "tools/call", Some(json!({"name": 42}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "42")],
+            ),
+            // Case differences are differences: names are case-sensitive.
+            (
+                JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "SEARCH")],
+            ),
+            // Empty header value never designates anything.
+            (
+                JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "search"}))),
+                vec![(crate::protocol::HEADER_MCP_NAME, "")],
+            ),
+        ];
+
+        for (req, pairs) in cases {
+            let headers = routing_headers(&pairs);
+            assert!(
+                check_routing_headers(&headers, &req).is_some(),
+                "{pairs:?} on {} was accepted",
+                req.method
+            );
+        }
+        // Sanity: the shared happy case really does pass, so the loop above
+        // is not trivially green.
+        assert!(check_routing_headers(
+            &routing_headers(&[(crate::protocol::HEADER_MCP_NAME, "search")]),
+            &call
+        )
+        .is_none());
     }
 
     #[test]
@@ -703,6 +1247,30 @@ mod tests {
         let received = rx.recv().await.unwrap().unwrap();
         // Event was received successfully
         assert!(format!("{:?}", received).contains("ok"));
+    }
+
+    /// Half the pair is still a valid claim: a client may send `Mcp-Method`
+    /// on a method that targets no primitive, and gets no `Mcp-Name` to send.
+    #[test]
+    fn method_header_alone_is_ok() {
+        let req = JsonRpcRequest::new(1, "tools/list", None);
+        let headers = routing_headers(&[(crate::protocol::HEADER_MCP_METHOD, "tools/list")]);
+        assert!(check_routing_headers(&headers, &req).is_none());
+    }
+
+    /// Header *names* are case-insensitive on the wire; header *values* are
+    /// not — a method is a method, not a case-folded label.
+    #[test]
+    fn header_name_casing_does_not_matter_but_value_casing_does() {
+        let req = JsonRpcRequest::new(1, "tools/call", Some(json!({"name": "gh__issue"})));
+        assert!(
+            check_routing_headers(&routing_headers(&[("Mcp-Method", "tools/call")]), &req)
+                .is_none()
+        );
+        assert!(
+            check_routing_headers(&routing_headers(&[("mcp-method", "Tools/Call")]), &req)
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -49,12 +49,18 @@ fn err_response(code: StatusCode, message: &str) -> Response {
 
 /// Build the redirect URI that carries the authorization code back to
 /// the client, preserving the supplied `state` parameter as RFC 6749 §4.1.2 demands.
-fn build_redirect(redirect_uri: &str, code: &str, state: &str) -> String {
+///
+/// `iss` is RFC 9207: it lets the client prove the code came from the AS
+/// it started the flow with, closing the mix-up attack. The value is the
+/// same issuer identifier advertised by `/.well-known/oauth-authorization-server`,
+/// normalized the same way, so the client's string comparison matches.
+fn build_redirect(redirect_uri: &str, code: &str, state: &str, issuer: &str) -> String {
     let separator = if redirect_uri.contains('?') { '&' } else { '?' };
     format!(
-        "{redirect_uri}{separator}code={}&state={}",
+        "{redirect_uri}{separator}code={}&state={}&iss={}",
         url_encode(code),
-        url_encode(state)
+        url_encode(state),
+        url_encode(issuer.trim_end_matches('/'))
     )
 }
 
@@ -166,7 +172,13 @@ pub async fn authorize(
         expires_at_unix: now + ctx.config.authorization_code_ttl_seconds,
     });
 
-    Redirect::to(&build_redirect(&q.redirect_uri, &code, &q.state)).into_response()
+    Redirect::to(&build_redirect(
+        &q.redirect_uri,
+        &code,
+        &q.state,
+        &ctx.config.issuer_url,
+    ))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -175,8 +187,12 @@ mod tests {
     use crate::server_auth::oauth_as::types::RegisteredClient;
 
     fn ctx() -> Arc<AppCtx> {
+        ctx_with_issuer("https://mcp.example.com")
+    }
+
+    fn ctx_with_issuer(issuer_url: &str) -> Arc<AppCtx> {
         let config = Arc::new(super::super::OAuthAsConfig {
-            issuer_url: "https://mcp.example.com".to_string(),
+            issuer_url: issuer_url.to_string(),
             jwt_secret: "x".repeat(32),
             trusted_user_header: "x-forwarded-user".to_string(),
             trusted_groups_header: "x-forwarded-groups".to_string(),
@@ -321,6 +337,90 @@ mod tests {
         let resp = authorize(State(ctx), loopback(), Query(q), good_headers()).await;
         let loc = parse_redirect_location(resp);
         assert!(loc.contains("state=this-is-the-state-i-sent"));
+    }
+
+    /// Pull a query parameter out of the redirect `Location`.
+    fn redirect_param(resp: Response, key: &str) -> Option<String> {
+        let loc = parse_redirect_location(resp);
+        url::Url::parse(&loc)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.to_string())
+    }
+
+    #[tokio::test]
+    async fn test_authorize_redirect_carries_rfc9207_iss() {
+        let ctx = ctx();
+        let resp = authorize(State(ctx), loopback(), Query(good_query()), good_headers()).await;
+        assert_eq!(
+            redirect_param(resp, "iss").as_deref(),
+            Some("https://mcp.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorize_iss_matches_advertised_issuer_when_configured_with_slash() {
+        // The metadata endpoint trims the trailing slash; `iss` must be
+        // normalized identically or the client's string comparison fails.
+        let ctx = ctx_with_issuer("https://mcp.example.com/");
+        let resp = authorize(State(ctx), loopback(), Query(good_query()), good_headers()).await;
+        assert_eq!(
+            redirect_param(resp, "iss").as_deref(),
+            Some("https://mcp.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorize_iss_does_not_disturb_code_and_state() {
+        let ctx = ctx();
+        let resp = authorize(State(ctx), loopback(), Query(good_query()), good_headers()).await;
+        let loc = parse_redirect_location(resp);
+        let url = url::Url::parse(&loc).unwrap();
+        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert!(!params["code"].is_empty());
+        assert_eq!(params["state"], "opaque-csrf");
+        assert_eq!(params["iss"], "https://mcp.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_authorize_iss_absent_on_rejected_requests() {
+        // A refusal must never hand out an issuer-bearing redirect — the
+        // rejected paths return plain HTTP errors, not redirects.
+        let ctx = ctx();
+        let mut q = good_query();
+        q.client_id = "ghost".to_string();
+        let resp = authorize(State(ctx), loopback(), Query(q), good_headers()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp.headers().get("location").is_none());
+    }
+
+    #[test]
+    fn test_build_redirect_url_encodes_issuer() {
+        let out = build_redirect(
+            "https://claude.ai/cb",
+            "c0de",
+            "st",
+            "https://mcp.example.com/tenant/a",
+        );
+        assert!(
+            out.contains("iss=https%3A%2F%2Fmcp.example.com%2Ftenant%2Fa"),
+            "issuer must be percent-encoded: {out}"
+        );
+    }
+
+    #[test]
+    fn test_build_redirect_appends_to_existing_query() {
+        let out = build_redirect(
+            "https://claude.ai/cb?foo=bar",
+            "c0de",
+            "st",
+            "https://mcp.example.com",
+        );
+        assert!(
+            out.starts_with("https://claude.ai/cb?foo=bar&code="),
+            "{out}"
+        );
     }
 
     #[tokio::test]

@@ -117,6 +117,32 @@ get_issue_details
 
 JSON output includes full JSON Schema for each tool's input parameters.
 
+### `mcp <server> --health`
+
+Connect to the server and disconnect. Exits non-zero if the connection fails.
+
+```bash
+mcp sentry --health
+```
+
+Interactive output:
+
+```
+sentry: ok
+```
+
+JSON output also reports the MCP protocol revision the two sides agreed on — the quickest way to see whether a backend negotiated `2026-07-28` or fell back to the legacy `initialize` handshake:
+
+```bash
+mcp sentry --health --json
+```
+
+```json
+{"server":"sentry","status":"ok","protocolVersion":"2025-11-25"}
+```
+
+With `MCP_PROXY_URL` set, the connection goes through the running `mcp serve` proxy, so `protocolVersion` is the revision negotiated with the *proxy*, not with the backend behind it.
+
 ### `mcp <server> <tool> [json]`
 
 Call a tool on the server. The optional `json` argument is a JSON object with the tool's parameters.

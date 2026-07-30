@@ -27,6 +27,13 @@ pub struct RegistrationRequest {
     pub response_types: Option<Vec<String>>,
     #[serde(default)]
     pub token_endpoint_auth_method: Option<String>,
+    /// SEP-837 requires MCP clients to declare this so OIDC servers stop
+    /// rejecting native/localhost redirect URIs. We are not an OIDC
+    /// server and impose no redirect constraints from it, so any value is
+    /// accepted — refusing one would break a client for doing the right
+    /// thing. Absent is equally fine: pre-SEP-837 clients omit it.
+    #[serde(default)]
+    pub application_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +43,10 @@ pub struct RegistrationResponse {
     pub redirect_uris: Vec<String>,
     pub grant_types: Vec<String>,
     pub token_endpoint_auth_method: &'static str,
+    /// Echoed back per RFC 7591 §3.2.1 only when the client sent it, so
+    /// the response stays byte-for-byte identical for clients that don't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +182,7 @@ pub async fn register(
         redirect_uris: req.redirect_uris,
         grant_types,
         token_endpoint_auth_method: "none",
+        application_type: req.application_type,
     }))
 }
 
@@ -211,6 +223,7 @@ mod tests {
                 grant_types: None,
                 response_types: None,
                 token_endpoint_auth_method: None,
+                application_type: None,
             }),
         )
         .await
@@ -231,6 +244,7 @@ mod tests {
                 grant_types: None,
                 response_types: None,
                 token_endpoint_auth_method: None,
+                application_type: None,
             }),
         )
         .await
@@ -251,6 +265,7 @@ mod tests {
                 grant_types: None,
                 response_types: None,
                 token_endpoint_auth_method: None,
+                application_type: None,
             }),
         )
         .await
@@ -270,12 +285,117 @@ mod tests {
                 grant_types: Some(vec!["client_credentials".to_string()]),
                 response_types: None,
                 token_endpoint_auth_method: None,
+                application_type: None,
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1.error, "invalid_client_metadata");
+    }
+
+    #[tokio::test]
+    async fn test_register_accepts_application_type_native() {
+        // SEP-837: a CLI on a localhost redirect registers as "native".
+        // Accepting it is the whole point — rejecting would lock out every
+        // spec-compliant client.
+        let _g = InlineSaveGuard::acquire();
+        let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
+        let res = register(
+            State(ctx),
+            Json(RegistrationRequest {
+                client_name: Some("mcp".to_string()),
+                redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
+                grant_types: None,
+                response_types: None,
+                token_endpoint_auth_method: None,
+                application_type: Some("native".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(res.client_id.starts_with("mcp_"));
+        assert_eq!(res.application_type.as_deref(), Some("native"));
+    }
+
+    #[tokio::test]
+    async fn test_register_accepts_application_type_web() {
+        let _g = InlineSaveGuard::acquire();
+        let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
+        let res = register(
+            State(ctx),
+            Json(RegistrationRequest {
+                client_name: None,
+                redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
+                grant_types: None,
+                response_types: None,
+                token_endpoint_auth_method: None,
+                application_type: Some("web".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.application_type.as_deref(), Some("web"));
+    }
+
+    #[tokio::test]
+    async fn test_register_without_application_type_keeps_legacy_response_shape() {
+        // Backwards compat: a pre-SEP-837 client omits the field and must
+        // get back exactly the JSON it got before — no new key.
+        let _g = InlineSaveGuard::acquire();
+        let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
+        let res = register(
+            State(ctx),
+            Json(RegistrationRequest {
+                client_name: None,
+                redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
+                grant_types: None,
+                response_types: None,
+                token_endpoint_auth_method: None,
+                application_type: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&res.0).unwrap();
+        assert!(
+            json.get("application_type").is_none(),
+            "absent application_type must not appear in the response: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_body_without_application_type_still_deserializes() {
+        // The wire-level backwards-compat check: the old request body has
+        // no `application_type` and must keep parsing.
+        let req: RegistrationRequest = serde_json::from_str(
+            r#"{"client_name":"legacy","redirect_uris":["https://claude.ai/api/mcp/auth_callback"]}"#,
+        )
+        .unwrap();
+        assert!(req.application_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_register_still_rejects_bad_metadata_with_application_type_present() {
+        // Privilege check: `application_type` is metadata, not a bypass —
+        // an off-allowlist redirect_uri stays refused.
+        let _g = InlineSaveGuard::acquire();
+        let ctx = ctx_with(vec!["https://claude.ai/api/mcp/auth_callback".to_string()]);
+        let err = register(
+            State(ctx),
+            Json(RegistrationRequest {
+                client_name: None,
+                redirect_uris: vec!["https://attacker.example.com/cb".to_string()],
+                grant_types: None,
+                response_types: None,
+                token_endpoint_auth_method: None,
+                application_type: Some("native".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.error, "invalid_redirect_uri");
     }
 
     #[tokio::test]
@@ -296,6 +416,7 @@ mod tests {
                 grant_types: None,
                 response_types: None,
                 token_endpoint_auth_method: None,
+                application_type: None,
             }),
         )
         .await
@@ -308,6 +429,7 @@ mod tests {
                 grant_types: None,
                 response_types: None,
                 token_endpoint_auth_method: None,
+                application_type: None,
             }),
         )
         .await

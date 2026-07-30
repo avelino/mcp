@@ -119,8 +119,13 @@ pub async fn run_stdio(mut config: Config) -> Result<()> {
             let stdout = Arc::clone(&stdout);
             let identity = identity.clone();
             let acl = acl.clone();
+            // No headers on this transport, so the body is the only place a
+            // peer can declare the revision.
+            let stateless_peer = super::dispatch::body_declares_stateless(&req);
             tokio::spawn(async move {
-                let response = dispatch_request(&proxy, req, &identity, &acl, "serve:stdio").await;
+                let response =
+                    dispatch_request(&proxy, req, &identity, &acl, "serve:stdio", stateless_peer)
+                        .await;
                 let mut data = match serde_json::to_string(&response) {
                     Ok(s) => s,
                     Err(_) => return,

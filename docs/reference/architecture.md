@@ -11,10 +11,13 @@ When you run `mcp sentry search_issues '{"query": "is:unresolved"}'`, this is wh
 2. Load config → find "sentry" in servers.json → it's an HTTP server
 3. Create transport → HttpTransport with the server URL
 4. Load saved auth token (if any)
-5. MCP handshake:
-   → Send "initialize" request with protocol version
-   ← Receive server capabilities
-   → Send "notifications/initialized"
+5. Protocol negotiation:
+   → Send "server/discover" (2026-07-28 probe)
+   ← If it works: pick the newest revision both sides speak
+   ← If it fails for any reason: fall back to the legacy handshake
+     → Send "initialize" request with protocol version
+     ← Receive server capabilities
+     → Send "notifications/initialized"
 6. Send "tools/call" request with tool name and arguments
    ← If 401: start OAuth flow → retry with new token
    ← Receive tool result
@@ -42,7 +45,7 @@ Three implementations:
 
 **StdioTransport** — Spawns a child process and runs it as a multiplexed pipe. A dedicated **writer task** owns the child's stdin and serializes outbound writes. A dedicated **reader task** consumes the child's stdout line-by-line and dispatches each response to its caller via a `oneshot` channel keyed by JSON-RPC `id`. The result: **multiple in-flight requests can run concurrently on the same backend process** — callers only block waiting for their own response. The child is spawned with `kill_on_drop(true)` so it is reaped on any cleanup path (graceful shutdown, panic, task abort, error). On `close()` the child gets a brief grace period and is then force-killed.
 
-**HttpTransport** — Sends HTTP POST requests with JSON-RPC bodies. Handles SSE (Server-Sent Events) responses by extracting the last `data:` line. Manages session IDs via `Mcp-Session-Id` headers. On 401 responses, triggers the authentication flow and retries once. Mutable state (`session_id`, `bearer_token`, `headers` after a 401) lives behind small `Mutex`es; `reqwest::Client` is already `Send + Sync`, so concurrent requests fan out at the HTTP layer.
+**HttpTransport** — Sends HTTP POST requests with JSON-RPC bodies. Handles SSE (Server-Sent Events) responses by extracting the last `data:` line. Manages session IDs via `Mcp-Session-Id` headers — but only while the negotiated revision is a legacy one; 2026-07-28 removed sessions, so the header is neither sent nor captured once that revision is agreed. Every POST also carries `Mcp-Method` and (when the request targets a single primitive) `Mcp-Name`, so gateways can route and meter without parsing the body. `Mcp-Method` mirrors the JSON-RPC method verbatim; `Mcp-Name` carries a tool name or resource URI, which is not constrained to header-safe characters, so a value that isn't printable ASCII — or that would be ambiguous — is wrapped in the spec's Base64 sentinel `=?base64?…?=`, which the receiving server decodes before comparing it to the body. Either header is dropped rather than truncated when the encoded value exceeds 1 KiB. When the body's `_meta` declares a protocol version, the same value goes out as the `MCP-Protocol-Version` header, and `Mcp-Param-*` headers are added from the called tool's `x-mcp-header` annotations. On 401 responses, triggers the authentication flow and retries once. Mutable state (`session_id`, `bearer_token`, `headers` after a 401) lives behind small `Mutex`es; `reqwest::Client` is already `Send + Sync`, so concurrent requests fan out at the HTTP layer.
 
 **CliTransport** — Wraps any command-line tool as an MCP server (see [CLI as MCP](../guides/cli-as-mcp.md)). Discovery state lives behind an `RwLock` with double-checked locking, and each tool invocation spawns a fresh `Command` with `kill_on_drop(true)` so cancellation reaps the child instead of leaking it.
 
@@ -55,22 +58,23 @@ Auth only applies to HTTP servers. The strategy is a cascade:
 1. **Config headers** — If `servers.json` has an `Authorization` header with a non-empty token, use it
 2. **Saved token** — On connect, load token from `auth.json` (if valid and not expired)
 3. **OAuth 2.0** — On 401 response:
-   - Discover the authorization server (RFC 9728 Protected Resource Metadata → `.well-known/oauth-authorization-server`)
-   - Register as a client (Dynamic Client Registration)
+   - Discover the authorization server (RFC 9728 Protected Resource Metadata → `.well-known/oauth-authorization-server`), rejecting a metadata document whose `issuer` doesn't match where it was fetched from (RFC 8414 §3.3); an absent `issuer` stays allowed, since hand-rolled documents routinely omit it
+   - Register as a client (Dynamic Client Registration, `application_type: native`)
    - Run Authorization Code flow with PKCE (S256)
    - Open browser, listen for callback on localhost:8085-8099
+   - Validate the callback's `iss` against the discovered issuer when present (RFC 9207)
    - Exchange code for tokens, save them
 4. **Manual prompt** — If OAuth registration fails, ask the user for a token interactively. Show service-specific hints for known services (Sentry, GitHub, Slack, etc.)
 
-Tokens are stored per server URL (normalized, trailing slash stripped). Refresh tokens are used automatically when access tokens expire.
+Tokens are stored per server URL (normalized, trailing slash stripped) — they are scoped to the resource server. Client *registrations* are keyed by the authorization server's `issuer` instead, so one AS's `client_id` is never reused with another. Stores written by older builds keyed registrations by MCP server URL; they are migrated in place (`version` + `legacy_clients`) and each entry is adopted under an issuer only *after* a token exchange with that issuer succeeds — a server naming an issuer is not enough to claim someone else's registration. Nothing has to be re-registered. Refresh tokens are used automatically when access tokens expire.
 
 ## Protocol: JSON-RPC 2.0 over MCP
 
 `mcp` implements a subset of the [Model Context Protocol](https://spec.modelcontextprotocol.io/):
 
-**Handshake:**
-- `initialize` → Server responds with capabilities
-- `notifications/initialized` → Client confirms it's ready
+**Negotiation:**
+- `server/discover` → Server lists the revisions it speaks (2026-07-28)
+- `initialize` + `notifications/initialized` → Legacy handshake, for peers that don't answer the probe
 
 **Tool operations:**
 - `tools/list` → Returns available tools (with pagination via cursor)
@@ -87,6 +91,25 @@ Tokens are stored per server URL (normalized, trailing slash stripped). Refresh 
 All three categories use the same `{server}__{name}` aliasing to keep items from different upstreams distinguishable. Sampling and other MCP features are not implemented.
 
 Responses follow the MCP content model: an array of content items, each with a type (`text`, `image`) and corresponding data. The `isError` flag indicates tool-level errors (distinct from protocol errors).
+
+### Protocol revisions: the dual stack
+
+`mcp` speaks two generations of MCP at once. The newest revision it implements is **2026-07-28**; the previous one, **2025-11-25**, is what every backend in the wild still speaks. Accepted revisions, newest first: `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`. Anything outside that set is rejected with `-32022` (UnsupportedProtocolVersion).
+
+**As a client**, `McpClient::negotiate()` probes `server/discover` first. The probe answers with `supportedVersions` (plus `capabilities`, and `serverInfo` inside `_meta`); the client picks the newest revision both sides list and — when that revision is stateless — skips the handshake entirely. The probe is bounded by its own **3-second** timeout rather than the request timeout, because the likeliest answer from today's backends is no answer at all and that is not worth a minute of startup. If it fails for *any* reason (method not found, some other JSON-RPC error, a timeout, a transport failure, or a result that isn't a discovery result), the client falls back to `initialize` at `2025-11-25` and behaves exactly as it did before, adopting whatever earlier revision the server echoes back. When the probe killed the transport outright — a stdio backend that exits on an unknown method — the transport is re-opened before the handshake runs, so a fatal probe still ends in a working connection. The agreed revision is fixed at connect time and surfaced by `McpClient::protocol_version()` (and by `mcp <server> --health --json`).
+
+What "stateless" changes on the wire, once 2026-07-28 is agreed:
+
+- No `initialize`/`notifications/initialized`, no `Mcp-Session-Id`.
+- Every request carries its own `params._meta`: `io.modelcontextprotocol/protocolVersion`, `clientCapabilities`, `clientInfo`, plus W3C trace context (`traceparent`/`tracestate`/`baggage`) when telemetry is enabled — which is the only way a stdio backend ever sees a trace, since it has no headers.
+- Results carry a `resultType` discriminator. A result that omits it reads as `"complete"`, which is what keeps older peers working. `input_required` is the interim result of a Multi Round-Trip Request (MRTR) — the typed accessors refuse it, and the raw paths (`request_raw`, `call_tool_raw`, `read_resource_raw`, `get_prompt_raw`) relay it untouched.
+- A tool may annotate input properties with `x-mcp-header`, asking for an argument to be mirrored into an `Mcp-Param-{Name}` header on `tools/call`. Both halves are implemented: annotations that break the spec's constraints invalidate the whole tool definition, which is dropped from `tools/list` with a warning (the annotation names the header, so an unchecked one lets a backend aim at `Authorization` or smuggle a CRLF), and valid ones are mirrored on every call. The mirroring only happens once 2026-07-28 is agreed — a legacy peer never agreed to receive those headers — but the validation runs against every peer and every transport, because `mcp serve` re-exports a stdio backend's tools over HTTP one hop later.
+
+On a legacy peer the client attaches **no** `_meta` at all. Absence is the legacy wire shape, and injecting keys a pre-2026-07-28 server never agreed to is exactly what trips strict schema validators.
+
+**As a server** (`mcp serve`), the revision is negotiated per request rather than per connection: it is read from `params._meta`, and its absence means a legacy client — never an error. `server/discover` advertises the accepted set; `initialize` is still served and now echoes back a revision the *client* asked for rather than blindly the newest one. A result going to a client that *declared* the new revision is stamped with `resultType` and `_meta` serverInfo and, on the `*/list` methods, `ttlMs` + `cacheScope: "private"` (they are ACL-filtered per identity, so no shared intermediary may cache them); a client that declared nothing gets none of these, because they do not exist in the revision it negotiated. `*/list` results are sorted deterministically for everyone, and `tools/call`, `resources/read` and `prompts/get` are relayed raw so MRTR exchanges pass through intact — the client's `inputResponses` / `requestState` reach the backend, and the backend's interim result reaches the client. What the backend does *not* get to decide is caching: `ttlMs` / `cacheScope` on a relayed result are stripped, and re-stated by the proxy only where it has something to say (`resources/read`, at `ttlMs: 0`), since only the proxy knows the result was ACL-filtered.
+
+Two more things change for a peer that declared 2026-07-28. The routing headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) are validated **only when present** — legacy clients send none and are not penalized — and a header contradicting the body is rejected with `-32020`, because that means a gateway routed or metered on a lie. And errors the transport pins to a status code get one: `-32020` and `-32022` answer `400`, and `-32601` answers `404` for a peer that declared the new revision (only for such a peer — legacy clients have always received `-32601` on `200` and still do). This matters because the spec's era-detection has clients inspect the body of a `400` to decide whether to fall back to `initialize`.
 
 ## Config: untagged enum deserialization
 
