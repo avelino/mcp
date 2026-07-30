@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -64,6 +64,14 @@ impl HttpTransport {
             .unwrap_or(60);
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
+            // An MCP endpoint answers JSON-RPC directly; it never redirects.
+            // A 3xx here is an auth gateway (Cloudflare Access, an SSO proxy)
+            // bouncing us to a login page. Following it lands on a 200 full of
+            // HTML, which used to surface as "failed to parse JSON response:
+            // expected value at line 1 column 1" — true, useless, and several
+            // layers away from "your VPN is disconnected". Stop at the
+            // redirect so the error can say what actually happened.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             client,
@@ -256,19 +264,21 @@ impl Transport for HttpTransport {
 
             self.capture_session_id(&resp);
             let status = resp.status();
+            let location = header_str(&resp, reqwest::header::LOCATION);
             let text = resp.text().await.context("failed to read HTTP response")?;
 
             if !status.is_success() {
-                bail!("HTTP error {status}: {text}");
+                return Err(http_error(status, location.as_deref(), &text));
             }
 
             return parse_response(&text);
         }
 
+        let location = header_str(&resp, reqwest::header::LOCATION);
         let text = resp.text().await.context("failed to read HTTP response")?;
 
         if !status.is_success() {
-            bail!("HTTP error {status}: {text}");
+            return Err(http_error(status, location.as_deref(), &text));
         }
 
         parse_response(&text)
@@ -298,6 +308,40 @@ impl Transport for HttpTransport {
     }
 }
 
+/// Read a response header as a `String`, when it is present and printable.
+fn header_str(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
+    resp.headers().get(name)?.to_str().ok().map(str::to_string)
+}
+
+/// Turn a non-success response into an error a person can act on.
+///
+/// A redirect is the case worth naming: an MCP endpoint answers JSON-RPC
+/// directly, so a 3xx means an auth gateway intercepted the request and is
+/// pointing at a login page. The body is HTML nobody wants echoed, and the
+/// `Location` host is the actual clue.
+fn http_error(status: reqwest::StatusCode, location: Option<&str>, body: &str) -> anyhow::Error {
+    if status.is_redirection() {
+        let target = location
+            .and_then(|l| reqwest::Url::parse(l).ok())
+            .and_then(|u| u.host_str().map(str::to_string));
+        return match target {
+            Some(host) => anyhow::anyhow!(
+                "HTTP {status}: the endpoint redirected to {host} instead of answering. \
+                 That is an auth gateway, not an MCP server — check that your VPN or SSO \
+                 session is active."
+            ),
+            None => anyhow::anyhow!(
+                "HTTP {status}: the endpoint redirected instead of answering, which means \
+                 an auth gateway intercepted the request"
+            ),
+        };
+    }
+    // Keep the body for real API errors, but do not paste a login page into
+    // the log.
+    let snippet: String = body.chars().take(400).collect();
+    anyhow::anyhow!("HTTP error {status}: {snippet}")
+}
+
 fn parse_response(text: &str) -> Result<JsonRpcResponse> {
     if text.starts_with("data:") || text.contains("\ndata:") {
         let last_data = text
@@ -317,6 +361,61 @@ mod tests {
     use super::*;
     use crate::protocol::{MAX_HEADER_VALUE_LEN, PROTOCOL_VERSION, PROTOCOL_VERSION_LEGACY};
     use serde_json::json;
+
+    /// An auth gateway (Cloudflare Access, an SSO proxy) answers a redirect
+    /// instead of JSON-RPC. Following it lands on a login page and the parse
+    /// error blames the JSON, several layers away from the real cause, so the
+    /// redirect has to be named where it happens.
+    #[test]
+    fn a_redirect_says_it_is_an_auth_gateway() {
+        let err = http_error(
+            reqwest::StatusCode::FOUND,
+            Some(
+                "https://buserbrasil.cloudflareaccess.com/cdn-cgi/access/login/mcp.buser.io?kid=x",
+            ),
+            "<html><head><title>302 Found</title></head></html>",
+        )
+        .to_string();
+
+        assert!(err.contains("302"), "{err}");
+        assert!(err.contains("buserbrasil.cloudflareaccess.com"), "{err}");
+        assert!(err.contains("auth gateway"), "{err}");
+        // The login page itself is noise, and can be large.
+        assert!(!err.contains("<html>"), "{err}");
+    }
+
+    #[test]
+    fn a_redirect_without_a_location_still_names_the_cause() {
+        let err = http_error(reqwest::StatusCode::TEMPORARY_REDIRECT, None, "").to_string();
+        assert!(err.contains("auth gateway"), "{err}");
+    }
+
+    /// A real API error still carries its body, or debugging a 4xx from the
+    /// backend gets harder rather than easier.
+    #[test]
+    fn a_normal_http_error_keeps_its_body() {
+        let err = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            None,
+            r#"{"error":"tool not found"}"#,
+        )
+        .to_string();
+        assert!(err.contains("400"), "{err}");
+        assert!(err.contains("tool not found"), "{err}");
+    }
+
+    /// An error body is truncated: a gateway can answer a megabyte of HTML and
+    /// that has no business in a log line.
+    #[test]
+    fn an_oversized_error_body_is_truncated() {
+        let err = http_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            &"x".repeat(10_000),
+        )
+        .to_string();
+        assert!(err.len() < 600, "error was {} chars", err.len());
+    }
 
     fn transport() -> HttpTransport {
         HttpTransport::new("http://localhost:9/mcp", &HashMap::new()).unwrap()

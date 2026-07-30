@@ -232,9 +232,14 @@ impl McpClient {
                         false
                     }
                 };
-                self.handshake(PROTOCOL_VERSION_LEGACY)
-                    .await
-                    .with_context(|| fatal_probe_hint(&self.peer, &probe_error, reopened))?
+                match self.handshake(PROTOCOL_VERSION_LEGACY).await {
+                    Ok(version) => version,
+                    Err(handshake_error) => {
+                        let hint =
+                            fatal_probe_hint(&self.peer, &probe_error, &handshake_error, reopened);
+                        return Err(handshake_error.context(hint));
+                    }
+                }
             }
         };
 
@@ -655,7 +660,26 @@ fn discover_params() -> Value {
 ///
 /// Without this the operator sees a bare "transport closed" and has no way to
 /// guess that our own compatibility probe is what killed their backend.
-fn fatal_probe_hint(peer: &str, probe_error: &anyhow::Error, reopened: bool) -> String {
+fn fatal_probe_hint(
+    peer: &str,
+    probe_error: &anyhow::Error,
+    handshake_error: &anyhow::Error,
+    reopened: bool,
+) -> String {
+    // A fresh connection that fails exactly like the probe did refutes the
+    // "our probe killed it" theory: the backend is simply unreachable, and
+    // blaming the probe sends the reader chasing the wrong thing. Not
+    // hypothetical — an expired VPN session makes every request redirect, and
+    // the first version of this message pointed at the probe instead of at the
+    // auth gateway doing the redirecting.
+    //
+    // The re-open is what makes the comparison mean anything. Without it the
+    // handshake ran on the connection the probe already killed, so an
+    // identical error is exactly what a probe-caused death looks like.
+    if reopened && format!("{probe_error:#}") == format!("{handshake_error:#}") {
+        return format!("backend '{peer}' is unreachable");
+    }
+
     let recovery = if reopened {
         "the transport was re-opened and the initialize handshake still failed"
     } else {
@@ -1764,6 +1788,42 @@ mod tests {
         assert!(err.contains("flaky-backend"), "{err}");
         assert!(err.contains("server/discover"), "{err}");
         assert!(err.contains("unknown JSON-RPC method"), "{err}");
+    }
+
+    /// A fresh connection failing exactly like the probe did means the probe
+    /// killed nothing. Reported from the field: an expired VPN session made
+    /// every request redirect to an SSO login, and the error blamed our
+    /// compatibility probe instead of the gateway.
+    #[test]
+    fn an_identical_failure_on_a_fresh_connection_blames_the_backend_not_the_probe() {
+        let same = || anyhow!("HTTP 302 Found: the endpoint redirected to sso.example");
+
+        let reopened = fatal_probe_hint("buser", &same(), &same(), true);
+        assert!(reopened.contains("unreachable"), "{reopened}");
+        assert!(!reopened.contains("unknown JSON-RPC method"), "{reopened}");
+
+        // Without a re-open the handshake ran on the connection the probe
+        // killed, so an identical error proves nothing and the probe stays a
+        // suspect.
+        let not_reopened = fatal_probe_hint("buser", &same(), &same(), false);
+        assert!(
+            not_reopened.contains("unknown JSON-RPC method"),
+            "{not_reopened}"
+        );
+    }
+
+    /// Different errors keep pointing at the probe, which is the case the hint
+    /// was written for.
+    #[test]
+    fn a_different_failure_after_re_open_still_blames_the_probe() {
+        let hint = fatal_probe_hint(
+            "flaky",
+            &anyhow!("transport closed"),
+            &anyhow!("initialize failed: unsupported version"),
+            true,
+        );
+        assert!(hint.contains("server/discover"), "{hint}");
+        assert!(hint.contains("unknown JSON-RPC method"), "{hint}");
     }
 
     // --- MRTR on the other two supported methods ---
