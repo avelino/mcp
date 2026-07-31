@@ -37,6 +37,18 @@ async fn main() {
     }
 }
 
+/// Whether an argument asks for the version.
+///
+/// `-v` is accepted alongside the conventional `-V` because this CLI has no
+/// verbosity flag for it to collide with, and `-v` is what people type.
+fn is_version_flag(arg: &str) -> bool {
+    matches!(arg, "--version" | "-V" | "-v")
+}
+
+fn is_help_flag(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h")
+}
+
 fn print_usage() {
     eprintln!("mcp — CLI that turns MCP servers into terminal commands");
     eprintln!();
@@ -77,6 +89,8 @@ fn print_usage() {
     eprintln!("  mcp healthcheck [url]               HTTP health probe (for containers)");
     eprintln!();
     eprintln!("Flags:");
+    eprintln!("  --version, -V                       Print the version");
+    eprintln!("  --help, -h                          Show this help");
     eprintln!("  --json                              Force JSON output");
     eprintln!("  --insecure                          Allow HTTP on non-loopback interfaces");
     eprintln!();
@@ -91,6 +105,19 @@ async fn run() -> Result<()> {
     let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--json").collect();
     let fmt = OutputFormat::detect(json_flag);
 
+    // Answered before anything reads the config or opens the database. These
+    // two are what you reach for when the config is broken, so they must not
+    // depend on it — and without this, `--version` fell through to the server
+    // dispatch and came back as `server "--version" not found in config`.
+    if args.first().is_some_and(|a| is_version_flag(a)) {
+        println!("mcp {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.is_empty() || args.first().is_some_and(|a| is_help_flag(a)) {
+        print_usage();
+        return Ok(());
+    }
+
     let mut cfg = config::load_config()?;
     let conflicts = config::validate_server_names(&cfg);
     for name in &conflicts {
@@ -99,11 +126,6 @@ async fn run() -> Result<()> {
             config = %cfg.path.display(),
             "server name conflicts with a reserved command name — rename it to avoid unexpected behavior"
         );
-    }
-
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        print_usage();
-        return Ok(());
     }
 
     // Built-in HTTP health probe for container health checks (scratch/distroless
@@ -388,5 +410,47 @@ pub(crate) fn read_stdin_or_empty() -> Result<serde_json::Value> {
         Ok(serde_json::json!({}))
     } else {
         Ok(serde_json::from_str(input)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_flags_are_recognized() {
+        for arg in ["--version", "-V", "-v"] {
+            assert!(is_version_flag(arg), "{arg} must print the version");
+        }
+    }
+
+    /// The bug this guards: an unrecognized flag fell through to the server
+    /// dispatch and came back as `server "--version" not found in config`.
+    #[test]
+    fn version_flags_are_not_mistaken_for_server_names() {
+        for arg in ["version", "--versions", "-vv", "--v", "roam", "serve", ""] {
+            assert!(!is_version_flag(arg), "{arg} is not a version flag");
+        }
+    }
+
+    #[test]
+    fn help_flags_are_recognized() {
+        for arg in ["--help", "-h"] {
+            assert!(is_help_flag(arg));
+        }
+        for arg in ["help", "--helper", "-H", "roam", ""] {
+            assert!(!is_help_flag(arg), "{arg} is not a help flag");
+        }
+    }
+
+    /// Version and help must stay disjoint, or one silently shadows the other.
+    #[test]
+    fn version_and_help_do_not_overlap() {
+        for arg in ["--version", "-V", "-v", "--help", "-h"] {
+            assert!(
+                !(is_version_flag(arg) && is_help_flag(arg)),
+                "{arg} matched both"
+            );
+        }
     }
 }
