@@ -27,7 +27,7 @@ dirs = "6"
 regex = "1"
 async-trait = "0.1"
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.10"
 open = "5"
 url = "2"
@@ -43,13 +43,13 @@ shell-words = "1"
 socket2 = { version = "0.6", features = ["all"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 
 # OpenTelemetry — default-off, ativado via OTEL_EXPORTER_OTLP_ENDPOINT.
 # Suporta gRPC (tonic) e HTTP/protobuf (reqwest) — operador escolhe via
 # OTEL_EXPORTER_OTLP_PROTOCOL. Reqwest reutiliza nossa stack já existente.
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
   "rt-tokio",
   "trace",
   "metrics",
@@ -58,7 +58,7 @@ opentelemetry_sdk = { version = "0.31", default-features = false, features = [
   "experimental_trace_batch_span_processor_with_async_runtime",
   "experimental_metrics_periodicreader_with_async_runtime",
 ] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
   "trace",
   "metrics",
   "grpc-tonic",
@@ -67,7 +67,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
   # avoiding a second copy of reqwest in the binary.
   "hyper-client",
 ] }
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 
 [dev-dependencies]
 tempfile = "3"
