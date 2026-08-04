@@ -10,7 +10,7 @@ use crate::server_auth::{self, AclConfig, AuthIdentity};
 use super::discovery::{connect_backend, discover_pending_backends, discover_single_backend};
 use super::proxy::{
     backend_prompt_get_params, backend_resource_read_params, handle_server_discover,
-    infer_backend_name, mrtr_continuation_fields, proxy_server_info, ProxyServer, ResolvedCall,
+    infer_backend_name, mrtr_continuation_fields, proxy_server_info, ResolvedCall,
     ResolvedPromptGet, ResolvedResourceRead, SharedProxy, SEPARATOR,
 };
 
@@ -165,7 +165,7 @@ pub(crate) async fn dispatch_request(
             // Decide whether to trigger discovery, then drop the proxy lock
             // before doing any I/O. Discovery is serialized via the separate
             // discovery_lock inside discover_pending_backends.
-            audit_logger = discover_for_list(proxy, |p| p.tools.is_empty()).await;
+            audit_logger = discover_for_list(proxy).await;
             // Snapshot tools + metadata under a brief lock, then release
             // before ACL evaluation/serialization/logging.
             let (tools_snap, tool_map_snap, cls_snap, list_audit) = {
@@ -314,7 +314,7 @@ pub(crate) async fn dispatch_request(
             }
         }
         "resources/list" => {
-            audit_logger = discover_for_list(proxy, |p| p.resources.is_empty()).await;
+            audit_logger = discover_for_list(proxy).await;
             let (resources_snap, resource_map_snap, list_audit) = {
                 let p = proxy.lock().await;
                 (
@@ -500,7 +500,7 @@ pub(crate) async fn dispatch_request(
             }
         }
         "prompts/list" => {
-            audit_logger = discover_for_list(proxy, |p| p.prompts.is_empty()).await;
+            audit_logger = discover_for_list(proxy).await;
             let (prompts_snap, prompt_map_snap, list_audit) = {
                 let p = proxy.lock().await;
                 (
@@ -732,21 +732,17 @@ fn set_private_cache_hints(result: &mut Value, ttl_ms: u64, stateless_peer: bool
     crate::protocol::set_cache_hints(result, ttl_ms, CacheScope::Private);
 }
 
-/// Discover pending backends when the registry a `*/list` reads is still
-/// empty, and hand back the audit logger the arm needs either way.
+/// Discover every backend that still needs it before answering a `*/list`,
+/// and hand back the audit logger the arm needs either way.
 ///
-/// The closure picks the registry: the three list arms differ only in which
-/// one they check for emptiness.
-async fn discover_for_list(
-    proxy: &SharedProxy,
-    is_empty: impl Fn(&ProxyServer) -> bool,
-) -> Arc<AuditLogger> {
+/// This used to also require the registry to be *empty*: one backend restored
+/// from the tool cache was enough to skip discovering all the others, and the
+/// client was told they did not exist (issue #106). A truncated list is worse
+/// than a slower one — the caller cannot tell the difference, and acts on it.
+async fn discover_for_list(proxy: &SharedProxy) -> Arc<AuditLogger> {
     let (needs_discovery, audit) = {
         let p = proxy.lock().await;
-        (
-            is_empty(&p) && p.has_undiscovered_backends(),
-            Arc::clone(&p.audit),
-        )
+        (p.has_undiscovered_backends(), Arc::clone(&p.audit))
     };
     if needs_discovery {
         discover_pending_backends(proxy).await;
@@ -1180,6 +1176,56 @@ mod tests {
         // No backends configured, so tool_map is empty → unknown tool
         assert!(resp.error.is_some());
         assert!(resp.error.unwrap().message.contains("unknown tool"));
+    }
+
+    /// A partial tool cache used to suppress discovery entirely: the registry
+    /// was non-empty, so the backends that had *no* cache entry were never
+    /// contacted and the client was told they did not exist (issue #106).
+    #[tokio::test]
+    async fn tools_list_discovers_backends_missing_from_a_partial_cache() {
+        use crate::config::{IdleTimeoutPolicy, ServerConfig};
+
+        let mut server = test_server();
+        // `outl` is configured but has no cache entry — it must be discovered.
+        server.configs.insert(
+            "outl".to_string(),
+            ServerConfig::Stdio {
+                // Exits immediately, so discovery fails fast instead of
+                // stalling the test on the 30s timeout. What matters is that
+                // it was *attempted*.
+                command: "true".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                tool_acl: None,
+                idle_timeout: IdleTimeoutPolicy::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
+            },
+        );
+        // `ai-memory` came off the cache, so the registry is already non-empty.
+        server.register_tools(
+            "ai-memory",
+            &[Tool {
+                name: "memory_query".to_string(),
+                description: Some("Query".to_string()),
+                input_schema: None,
+                annotations: None,
+            }],
+        );
+        server.discovered_backends.insert("ai-memory".to_string());
+        assert!(!server.tools.is_empty());
+
+        let proxy: SharedProxy = Arc::new(Mutex::new(server));
+        let identity = AuthIdentity::anonymous();
+        let req = JsonRpcRequest::new(1, "tools/list", None);
+        let resp = dispatch_request(&proxy, req, &identity, &None, "test", true).await;
+        assert!(resp.error.is_none());
+
+        let p = proxy.lock().await;
+        assert!(
+            p.discovery_failures.contains_key("outl"),
+            "outl was never discovered — a cached backend suppressed discovery"
+        );
     }
 
     #[tokio::test]
