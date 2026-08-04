@@ -450,10 +450,7 @@ pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Re
             tokio::time::sleep(Duration::from_millis(500)).await;
             {
                 let mut proxy = refresh_proxy.lock().await;
-                let cached: Vec<String> = proxy.discovered_backends.iter().cloned().collect();
-                for name in &cached {
-                    proxy.discovered_backends.remove(name);
-                }
+                proxy.reset_cache_loaded_for_refresh();
             }
             discover_pending_backends(&refresh_proxy).await;
         });

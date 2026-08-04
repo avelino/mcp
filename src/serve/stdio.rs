@@ -86,7 +86,7 @@ pub async fn run_stdio(mut config: Config) -> Result<()> {
                 if needs_refresh.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     {
                         let mut p = proxy.lock().await;
-                        p.discovered_backends.clear();
+                        p.reset_cache_loaded_for_refresh();
                     }
                     discover_pending_backends(&proxy).await;
                 }

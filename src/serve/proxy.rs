@@ -378,7 +378,17 @@ impl ProxyServer {
         )
     }
 
+    /// Register a backend's tools, **replacing** whatever was registered for it
+    /// before. `self.tools` is a Vec: appending meant every re-discovery
+    /// (background refresh, reconnect) added another copy of the whole list,
+    /// which `snapshot_cache_entries` then persisted — so the duplication
+    /// survived restarts and grew on each one (issue #106).
+    ///
+    /// Skipping names already in `tool_map` — emptied for this server one line
+    /// above — drops repeats *within* `tools` too, which is what heals a cache
+    /// already poisoned by the old behavior.
     pub(crate) fn register_tools(&mut self, server_name: &str, tools: &[Tool]) {
+        self.unregister_tools(server_name);
         let overrides = self
             .configs
             .get(server_name)
@@ -387,6 +397,9 @@ impl ProxyServer {
             .cloned();
         for tool in tools {
             let namespaced = format!("{server_name}{SEPARATOR}{}", tool.name);
+            if self.tool_map.contains_key(&namespaced) {
+                continue;
+            }
             let description = match &tool.description {
                 Some(desc) => Some(format!("[{server_name}] {desc}")),
                 None => Some(format!("[{server_name}]")),
@@ -459,9 +472,14 @@ impl ProxyServer {
         self.classifications.retain(|k, _| !k.starts_with(&prefix));
     }
 
+    /// Same replace-don't-append contract as [`Self::register_tools`].
     pub(crate) fn register_resources(&mut self, server_name: &str, resources: &[Resource]) {
+        self.unregister_resources(server_name);
         for r in resources {
             let namespaced_uri = format!("{server_name}{SEPARATOR}{}", r.uri);
+            if self.resource_map.contains_key(&namespaced_uri) {
+                continue;
+            }
             let description = r
                 .description
                 .as_ref()
@@ -486,9 +504,14 @@ impl ProxyServer {
         self.resource_map.retain(|k, _| !k.starts_with(&prefix));
     }
 
+    /// Same replace-don't-append contract as [`Self::register_tools`].
     pub(crate) fn register_prompts(&mut self, server_name: &str, prompts: &[Prompt]) {
+        self.unregister_prompts(server_name);
         for p in prompts {
             let namespaced_name = format!("{server_name}{SEPARATOR}{}", p.name);
+            if self.prompt_map.contains_key(&namespaced_name) {
+                continue;
+            }
             let description = p
                 .description
                 .as_ref()
@@ -544,6 +567,19 @@ impl ProxyServer {
                 .count();
             tracing::info!(server = %name, tool_count, "tools loaded from cache");
         }
+    }
+
+    /// Mark cache-loaded backends as pending discovery again so a background
+    /// refresh re-reads their tool list from the live backend.
+    ///
+    /// Only backends that are *not* connected in this process are reset:
+    /// clearing the whole `discovered_backends` set would also re-discover
+    /// healthy live backends, replacing a working client with a fresh child
+    /// for no reason.
+    pub(crate) fn reset_cache_loaded_for_refresh(&mut self) {
+        let backends = &self.backends;
+        self.discovered_backends
+            .retain(|name| !matches!(backends.get(name), Some(BackendState::Disconnected { .. })));
     }
 
     /// Build a snapshot of cache entries to persist. This is pure in-memory
@@ -680,11 +716,8 @@ impl ProxyServer {
         };
         stats.record_request();
 
-        self.unregister_tools(server_name);
         self.register_tools(server_name, tools);
-        self.unregister_resources(server_name);
         self.register_resources(server_name, resources);
-        self.unregister_prompts(server_name);
         self.register_prompts(server_name, prompts);
         tracing::info!(
             server = %server_name,
@@ -1084,6 +1117,107 @@ mod tests {
         // Simulate success: remove from failures
         server.discovery_failures.remove("test_backend");
         assert!(!server.discovery_failures.contains_key("test_backend"));
+    }
+
+    // --- Idempotent registration (issue #106) ---
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            description: Some(format!("does {name}")),
+            input_schema: None,
+            annotations: None,
+        }
+    }
+
+    /// A background refresh or a reconnect re-registers a backend that is
+    /// already registered. Appending there is what multiplied one backend's
+    /// tool list by the number of refreshes.
+    #[test]
+    fn re_registering_a_backend_replaces_its_previous_entries() {
+        let mut server = test_server();
+        let tools = vec![tool("search"), tool("create")];
+
+        for _ in 0..5 {
+            server.register_tools("ai-memory", &tools);
+        }
+
+        assert_eq!(server.tools.len(), 2);
+        assert_eq!(server.tool_map.len(), 2);
+        assert_eq!(server.classifications.len(), 2);
+    }
+
+    /// A backend that dropped a tool between two discoveries must lose it from
+    /// the registry — replacing, not merging, is what makes that work.
+    #[test]
+    fn re_registering_drops_tools_the_backend_no_longer_exposes() {
+        let mut server = test_server();
+        server.register_tools("ai-memory", &[tool("search"), tool("create")]);
+        server.register_tools("ai-memory", &[tool("search")]);
+
+        assert_eq!(server.tools.len(), 1);
+        assert_eq!(server.tools[0].name, "ai-memory__search");
+        assert!(!server.tool_map.contains_key("ai-memory__create"));
+    }
+
+    /// The duplicates reached the on-disk tool cache, so a fixed build still
+    /// loads a poisoned list at startup. Collapsing same-name repeats is what
+    /// heals it without asking anyone to wipe the cache.
+    #[test]
+    fn a_poisoned_cached_list_collapses_to_one_copy() {
+        let mut server = test_server();
+        let poisoned: Vec<Tool> = (0..28)
+            .flat_map(|_| [tool("search"), tool("create")])
+            .collect();
+
+        server.register_tools("ai-memory", &poisoned);
+
+        assert_eq!(server.tools.len(), 2);
+    }
+
+    /// ...and the healed list is what gets written back, so the next start is
+    /// clean too.
+    #[test]
+    fn the_persisted_cache_snapshot_carries_no_duplicates() {
+        let mut server = test_server_with_configs(&["ai-memory"]);
+        server
+            .config_hashes
+            .insert("ai-memory".to_string(), "hash".to_string());
+        server.discovered_backends.insert("ai-memory".to_string());
+
+        server.register_tools("ai-memory", &[tool("search"), tool("search")]);
+        server.register_tools("ai-memory", &[tool("search"), tool("search")]);
+
+        let entries = server.snapshot_cache_entries();
+        let (_, entry) = entries
+            .iter()
+            .find(|(n, _)| n == "ai-memory")
+            .expect("ai-memory snapshot");
+        assert_eq!(entry.tools.len(), 1);
+        assert_eq!(entry.tools[0].name, "search");
+    }
+
+    /// The refresh only re-discovers what came off the cache. Clearing the
+    /// whole discovered set also re-discovered live backends, replacing a
+    /// working client with a fresh child for nothing.
+    #[test]
+    fn refresh_resets_only_backends_that_were_not_connected() {
+        let mut server = test_server_with_configs(&["ai-memory", "outl"]);
+        server.discovered_backends.insert("ai-memory".to_string());
+        server.discovered_backends.insert("outl".to_string());
+        server.backends.insert(
+            "ai-memory".to_string(),
+            BackendState::Disconnected {
+                cached_tools: vec![],
+                usage_stats: UsageStats::new(),
+            },
+        );
+        // `outl` has no `backends` entry — it was never loaded from cache.
+
+        server.reset_cache_loaded_for_refresh();
+
+        assert!(!server.discovered_backends.contains("ai-memory"));
+        assert!(server.discovered_backends.contains("outl"));
     }
 
     // --- BackendState + register/unregister tests ---
