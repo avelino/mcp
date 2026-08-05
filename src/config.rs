@@ -488,13 +488,137 @@ pub fn is_reserved_name(name: &str) -> bool {
     RESERVED_NAMES.contains(&name)
 }
 
+/// Narrow the served catalog to a subset of backends.
+///
+/// A proxy that aggregates every backend is the right default for a human at a
+/// terminal, and the wrong one for a model. Every tool the proxy publishes
+/// costs context in the client, and past a few hundred the client starts
+/// deferring tools behind a lookup step — which turns one answer into several
+/// round trips. An agent that only ever needs Roam and GitHub should not pay
+/// for the other backends' tools.
+///
+/// `only` is applied first, then `exclude`. Both take comma-separated names.
+/// An unknown name is returned to the caller rather than ignored: silently
+/// dropping a typo would serve a catalog missing a whole backend, and the
+/// failure looks like "the model stopped using that tool".
+pub fn filter_servers(
+    config: &mut Config,
+    only: Option<&str>,
+    exclude: Option<&str>,
+) -> Vec<String> {
+    let parse = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    };
+
+    let mut unknown = Vec::new();
+    let mut check = |names: &[String], config: &Config| {
+        for n in names {
+            if !config.servers.contains_key(n) {
+                unknown.push(n.clone());
+            }
+        }
+    };
+
+    if let Some(list) = only {
+        let keep = parse(list);
+        check(&keep, config);
+        config.servers.retain(|name, _| keep.contains(name));
+    }
+    if let Some(list) = exclude {
+        let drop = parse(list);
+        check(&drop, config);
+        config.servers.retain(|name, _| !drop.contains(name));
+    }
+    unknown
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn config_with(names: &[&str]) -> Config {
+        let json = format!(
+            r#"{{"mcpServers": {{{}}}}}"#,
+            names
+                .iter()
+                .map(|n| format!(r#""{n}": {{"command": "true"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        super::tests::config_from_json(&json).unwrap()
+    }
+
+    fn names(config: &Config) -> Vec<String> {
+        let mut v: Vec<String> = config.servers.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn only_keeps_the_listed_servers() {
+        let mut c = config_with(&["roam", "outl", "github", "ai-memory"]);
+        let unknown = filter_servers(&mut c, Some("roam,github"), None);
+        assert_eq!(names(&c), vec!["github", "roam"]);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn exclude_drops_the_listed_servers() {
+        let mut c = config_with(&["roam", "outl", "github", "ai-memory"]);
+        let unknown = filter_servers(&mut c, None, Some("ai-memory"));
+        assert_eq!(names(&c), vec!["github", "outl", "roam"]);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn only_runs_before_exclude() {
+        let mut c = config_with(&["roam", "outl", "github"]);
+        filter_servers(&mut c, Some("roam,outl"), Some("outl"));
+        assert_eq!(names(&c), vec!["roam"]);
+    }
+
+    #[test]
+    fn an_unknown_name_is_reported_rather_than_ignored() {
+        // A typo must not quietly serve a catalog missing a backend — that
+        // failure reads as "the model stopped using that tool".
+        let mut c = config_with(&["roam"]);
+        let unknown = filter_servers(&mut c, Some("roam,rom"), None);
+        assert_eq!(unknown, vec!["rom"]);
+        assert_eq!(names(&c), vec!["roam"]);
+    }
+
+    #[test]
+    fn whitespace_and_empty_entries_are_tolerated() {
+        let mut c = config_with(&["roam", "outl"]);
+        filter_servers(&mut c, Some(" roam , , outl "), None);
+        assert_eq!(names(&c), vec!["outl", "roam"]);
+    }
+
+    #[test]
+    fn no_flags_means_no_change() {
+        let mut c = config_with(&["roam", "outl"]);
+        filter_servers(&mut c, None, None);
+        assert_eq!(names(&c), vec!["outl", "roam"]);
+    }
+
+    #[test]
+    fn excluding_everything_yields_an_empty_catalog_not_a_panic() {
+        let mut c = config_with(&["roam"]);
+        filter_servers(&mut c, None, Some("roam"));
+        assert!(c.servers.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn config_from_json(json: &str) -> Result<Config> {
+    pub(super) fn config_from_json(json: &str) -> Result<Config> {
         let mut file = NamedTempFile::new().unwrap();
         write!(file, "{}", json).unwrap();
         let path = file.path().to_path_buf();

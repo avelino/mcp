@@ -158,6 +158,13 @@ async fn run() -> Result<()> {
     if args[0] == "serve" {
         let rest = &args[1..];
         let insecure = rest.iter().any(|a| a == "--insecure");
+        let value_of = |flag: &str| -> Option<String> {
+            rest.iter()
+                .position(|a| a == flag)
+                .and_then(|pos| rest.get(pos + 1))
+                .filter(|a| !a.starts_with("--"))
+                .map(|a| a.to_string())
+        };
         let http_addr = if let Some(pos) = rest.iter().position(|a| a == "--http") {
             let addr = rest
                 .get(pos + 1)
@@ -168,6 +175,24 @@ async fn run() -> Result<()> {
         } else {
             None
         };
+
+        // `--only` / `--exclude` narrow the catalog for one instance, so a
+        // model-facing proxy can publish a handful of backends while the
+        // terminal keeps all of them.
+        let only = value_of("--only");
+        let exclude = value_of("--exclude");
+        if only.is_some() || exclude.is_some() {
+            let before = cfg.servers.len();
+            let unknown = config::filter_servers(&mut cfg, only.as_deref(), exclude.as_deref());
+            for name in &unknown {
+                tracing::warn!(server = %name, "unknown server in --only/--exclude — ignored");
+            }
+            tracing::info!(
+                before,
+                after = cfg.servers.len(),
+                "catalog filtered for this instance"
+            );
+        }
         return serve::run(cfg, http_addr.as_deref(), insecure).await;
     }
 
