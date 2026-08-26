@@ -91,6 +91,8 @@ MCP_TIMEOUT=120 mcp slack --list
 
 One request is deliberately not covered by it: the `server/discover` probe `mcp` sends on connect to detect an MCP 2026-07-28 server. A backend that predates that revision usually just never answers, and waiting `MCP_TIMEOUT` for a reply we expect to fail would cost that much on *every* connection, so the probe is capped at 3 seconds and then falls back to the `initialize` handshake.
 
+Note that `mcp serve` also bounds the **whole** discovery of one backend (probe, handshake, `tools/list`, `resources/list`, `prompts/list`) at a fixed 30 seconds. That ceiling is not configurable, and raising `MCP_TIMEOUT` above it has no effect on discovery: the backend is dropped from `tools/list` at 30s regardless. It still applies to `tools/call` afterwards.
+
 ### `MCP_MAX_OUTPUT`
 
 Maximum number of bytes to capture from a CLI server's stdout. Commands that exceed this limit have their output truncated. Default is 1 MB.

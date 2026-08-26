@@ -1,12 +1,42 @@
-# Optional: persistent audit log storage.
-# Only needed if you set MCP_AUDIT_ENABLED=true in the Deployment.
+# Durable storage for /data. Two separate consumers, with very different
+# stakes:
 #
-# To use: uncomment the persistentVolumeClaim reference in deployment.yaml
-# and replace the emptyDir volume for "data".
+#   1. OAuth AS state (MCP_AUTH_SERVER_PATH) — registered DCR clients and
+#      refresh tokens. If you run `oauth_as`, this volume is NOT optional.
+#      Losing the file forces every user to reconnect the MCP by hand on
+#      every pod restart: the provider rejects any token whose `aud` is not
+#      a registered client, so unexpired access tokens die with it, and the
+#      refresh tokens are gone too, so nothing recovers silently. A few KB
+#      of JSON, but the whole login state of your fleet.
+#
+#   2. Audit logs (MCP_AUDIT_ENABLED=true) — optional, and the reason to
+#      size this above the minimum. Streaming to stdout instead needs no
+#      volume at all.
+#
+# Running both from one claim is fine at small scale, but size it for the
+# audit retention you want. Audit logs filling the volume takes the OAuth
+# state down with it.
+#
+# To use: add `- pvc.yaml` to kustomization.yaml and point the "data"
+# volume in deployment.yaml at this claim.
+#
+# Heads up before you apply:
+#   - ReadWriteOnce (the default for EBS, GCE PD, Azure Disk) cannot be
+#     mounted by two pods at once, so the Deployment needs
+#     `strategy.type: Recreate`. See deployment.yaml.
+#   - Most block storage is zonal, which pins the pod to one zone. Fine at
+#     replicas: 1, which is the only supported topology anyway.
+#   - On a StorageClass with `reclaimPolicy: Delete`, deleting this PVC
+#     destroys the volume and the state with it.
+#
+# storageClassName is intentionally unset so the cluster default applies.
+# A default with `volumeBindingMode: WaitForFirstConsumer` is preferable:
+# it provisions only after the scheduler picks a node, which avoids a
+# volume stranded in a zone the pod cannot reach.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: mcp-audit-data
+  name: mcp-data
   namespace: mcp
   labels:
     app.kubernetes.io/name: mcp-proxy

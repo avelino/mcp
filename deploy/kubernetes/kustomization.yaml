@@ -10,7 +10,9 @@ resources:
   - service.yaml
   # Create the Secret separately before applying (see secret.yaml for template):
   #   kubectl -n mcp create secret generic mcp-secrets --from-literal=sentry-token=sntrys_...
-  # Uncomment to enable persistent audit logging:
+  # Durable /data. REQUIRED if serverAuth.providers includes "oauth_as"
+  # (losing the AS state logs every user out on each restart); optional
+  # for audit logs. See pvc.yaml.
   # - pvc.yaml
 
 labels:

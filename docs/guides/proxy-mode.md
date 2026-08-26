@@ -29,6 +29,29 @@ graph LR
     style Proxy fill:#4a9,color:#fff
 ```
 
+### Don't wrap an HTTP backend in a stdio bridge
+
+The table above is about how *clients* reach the proxy. The same choice exists one layer down, between the proxy and each backend, and it has a wrong answer.
+
+If a backend already speaks MCP over HTTP, declare it as HTTP. No child process:
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${MY_TOKEN}" }
+    }
+  }
+}
+```
+
+Reaching for a stdio bridge like `mcp-remote` instead adds a Node process per backend, plus its cold start, and hands your auth to a tool built for a different job. Those bridges exist to give *stdio-only clients* access to remote servers; they typically prefer their own OAuth flow over the header you passed, and that flow wants a browser. In a container there isn't one, so discovery hangs until it hits the 30s cap and the backend vanishes from `tools/list` ([symptoms](../howto/troubleshooting.md#a-backend-silently-disappears-from-toolslist)).
+
+`mcp` already is the HTTP client. Adding a bridge in front of it means two MCP implementations negotiating with each other so that one of them can talk to a third.
+
+Keep stdio for backends that genuinely ship no HTTP endpoint.
+
 ## How it works
 
 ```mermaid

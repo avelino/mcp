@@ -182,6 +182,21 @@ inline the whole content with `MCP_AUTH_SERVER_CONFIG='{"clients":{}, "refresh_t
 The inline mode is for read-only Secret mounts in Kubernetes — same
 contract as `MCP_AUTH_CONFIG` for the client store.
 
+### Losing this file logs everyone out immediately
+
+This is not "you lose some history". Point `MCP_AUTH_SERVER_PATH` at ephemeral storage and **every restart forces every user to reconnect the MCP by hand.**
+
+Two things break at once:
+
+1. **Access tokens die instantly, even unexpired ones.** Before verifying a signature, the provider checks that the token's `aud` refers to a registered client, so a token whose DCR registration is gone is rejected no matter how much TTL is left. Revoking a client *should* kill its tokens — that same check turns a wiped state file into a fleet-wide revocation.
+2. **Refresh tokens are gone too**, so there is no silent recovery. The client cannot refresh; it has to re-register via DCR and send the user back through the browser.
+
+The signing secret is not enough on its own. Tokens are stateless JWTs, but the registered-client check makes verification depend on this file, so a stable `jwtSecret` with a wiped state file still rejects everything.
+
+Durable storage is the requirement. On Kubernetes that means a PersistentVolumeClaim, not an `emptyDir` — see [Kubernetes: OAuth AS state](kubernetes.md#oauth-as-state-needs-a-persistent-volume).
+
+Even with durable storage, users still re-authenticate when the `jwtSecret` rotates, or when they go idle past the refresh token TTL (`refreshTokenTtlSeconds`, 30d by default).
+
 ## Security notes
 
 - **`trustedSourceCidrs` is mandatory.** With an empty list, any

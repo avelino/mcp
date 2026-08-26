@@ -186,6 +186,43 @@ kubectl -n mcp logs deploy/mcp-proxy -f | jq -c 'select(.level=="ERROR")'
 
 > **Why stderr, not stdout, for app logs?** In `mcp serve`, audit logs go to **stdout** by default (auto-promotion of `file` to `file+stdout`) and they're the structured product surface. Application/tracing logs go to **stderr** as the diagnostic surface. Kubernetes captures both in the same `kubectl logs` stream by default — split them downstream with `jq` (audit lines have `method`/`identity`; tracing lines have `level`/`target`).
 
+## OAuth AS state needs a persistent volume
+
+Skip this if you don't run `oauth_as`. If you do, it is not optional.
+
+The Authorization Server keeps its registered DCR clients and refresh tokens in the file `MCP_AUTH_SERVER_PATH` points at. Back that path with an `emptyDir` and **every pod restart forces every user to reconnect the MCP by hand** — deploys, node rotation, OOM kills, all of them. Access tokens are rejected the moment the client registry is gone, even ones with hours of TTL left, because the provider requires the token's `aud` to be a registered client. See [Losing this file logs everyone out immediately](oauth-as.md#losing-this-file-logs-everyone-out-immediately).
+
+```yaml
+# deployment.yaml
+        env:
+          - name: MCP_AUTH_SERVER_PATH
+            value: "/data/auth_server.json"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mcp-data
+```
+
+The state is a few KB of JSON, so the smallest volume your StorageClass allows is plenty.
+
+### Use `Recreate`, not `RollingUpdate`
+
+A `ReadWriteOnce` volume (the default for EBS, GCE PD, Azure Disk) cannot be mounted by two pods at once. With `RollingUpdate` the incoming pod waits for a volume the outgoing pod still holds, and sits `Pending` until `progressDeadlineSeconds` fails the rollout.
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+```
+
+The cost is a short gap on every deploy while the old pod drains and the volume detaches and reattaches. Worth checking against your own uptime expectations, but note the alternative was logging every user out on the same schedule.
+
+### This pins the pod to one zone
+
+Most block storage is zonal. Once the volume is provisioned the pod can only schedule where that volume lives. Fine at `replicas: 1`, which is the only supported topology anyway (see [Scaling](#scaling)). For multi-zone HA you need shared storage (EFS, Filestore) or an external state backend.
+
+Reclaim policy matters too: on a `Delete` StorageClass, removing the PVC destroys the volume and the state with it.
+
 ## Audit logging
 
 By default, audit logging is disabled (`MCP_AUDIT_ENABLED=false`) because the scratch-based image has no writable filesystem.
@@ -206,7 +243,7 @@ Set `MCP_AUDIT_OUTPUT=stdout` in the Deployment env. Audit entries are emitted a
 volumes:
   - name: data
     persistentVolumeClaim:
-      claimName: mcp-audit-data
+      claimName: mcp-data
 ```
 
 3. Uncomment `pvc.yaml` in `kustomization.yaml`:
@@ -224,6 +261,8 @@ kubectl apply -k deploy/kubernetes/
 ```
 
 Audit logs are written to `/data/audit/data` and indexed at `/data/audit/index` (controlled by `MCP_AUDIT_PATH` and `MCP_AUDIT_INDEX_PATH`).
+
+> This is the same `mcp-data` claim the OAuth AS state uses. Sharing one volume is fine, but size it for the audit retention you want: audit logs filling the volume take the AS state down with them, and that logs everyone out.
 
 ## Security context
 

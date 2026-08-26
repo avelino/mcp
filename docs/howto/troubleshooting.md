@@ -134,6 +134,64 @@ If you see repeated discovery failures in stderr:
 
 After fixing the issue, restart `mcp serve` — the backoff state is in-memory and resets on restart.
 
+### A backend silently disappears from `tools/list`
+
+The proxy discovers each backend independently, so one that dies on startup just stops appearing. Everything else keeps working: the process stays up, `/health` returns 200, the container never restarts. Nothing surfaces the loss until someone asks where a tool went.
+
+**1. Get the roll call.** One line per backend, healthy and broken:
+
+```bash
+mcp serve --http 2>&1 \
+  | grep -E "discovered capabilities|failed to discover|discovery timed out"
+```
+
+`discovered capabilities server=X tools=N` means it came up. `failed to discover` or `discovery timed out` names your culprit.
+
+**2. Read the backend's own stderr.** The proxy captures it and replays it inside the failure message, which is where the real cause lives. The proxy-level error only tells you the pipe closed:
+
+```
+failed to discover server=slack error=backend 'slack-mcp-server' failed
+during the server/discover compatibility probe (server closed stdout (EOF)
+
+server stderr:
+{"level":"error","message":"Failed to fetch channels","error":"missing_scope"}
+{"level":"fatal","message":"Error booting provider"}
+```
+
+The `EOF` is the symptom. `missing_scope` is the bug.
+
+**3. Call the backend's API directly** with the same credentials and from the same network the proxy uses. In a container, exec into it and reference the env var so the secret never leaves the process:
+
+```bash
+kubectl exec deploy/mcp-proxy -- sh -c \
+  'curl -s -H "Authorization: Bearer $MY_TOKEN" https://api.example.com/v1/thing'
+```
+
+This separates "the credential is wrong" from "the wrapper is broken", which the proxy log alone can't tell you apart.
+
+**Common causes:**
+
+| What the backend stderr says | Actual cause |
+|---|---|
+| A permission or scope error, then a fatal exit | The backend refuses to boot without some API call succeeding. Grant the scope; the API response usually names the missing one. |
+| Nothing — it just times out | Discovery is capped at 30s per backend and is not configurable. If the endpoint answers fast when you curl it, the wrapper process is the problem, not the network. |
+| `invalid character '<' looking for beginning of value` | It got HTML, not JSON. See below. |
+
+### Backend returns HTML instead of JSON
+
+A parse error pointing at `<` or at "line 1 column 1" means an auth gateway (Cloudflare Access, an SSO proxy, a captive portal) answered instead of the MCP server. Your token was never evaluated.
+
+For backends declared with `url`, `mcp` refuses to follow redirects precisely so this reports as a redirect rather than a confusing parse error. Backends that speak to their own API over HTTP do their own requests, so they surface the raw parse failure instead.
+
+Confirm by looking at the status code rather than the body:
+
+```bash
+curl -s -o /dev/null -w "http=%{http_code} type=%{content_type}\n" \
+  -H "Authorization: Bearer $TOKEN" https://backend.example.com/api/thing
+```
+
+A `302` with `text/html` is the gateway. Fix it at the gateway: issue a service token for machine traffic, or allow the proxy's egress range. No amount of backend config gets past it.
+
 ### "access denied" on tools/call
 
 The ACL blocks both `tools/call` requests **and** filters `tools/list` responses. If a tool doesn't appear in `tools/list`, the identity doesn't have access to it. If a tool appears but `tools/call` returns access denied, the ACL rules may have changed between the list and the call, or the tool's read/write classification doesn't match the identity's access level.

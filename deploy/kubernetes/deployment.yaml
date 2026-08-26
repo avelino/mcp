@@ -8,6 +8,15 @@ metadata:
     app.kubernetes.io/component: proxy
 spec:
   replicas: 1
+  # If you point the "data" volume at a ReadWriteOnce PVC (see pvc.yaml),
+  # uncomment this. RWO volumes cannot be mounted by two pods at once, so
+  # a RollingUpdate leaves the incoming pod Pending on a volume the
+  # outgoing pod still holds, until progressDeadlineSeconds fails the
+  # rollout. Recreate drains the old pod first, at the cost of a short
+  # gap on every deploy.
+  # strategy:
+  #   type: Recreate
+  #
   # Each replica runs its own backend pool — there is no shared state or
   # leader election. Scaling to N replicas means N independent instances
   # of every configured MCP server. This is safe but multiplies backend
@@ -57,6 +66,22 @@ spec:
                 secretKeyRef:
                   name: mcp-secrets
                   key: sentry-token
+
+            # OAuth AS state — registered DCR clients and refresh tokens.
+            # Only read when serverAuth.providers includes "oauth_as", but
+            # when it does, this MUST resolve to durable storage.
+            #
+            # Left unset, the state lands in config_dir() (~/.config/mcp,
+            # or /tmp/mcp when HOME is unset) — read-only or ephemeral in
+            # this pod either way. Every restart then forces every user to
+            # reconnect the MCP by hand, because the provider rejects any
+            # token whose `aud` is no longer a registered client. Unexpired
+            # access tokens included.
+            #
+            # /data is an emptyDir below, which is NOT durable. Swap it for
+            # the PVC in pvc.yaml before enabling oauth_as.
+            # - name: MCP_AUTH_SERVER_PATH
+            #   value: "/data/auth_server.json"
 
             # Audit logging. Set to "true" and mount a PVC at /data to persist
             # logs across restarts. The scratch image has no writable filesystem
@@ -128,8 +153,9 @@ spec:
             # Writable tmp for classifier cache and other ephemeral files.
             - name: tmp
               mountPath: /tmp
-            # Audit data (only needed if MCP_AUDIT_ENABLED=true).
-            # Swap emptyDir for a PVC reference to persist across restarts.
+            # Durable state: OAuth AS clients/refresh tokens and, if
+            # enabled, audit logs. Swap the emptyDir below for a PVC to
+            # survive restarts.
             - name: data
               mountPath: /data
 
@@ -137,9 +163,11 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 10Mi
-        # For persistent audit logs, replace with:
+        # emptyDir is fine ONLY when oauth_as is off and audit logging is
+        # off (or streaming to stdout). Otherwise replace with:
         #   persistentVolumeClaim:
-        #     claimName: mcp-audit-data
+        #     claimName: mcp-data
+        # and uncomment strategy.type: Recreate above.
         - name: data
           emptyDir:
             sizeLimit: 100Mi
