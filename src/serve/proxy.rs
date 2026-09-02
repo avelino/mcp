@@ -842,6 +842,43 @@ impl ProxyServer {
     /// `arguments`. Returns Err(JsonRpcResponse) if the call should be
     /// rejected immediately.
     #[allow(clippy::result_large_err)]
+    /// Headers carrying the caller's identity for one backend call, or empty
+    /// when the server did not opt in via `forwardIdentity`.
+    ///
+    /// Empty is the default and the safe answer: a backend that never asked for
+    /// identity must not start receiving one, and a backend that DID ask is
+    /// trusting the header — see `config::ForwardIdentity` for the condition
+    /// that makes that safe.
+    ///
+    /// Values are checked here, not at load time, because the subject is
+    /// runtime data (it comes from a bearer token or an upstream SSO header).
+    /// A subject with CR/LF in it would be header injection into the backend
+    /// request, so such a call is refused rather than sent without identity —
+    /// sending it anyway would land the write under the shared credential,
+    /// which is exactly the silent-wrong-owner outcome this feature removes.
+    pub(crate) fn identity_headers(
+        &self,
+        server: &str,
+        identity: &AuthIdentity,
+    ) -> std::result::Result<Vec<(String, String)>, String> {
+        let Some(cfg) = self.configs.get(server).and_then(|c| c.forward_identity()) else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::with_capacity(2);
+        out.push((
+            valid_header_name(&cfg.header)?,
+            valid_header_value(&identity.subject, "subject")?,
+        ));
+        if let Some(roles_header) = &cfg.roles_header {
+            out.push((
+                valid_header_name(roles_header)?,
+                valid_header_value(&identity.roles.join(","), "roles")?,
+            ));
+        }
+        Ok(out)
+    }
+
     pub(crate) fn resolve_tool_call(
         &self,
         id: &Value,
@@ -954,6 +991,30 @@ pub(crate) async fn shutdown_clients_in_parallel(clients: Vec<(String, Arc<McpCl
         });
     }
     while let Some(_res) = joinset.join_next().await {}
+}
+
+/// RFC 9110 field-name token check, same rule the `x-mcp-header` annotation
+/// path uses. Rejects CR, LF and every other control character by construction.
+fn valid_header_name(name: &str) -> std::result::Result<String, String> {
+    if name.is_empty() {
+        return Err("forwardIdentity header name must not be empty".to_string());
+    }
+    if !name.bytes().all(crate::client::x_mcp_header::is_tchar) {
+        return Err(format!(
+            "forwardIdentity header name {name:?} is not an RFC 9110 field-name token"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// Field values are laxer than names (spaces and most printable bytes are
+/// legal), so the check is narrower: no control characters, which is what an
+/// injected header line would need.
+fn valid_header_value(value: &str, what: &str) -> std::result::Result<String, String> {
+    if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(format!("caller {what} contains a control character"));
+    }
+    Ok(value.to_string())
 }
 
 #[cfg(test)]
@@ -1420,6 +1481,130 @@ mod tests {
         let configs = make_configs(&["a"]);
         // split_once gives ("a", "b__c") — prefix "a" is in configs
         assert_eq!(infer_backend_name("a__b__c", &configs), Some("a"));
+    }
+
+    // --- forwardIdentity tests ---
+
+    fn http_server(forward: Option<crate::config::ForwardIdentity>) -> ProxyServer {
+        let pool = Arc::new(crate::db::DbPool::disabled());
+        let mut configs = HashMap::new();
+        configs.insert(
+            "hub".to_string(),
+            ServerConfig::Http {
+                url: "http://hub.internal/mcp".to_string(),
+                headers: HashMap::new(),
+                forward_identity: forward,
+                tool_acl: None,
+                idle_timeout: crate::config::IdleTimeoutPolicy::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
+            },
+        );
+        ProxyServer::new(
+            Arc::new(AuditLogger::Disabled),
+            configs,
+            HashMap::new(),
+            ToolCacheStore::new(pool),
+        )
+    }
+
+    fn forward(header: &str, roles_header: Option<&str>) -> crate::config::ForwardIdentity {
+        crate::config::ForwardIdentity {
+            header: header.to_string(),
+            roles_header: roles_header.map(str::to_string),
+        }
+    }
+
+    fn identity(subject: &str, roles: &[&str]) -> AuthIdentity {
+        AuthIdentity {
+            subject: subject.to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn no_forward_identity_config_sends_nothing() {
+        // The default has to be "no header": a backend that never asked for
+        // identity must not start receiving one on upgrade.
+        let p = http_server(None);
+        let out = p
+            .identity_headers("hub", &identity("ana", &["business"]))
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stdio_backend_never_forwards() {
+        // HTTP-only by construction: there is no per-request channel into a
+        // long-lived stdin pipe.
+        let p = test_server_with_configs(&["local"]);
+        let out = p.identity_headers("local", &identity("ana", &[])).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn unknown_server_sends_nothing() {
+        let p = http_server(Some(forward("X-MCP-Subject", None)));
+        let out = p
+            .identity_headers("nao-existe", &identity("ana", &[]))
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn subject_travels_under_the_configured_header() {
+        let p = http_server(Some(forward("X-MCP-Subject", None)));
+        let out = p
+            .identity_headers("hub", &identity("ana", &["business"]))
+            .unwrap();
+        assert_eq!(out, vec![("X-MCP-Subject".to_string(), "ana".to_string())]);
+    }
+
+    #[test]
+    fn roles_header_is_opt_in_and_comma_separated() {
+        let p = http_server(Some(forward("X-Who", Some("X-Roles"))));
+        let out = p
+            .identity_headers("hub", &identity("ana", &["business", "dev"]))
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                ("X-Who".to_string(), "ana".to_string()),
+                ("X-Roles".to_string(), "business,dev".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn crlf_in_subject_is_refused_not_forwarded() {
+        // Header injection into the backend request. The call is refused rather
+        // than sent without identity: falling back to the shared credential
+        // would record the write under the wrong owner, silently.
+        let p = http_server(Some(forward("X-MCP-Subject", None)));
+        let err = p
+            .identity_headers("hub", &identity("ana\r\nX-Admin: 1", &[]))
+            .unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn control_character_in_roles_is_refused() {
+        let p = http_server(Some(forward("X-Who", Some("X-Roles"))));
+        let err = p
+            .identity_headers("hub", &identity("ana", &["biz\nX-Admin: 1"]))
+            .unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn bad_header_name_is_refused() {
+        for name in ["", "X Subject", "X:Subject", "X\r\nY"] {
+            let p = http_server(Some(forward(name, None)));
+            assert!(
+                p.identity_headers("hub", &identity("ana", &[])).is_err(),
+                "header name {name:?} deveria ser recusado"
+            );
+        }
     }
 
     // --- is_backend_undiscovered tests ---

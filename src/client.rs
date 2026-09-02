@@ -563,6 +563,39 @@ impl McpClient {
     /// params from the two fields we happen to name would drop the
     /// continuation and stall the exchange. Rebuilding is what let the proxy
     /// bypass this method entirely, taking the header mirroring with it.
+    /// `call_tool_raw` plus headers the caller supplies — today, the caller's
+    /// identity (see `config::ForwardIdentity`).
+    ///
+    /// The extras go FIRST so a backend's own `x-mcp-header` annotation cannot
+    /// silently shadow the identity header: a tool that declares an argument
+    /// mapping to `X-MCP-Subject` would otherwise let the caller pick their own
+    /// subject, which is precisely the bypass this feature must not create.
+    pub async fn call_tool_raw_with(
+        &self,
+        params: serde_json::Value,
+        extra_headers: &[(String, String)],
+    ) -> Result<serde_json::Value> {
+        let empty = serde_json::Value::Object(serde_json::Map::new());
+        let from_params = match params.get("name").and_then(|v| v.as_str()) {
+            Some(name) => self.param_headers(name, params.get("arguments").unwrap_or(&empty)),
+            None => Vec::new(),
+        };
+
+        let reserved: Vec<String> = extra_headers
+            .iter()
+            .map(|(k, _)| k.to_ascii_lowercase())
+            .collect();
+        let mut headers = extra_headers.to_vec();
+        headers.extend(
+            from_params
+                .into_iter()
+                .filter(|(k, _)| !reserved.contains(&k.to_ascii_lowercase())),
+        );
+
+        self.send_with_headers("tools/call", Some(params), &headers)
+            .await
+    }
+
     pub async fn call_tool_raw(&self, params: serde_json::Value) -> Result<serde_json::Value> {
         // Read the header inputs out of the params we are about to send, so
         // the headers can never describe a different call than the body.
@@ -702,7 +735,7 @@ fn fatal_probe_hint(
 /// CRLF in it, and every intermediary between us and the server sees whatever
 /// it wanted there. The spec's answer is to treat a violating annotation as
 /// invalidating the whole tool definition.
-mod x_mcp_header {
+pub(crate) mod x_mcp_header {
     use serde_json::Value;
 
     /// The annotation keyword, as it appears inside a property's schema.
@@ -822,8 +855,10 @@ mod x_mcp_header {
         }
     }
 
-    /// RFC 9110 §5.1 `tchar`.
-    fn is_tchar(b: u8) -> bool {
+    /// RFC 9110 §5.1 `tchar`. `pub(crate)` so the identity-forwarding path in
+    /// `serve::proxy` validates header names with the SAME rule — two copies of
+    /// a header-injection check is how one of them drifts.
+    pub(crate) fn is_tchar(b: u8) -> bool {
         b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
     }
 
@@ -2231,6 +2266,93 @@ mod tests {
             .headers_for("tools/call")
             .iter()
             .any(|(name, _)| name.contains("Query")));
+    }
+
+    /// Privilege escalation, not cosmetics: a backend that declares a tool
+    /// argument annotated with the SAME header the proxy uses to forward the
+    /// caller's identity would let the caller pick their own subject. The
+    /// forwarded identity has to win, and the argument-derived one has to be
+    /// dropped — not appended after it, because a duplicate header is resolved
+    /// by the receiver and we do not get to decide how.
+    #[tokio::test]
+    async fn forwarded_identity_cannot_be_shadowed_by_x_mcp_header() {
+        let t = MockTransport::new(vec![
+            ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
+            (
+                "tools/list",
+                Reply::Result(json!({"tools": [tool_with_schema(
+                    "publish",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            // O backend tenta reivindicar o header de identidade.
+                            "whoami": {"type": "string", "x-mcp-header": "X-MCP-Subject"},
+                        },
+                    }),
+                )]})),
+            ),
+            ("tools/call", Reply::Result(json!({"content": []}))),
+        ]);
+        let client = connect_mock(Arc::clone(&t)).await.unwrap();
+        client.list_tools().await.unwrap();
+
+        client
+            .call_tool_raw_with(
+                json!({"name": "publish", "arguments": {"whoami": "admin"}}),
+                &[("X-MCP-Subject".to_string(), "ana".to_string())],
+            )
+            .await
+            .unwrap();
+
+        let headers = t.headers_for("tools/call");
+        let subjects: Vec<&String> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-mcp-subject"))
+            .map(|(_, value)| value)
+            .collect();
+
+        assert_eq!(
+            subjects,
+            vec!["ana"],
+            "a identidade encaminhada tem que ser a ÚNICA, e não a do argumento"
+        );
+    }
+
+    /// Sem identidade encaminhada, o comportamento do `x-mcp-header` não muda —
+    /// a feature é aditiva.
+    #[tokio::test]
+    async fn call_tool_raw_with_no_extras_behaves_like_call_tool_raw() {
+        let t = MockTransport::new(vec![
+            ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
+            (
+                "tools/list",
+                Reply::Result(json!({"tools": [tool_with_schema(
+                    "publish",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "region": {"type": "string", "x-mcp-header": "Region"},
+                        },
+                    }),
+                )]})),
+            ),
+            ("tools/call", Reply::Result(json!({"content": []}))),
+        ]);
+        let client = connect_mock(Arc::clone(&t)).await.unwrap();
+        client.list_tools().await.unwrap();
+
+        client
+            .call_tool_raw_with(
+                json!({"name": "publish", "arguments": {"region": "sa-east1"}}),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            t.headers_for("tools/call"),
+            vec![("Mcp-Param-Region".to_string(), "sa-east1".to_string())]
+        );
     }
 
     /// A value outside the header-safe set travels as the spec's Base64

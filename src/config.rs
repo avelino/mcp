@@ -64,6 +64,44 @@ pub struct ToolOverrides {
     pub write: Vec<String>,
 }
 
+/// Forward the *caller's* identity to an HTTP backend, per request.
+///
+/// The proxy already authenticates the caller and enforces the ACL, but it
+/// talks to every backend with one credential resolved at startup. That is the
+/// right model when the backend's data has no per-row owner (Sentry, Slack,
+/// Databricks): the shared token is the service account, and the proxy decides
+/// who may reach it.
+///
+/// It stops being the right model when the backend's data *is* owned per user —
+/// an internal app catalogue, a notes service, anything that records an author.
+/// There a shared credential makes every write land under the same name, and it
+/// does not fail loudly: it records the wrong owner, silently, forever.
+///
+/// Opt-in per server, because it is only safe under a condition this proxy
+/// cannot verify:
+///
+/// > The backend **must not** be reachable by anyone who could set this header
+/// > themselves. If it is, the header is a complete authentication bypass — the
+/// > caller just claims to be someone else.
+///
+/// In practice: the backend accepts it only from the proxy's address, over a
+/// private link.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ForwardIdentity {
+    /// Header carrying `AuthIdentity::subject`. Defaults to `X-MCP-Subject`.
+    #[serde(default = "default_subject_header")]
+    pub header: String,
+    /// Optional header carrying the caller's roles, comma-separated. Absent by
+    /// default: most backends only need to know *who*, and sending roles a
+    /// backend does not read is avoidable exposure.
+    #[serde(default)]
+    pub roles_header: Option<String>,
+}
+
+fn default_subject_header() -> String {
+    "X-MCP-Subject".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct CliToolConfig {
     pub name: String,
@@ -124,6 +162,11 @@ pub enum ServerConfig {
         url: String,
         #[serde(default)]
         headers: HashMap<String, String>,
+        /// Per-request caller identity. Only on HTTP backends: a stdio/CLI
+        /// backend is a process the proxy owns, and there is no per-request
+        /// channel to carry a header into a long-lived stdin pipe.
+        #[serde(default)]
+        forward_identity: Option<ForwardIdentity>,
         #[serde(default)]
         tool_acl: Option<ToolOverrides>,
         #[serde(default)]
@@ -166,6 +209,16 @@ impl ServerConfig {
         };
         raw.and_then(parse_duration_str)
             .unwrap_or(DEFAULT_MIN_IDLE_TIMEOUT)
+    }
+
+    /// `None` for stdio/CLI backends — identity forwarding is HTTP-only.
+    pub fn forward_identity(&self) -> Option<&ForwardIdentity> {
+        match self {
+            ServerConfig::Http {
+                forward_identity, ..
+            } => forward_identity.as_ref(),
+            _ => None,
+        }
     }
 
     pub fn tool_acl(&self) -> Option<&ToolOverrides> {
