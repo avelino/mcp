@@ -251,10 +251,28 @@ pub(crate) async fn dispatch_request(
             }
 
             // Phase 1: resolve routing under a brief lock.
+            let mut identity_headers: Vec<(String, String)> = Vec::new();
             let resolved: std::result::Result<ResolvedCall, JsonRpcResponse> = {
                 let mut p = proxy.lock().await;
                 match p.resolve_tool_call(&id, req.params.clone(), identity, acl) {
                     Ok((server, orig, args, decision)) => {
+                        // Identity headers are resolved HERE, under the same
+                        // lock that resolved the route: the config and the
+                        // caller are both in hand, and phase 3 runs unlocked.
+                        match p.identity_headers(&server, identity) {
+                            Ok(h) => identity_headers = h,
+                            Err(why) => {
+                                // Refuse rather than fall back to the shared
+                                // credential: silently writing under the wrong
+                                // owner is the failure this feature exists to
+                                // prevent.
+                                return JsonRpcResponse::error(
+                                    id.clone(),
+                                    error_codes::INVALID_PARAMS,
+                                    &format!("cannot forward caller identity: {why}"),
+                                );
+                            }
+                        }
                         let client = p.try_get_client(&server);
                         // Refine the audit entry now that we know the
                         // namespaced tool resolves to a real backend.
@@ -297,7 +315,10 @@ pub(crate) async fn dispatch_request(
                             // `x-mcp-header` annotations into `Mcp-Param-*`,
                             // and it takes whole params so the MRTR
                             // continuation survives the hop.
-                            match client.call_tool_raw(backend_params).await {
+                            match client
+                                .call_tool_raw_with(backend_params, &identity_headers)
+                                .await
+                            {
                                 Ok(mut result) => {
                                     sanitize_relayed_result(&mut result, stateless_peer);
                                     JsonRpcResponse::success(id, result)

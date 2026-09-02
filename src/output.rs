@@ -630,6 +630,7 @@ mod tests {
             ServerConfig::Http {
                 url: "https://example.com/mcp".to_string(),
                 headers: HashMap::new(),
+                forward_identity: None,
                 tool_acl: None,
                 idle_timeout: Default::default(),
                 min_idle_timeout: None,
@@ -653,6 +654,7 @@ mod tests {
             ServerConfig::Http {
                 url: "https://mcp.sentry.dev/sse".to_string(),
                 headers: HashMap::new(),
+                forward_identity: None,
                 tool_acl: None,
                 idle_timeout: Default::default(),
                 min_idle_timeout: None,

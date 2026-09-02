@@ -58,10 +58,58 @@ Three variants, distinguished by their fields:
 |---|---|---|---|
 | `url` | string | *required* | Server endpoint URL |
 | `headers` | object | `{}` | HTTP headers for every request |
+| `forward_identity` | object | `null` | Send the **caller's** identity per request (see [Forwarding caller identity](#forwarding-caller-identity)) |
 | `tool_acl` | object | `null` | Manual read/write classification overrides (see [Tool ACL overrides](#tool-acl-overrides)) |
 | `idle_timeout` | string | `"adaptive"` | Idle shutdown policy (see [Idle timeout](#idle-timeout)) |
 | `min_idle_timeout` | string | `"1m"` | Minimum idle timeout for adaptive mode |
 | `max_idle_timeout` | string | `"5m"` | Maximum idle timeout for adaptive mode |
+
+#### Forwarding caller identity
+
+The proxy authenticates the caller and enforces the ACL, then talks to the backend with
+**one credential resolved at startup**. That is the right model when the backend's data
+has no per-row owner — Sentry, Slack, Databricks: the shared token *is* the service
+account, and the proxy decides who may reach it.
+
+It stops being the right model when the backend's data **is** owned per user: an internal
+app catalogue, a notes service, anything that records an author. There a shared credential
+makes every write land under the same name, and it does not fail loudly — it records the
+wrong owner, silently.
+
+`forward_identity` sends the authenticated caller's `subject` to the backend as a header,
+per request:
+
+```json
+{
+  "url": "http://hub.internal/mcp",
+  "headers": { "Authorization": "Bearer ${HUB_SERVICE_TOKEN}" },
+  "forward_identity": { "header": "X-MCP-Subject" }
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `header` | string | `"X-MCP-Subject"` | Header carrying the caller's `subject` |
+| `roles_header` | string | `null` | Optional header with the caller's roles, comma-separated |
+
+> ⚠️ **The backend must not be reachable by anyone who could set this header themselves.**
+> If it is, the header is a complete authentication bypass — the caller just claims to be
+> someone else. In practice: the backend accepts it only from the proxy's address, over a
+> private link. This is the condition the proxy cannot verify, which is why the feature is
+> opt-in per server instead of on by default.
+
+Notes:
+
+- **HTTP backends only.** A stdio/CLI backend is a process the proxy owns, and there is no
+  per-request channel to carry a header into a long-lived stdin pipe.
+- The identity header **wins over** a backend's own `x-mcp-header` annotation with the same
+  name. Otherwise a tool could declare an argument mapped to `X-MCP-Subject` and let the
+  caller pick their own subject.
+- A `subject` (or role) containing a control character is **refused**, not sent without
+  identity: falling back to the shared credential is exactly the silent-wrong-owner
+  outcome this feature removes.
+- `roles_header` is off by default — most backends only need to know *who*, and sending
+  roles a backend does not read is avoidable exposure.
 
 ### CLI server
 
