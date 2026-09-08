@@ -754,6 +754,13 @@ async fn discover_for_list(proxy: &SharedProxy) -> Arc<AuditLogger> {
 ///
 /// Returns the client, or the error response to hand back — every caller
 /// reports a failed connect the same way.
+///
+/// `JsonRpcResponse` is the error type across this module by design — a
+/// failure here IS the reply the caller relays — so the Err variant is
+/// naturally past clippy's 128-byte threshold. Same allow, same reason, as
+/// `ProxyServer::resolve_tool_call`. Boxing it would be the other answer, but
+/// that changes the error type on every dispatch path at once.
+#[allow(clippy::result_large_err)]
 async fn client_or_connect(
     proxy: &SharedProxy,
     server: &str,
