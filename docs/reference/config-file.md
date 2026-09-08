@@ -102,14 +102,20 @@ Notes:
 
 - **HTTP backends only.** A stdio/CLI backend is a process the proxy owns, and there is no
   per-request channel to carry a header into a long-lived stdin pipe.
-- The identity header **wins over** a backend's own `x-mcp-header` annotation with the same
-  name. Otherwise a tool could declare an argument mapped to `X-MCP-Subject` and let the
-  caller pick their own subject.
 - A `subject` (or role) containing a control character is **refused**, not sent without
   identity: falling back to the shared credential is exactly the silent-wrong-owner
   outcome this feature removes.
 - `roles_header` is off by default — most backends only need to know *who*, and sending
   roles a backend does not read is avoidable exposure.
+- `roles_header` **may not equal** `header` (compared case-insensitively). Two same-named
+  headers with unrelated values leave the choice to the receiver, which could read the
+  roles value as the subject; the call is refused instead.
+- A backend's own `x-mcp-header` annotation **cannot claim** the identity header's name.
+  Argument-derived headers are always emitted as `Mcp-Param-{Name}`, so a tool annotating
+  `X-MCP-Subject` produces `Mcp-Param-X-MCP-Subject` and lands beside the identity header
+  rather than over it. The proxy additionally drops an argument-derived header whose full
+  name collides with a forwarded one, which is reachable only if you configure `header`
+  under the `Mcp-Param-` prefix yourself.
 
 ### CLI server
 

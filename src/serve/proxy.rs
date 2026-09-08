@@ -836,14 +836,8 @@ impl ProxyServer {
         )
     }
 
-    /// Resolve a tool name to (server, original_name, backend params, ACL
-    /// decision). The third element is the **whole** params object rewritten
-    /// for the backend (see [`backend_tool_call_params`]), not just
-    /// `arguments`. Returns Err(JsonRpcResponse) if the call should be
-    /// rejected immediately.
-    #[allow(clippy::result_large_err)]
     /// Headers carrying the caller's identity for one backend call, or empty
-    /// when the server did not opt in via `forwardIdentity`.
+    /// when the server did not opt in via `forward_identity`.
     ///
     /// Empty is the default and the safe answer: a backend that never asked for
     /// identity must not start receiving one, and a backend that DID ask is
@@ -865,20 +859,44 @@ impl ProxyServer {
             return Ok(Vec::new());
         };
 
+        let subject_name = valid_header_name(&cfg.header)?;
+
         let mut out = Vec::with_capacity(2);
         out.push((
-            valid_header_name(&cfg.header)?,
+            subject_name.clone(),
             valid_header_value(&identity.subject, "subject")?,
         ));
         if let Some(roles_header) = &cfg.roles_header {
+            let roles_name = valid_header_name(roles_header)?;
+            // The same name for both sends two same-named headers with
+            // unrelated values, and the receiver is the one that resolves a
+            // duplicate — it could take the roles value as the subject. Refused
+            // for the same reason as a control character: the alternative is
+            // recording the wrong owner, silently.
+            //
+            // Checked here rather than at load time because the existing config
+            // validation (`validate_server_names`) only warns at boot, and a
+            // warning would let the ambiguous call go out anyway.
+            if roles_name.eq_ignore_ascii_case(&subject_name) {
+                return Err(format!(
+                    "forward_identity: header and roles_header have the same name \
+                     ({subject_name}) — use distinct names or drop roles_header"
+                ));
+            }
             out.push((
-                valid_header_name(roles_header)?,
+                roles_name,
                 valid_header_value(&identity.roles.join(","), "roles")?,
             ));
         }
         Ok(out)
     }
 
+    /// Resolve a tool name to (server, original_name, backend params, ACL
+    /// decision). The third element is the **whole** params object rewritten
+    /// for the backend (see [`backend_tool_call_params`]), not just
+    /// `arguments`. Returns Err(JsonRpcResponse) if the call should be
+    /// rejected immediately.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn resolve_tool_call(
         &self,
         id: &Value,
@@ -1573,6 +1591,30 @@ mod tests {
                 ("X-Roles".to_string(), "business,dev".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn roles_header_equal_to_the_subject_header_is_refused() {
+        // Two same-named headers with unrelated values: the receiver resolves
+        // the duplicate, and it could take the roles value as the subject.
+        // Refused rather than sent ambiguous.
+        let p = http_server(Some(forward("X-Who", Some("X-Who"))));
+        let err = p
+            .identity_headers("hub", &identity("ana", &["business"]))
+            .unwrap_err();
+        assert!(
+            err.contains("same name"),
+            "the error must name the problem, got: {err}"
+        );
+    }
+
+    #[test]
+    fn roles_header_equal_ignoring_case_is_also_refused() {
+        // Header names are case-insensitive, so "x-who" collides with "X-Who".
+        let p = http_server(Some(forward("X-Who", Some("x-who"))));
+        assert!(p
+            .identity_headers("hub", &identity("ana", &["business"]))
+            .is_err());
     }
 
     #[test]
