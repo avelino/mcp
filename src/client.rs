@@ -550,26 +550,21 @@ impl McpClient {
         self.send(method, params).await
     }
 
-    /// `tools/call` returning the raw result, preserving MRTR interim
-    /// results for the caller to relay.
-    ///
-    /// This is also where `x-mcp-header` annotations turn into headers: the
-    /// spec requires the mirroring on `tools/call` specifically, and this is
-    /// the one path every `tools/call` goes through.
-    ///
-    /// Takes whole `params` rather than `(name, arguments)` — like
-    /// [`Self::read_resource_raw`] — because an MRTR retry carries
-    /// `inputResponses`/`requestState` alongside `arguments`, and rebuilding
-    /// params from the two fields we happen to name would drop the
-    /// continuation and stall the exchange. Rebuilding is what let the proxy
-    /// bypass this method entirely, taking the header mirroring with it.
     /// `call_tool_raw` plus headers the caller supplies — today, the caller's
     /// identity (see `config::ForwardIdentity`).
     ///
-    /// The extras go FIRST so a backend's own `x-mcp-header` annotation cannot
-    /// silently shadow the identity header: a tool that declares an argument
-    /// mapping to `X-MCP-Subject` would otherwise let the caller pick their own
-    /// subject, which is precisely the bypass this feature must not create.
+    /// The extras go FIRST and a same-named argument-derived header is dropped
+    /// rather than appended after: a duplicate header is resolved by the
+    /// receiver, and that decision is not ours to make.
+    ///
+    /// This guard is narrower than it looks, and the first version of this doc
+    /// oversold it. `x-mcp-header` annotations always emit `Mcp-Param-{Name}`
+    /// (see [`x_mcp_header::headers_for`]), so a tool annotating
+    /// `X-MCP-Subject` produces `Mcp-Param-X-MCP-Subject` and cannot claim the
+    /// identity header by name — the prefix already isolates it, with no help
+    /// from this filter. The filter earns its place only when
+    /// `forward_identity.header` is itself configured under the `Mcp-Param-`
+    /// prefix, which is the one arrangement where a collision is reachable.
     pub async fn call_tool_raw_with(
         &self,
         params: serde_json::Value,
@@ -596,6 +591,19 @@ impl McpClient {
             .await
     }
 
+    /// `tools/call` returning the raw result, preserving MRTR interim
+    /// results for the caller to relay.
+    ///
+    /// This is also where `x-mcp-header` annotations turn into headers: the
+    /// spec requires the mirroring on `tools/call` specifically, and this is
+    /// the one path every `tools/call` goes through.
+    ///
+    /// Takes whole `params` rather than `(name, arguments)` — like
+    /// [`Self::read_resource_raw`] — because an MRTR retry carries
+    /// `inputResponses`/`requestState` alongside `arguments`, and rebuilding
+    /// params from the two fields we happen to name would drop the
+    /// continuation and stall the exchange. Rebuilding is what let the proxy
+    /// bypass this method entirely, taking the header mirroring with it.
     pub async fn call_tool_raw(&self, params: serde_json::Value) -> Result<serde_json::Value> {
         // Read the header inputs out of the params we are about to send, so
         // the headers can never describe a different call than the body.
@@ -2268,14 +2276,18 @@ mod tests {
             .any(|(name, _)| name.contains("Query")));
     }
 
-    /// Privilege escalation, not cosmetics: a backend that declares a tool
-    /// argument annotated with the SAME header the proxy uses to forward the
-    /// caller's identity would let the caller pick their own subject. The
-    /// forwarded identity has to win, and the argument-derived one has to be
-    /// dropped — not appended after it, because a duplicate header is resolved
-    /// by the receiver and we do not get to decide how.
+    /// The structural reason the naive escalation is impossible: an annotation
+    /// naming `X-MCP-Subject` does NOT produce `X-MCP-Subject`. Every
+    /// argument-derived header is emitted under the `Mcp-Param-` prefix, so the
+    /// annotation lands beside the identity header instead of claiming it.
+    ///
+    /// This is a regression test for the *guarantee*, not for the filter below
+    /// — it passes with the filter removed. An earlier version of this test
+    /// asserted only "the forwarded subject is the one that goes out", which
+    /// was true for this reason and not because of any code of ours; the doc
+    /// on `call_tool_raw_with` used to claim otherwise.
     #[tokio::test]
-    async fn forwarded_identity_cannot_be_shadowed_by_x_mcp_header() {
+    async fn an_annotation_cannot_claim_the_identity_header_name() {
         let t = MockTransport::new(vec![
             ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
             (
@@ -2285,7 +2297,7 @@ mod tests {
                     json!({
                         "type": "object",
                         "properties": {
-                            // O backend tenta reivindicar o header de identidade.
+                            // The backend tries to claim the identity header.
                             "whoami": {"type": "string", "x-mcp-header": "X-MCP-Subject"},
                         },
                     }),
@@ -2305,21 +2317,78 @@ mod tests {
             .unwrap();
 
         let headers = t.headers_for("tools/call");
-        let subjects: Vec<&String> = headers
+        let named = |n: &str| -> Vec<&String> {
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(n))
+                .map(|(_, value)| value)
+                .collect()
+        };
+
+        assert_eq!(
+            named("x-mcp-subject"),
+            vec!["ana"],
+            "the forwarded identity is the only value under the identity header name"
+        );
+        assert_eq!(
+            named("mcp-param-x-mcp-subject"),
+            vec!["admin"],
+            "the argument value goes out under the Mcp-Param- prefix, where no \
+             identity check reads it — the prefix is what prevents the escalation"
+        );
+    }
+
+    /// The one case where `call_tool_raw_with`'s filter does real work: if the
+    /// operator configures `forward_identity.header` INSIDE the `Mcp-Param-`
+    /// prefix, an annotation can then collide on the exact name. The
+    /// argument-derived header must be dropped, not appended after.
+    ///
+    /// Unlike the test above, this one fails if the filter is removed.
+    #[tokio::test]
+    async fn extras_win_over_a_same_named_param_header() {
+        let t = MockTransport::new(vec![
+            ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
+            (
+                "tools/list",
+                Reply::Result(json!({"tools": [tool_with_schema(
+                    "publish",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "whoami": {"type": "string", "x-mcp-header": "Whoami"},
+                        },
+                    }),
+                )]})),
+            ),
+            ("tools/call", Reply::Result(json!({"content": []}))),
+        ]);
+        let client = connect_mock(Arc::clone(&t)).await.unwrap();
+        client.list_tools().await.unwrap();
+
+        client
+            .call_tool_raw_with(
+                json!({"name": "publish", "arguments": {"whoami": "admin"}}),
+                &[("Mcp-Param-Whoami".to_string(), "ana".to_string())],
+            )
+            .await
+            .unwrap();
+
+        let headers = t.headers_for("tools/call");
+        let values: Vec<&String> = headers
             .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("x-mcp-subject"))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("mcp-param-whoami"))
             .map(|(_, value)| value)
             .collect();
 
         assert_eq!(
-            subjects,
+            values,
             vec!["ana"],
-            "a identidade encaminhada tem que ser a ÚNICA, e não a do argumento"
+            "exact-name collision: ONE header goes out, carrying the forwarded value"
         );
     }
 
-    /// Sem identidade encaminhada, o comportamento do `x-mcp-header` não muda —
-    /// a feature é aditiva.
+    /// With no forwarded identity, `x-mcp-header` behaves exactly as before —
+    /// the feature is additive.
     #[tokio::test]
     async fn call_tool_raw_with_no_extras_behaves_like_call_tool_raw() {
         let t = MockTransport::new(vec![

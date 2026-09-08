@@ -94,6 +94,11 @@ pub struct ForwardIdentity {
     /// Optional header carrying the caller's roles, comma-separated. Absent by
     /// default: most backends only need to know *who*, and sending roles a
     /// backend does not read is avoidable exposure.
+    ///
+    /// May not equal [`Self::header`] (compared case-insensitively): two
+    /// same-named headers with unrelated values leave the choice to the
+    /// receiver, which could read the roles value as the subject. Such a call
+    /// is refused — see `ProxyServer::identity_headers`.
     #[serde(default)]
     pub roles_header: Option<String>,
 }
