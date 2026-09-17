@@ -542,12 +542,18 @@ impl McpClient {
     /// them.
     ///
     /// [mrtr]: https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr
+    /// `extra_headers` carries what the caller wants on the wire beyond the
+    /// transport's own — today, the caller's identity (see
+    /// `config::ForwardIdentity`). There are no argument-derived headers to
+    /// reconcile against here: `x-mcp-header` is a `tools/call` mechanism, so
+    /// on these methods the extras are the only headers in play.
     pub async fn request_raw(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
+        extra_headers: &[(String, String)],
     ) -> Result<serde_json::Value> {
-        self.send(method, params).await
+        self.send_with_headers(method, params, extra_headers).await
     }
 
     /// `call_tool_raw` plus headers the caller supplies — today, the caller's
@@ -559,12 +565,17 @@ impl McpClient {
     ///
     /// This guard is narrower than it looks, and the first version of this doc
     /// oversold it. `x-mcp-header` annotations always emit `Mcp-Param-{Name}`
-    /// (see [`x_mcp_header::headers_for`]), so a tool annotating
-    /// `X-MCP-Subject` produces `Mcp-Param-X-MCP-Subject` and cannot claim the
-    /// identity header by name — the prefix already isolates it, with no help
-    /// from this filter. The filter earns its place only when
-    /// `forward_identity.header` is itself configured under the `Mcp-Param-`
-    /// prefix, which is the one arrangement where a collision is reachable.
+    /// (see `x_mcp_header::headers_for`), so a tool annotating `X-MCP-Subject`
+    /// produces `Mcp-Param-X-MCP-Subject` and cannot claim the identity header
+    /// by name — the prefix already isolates it, with no help from this
+    /// filter. The filter earns its place only when `forward_identity.header`
+    /// is itself configured under the `Mcp-Param-` prefix, which is the one
+    /// arrangement where a collision is reachable.
+    ///
+    /// The *other* collision, with the server's static `headers`, is not
+    /// reconcilable here: those are applied by the transport, which appends
+    /// rather than replaces. `ProxyServer::identity_headers` refuses the call
+    /// upstream instead.
     pub async fn call_tool_raw_with(
         &self,
         params: serde_json::Value,
@@ -605,15 +616,7 @@ impl McpClient {
     /// continuation and stall the exchange. Rebuilding is what let the proxy
     /// bypass this method entirely, taking the header mirroring with it.
     pub async fn call_tool_raw(&self, params: serde_json::Value) -> Result<serde_json::Value> {
-        // Read the header inputs out of the params we are about to send, so
-        // the headers can never describe a different call than the body.
-        let empty = serde_json::Value::Object(serde_json::Map::new());
-        let headers = match params.get("name").and_then(|v| v.as_str()) {
-            Some(name) => self.param_headers(name, params.get("arguments").unwrap_or(&empty)),
-            None => Vec::new(),
-        };
-        self.send_with_headers("tools/call", Some(params), &headers)
-            .await
+        self.call_tool_raw_with(params, &[]).await
     }
 
     pub async fn call_tool(
@@ -652,8 +655,16 @@ impl McpClient {
     /// retry has to carry `inputResponses`/`requestState` through untouched;
     /// rebuilding params from the one field we happen to know would drop the
     /// continuation and stall the exchange.
-    pub async fn read_resource_raw(&self, params: serde_json::Value) -> Result<serde_json::Value> {
-        self.request_raw("resources/read", Some(params)).await
+    /// A resource read is where per-user data comes *back*, so a backend that
+    /// owns data per user needs `extra_headers` to carry the caller's
+    /// identity here for the same reason it needs it on `tools/call`.
+    pub async fn read_resource_raw(
+        &self,
+        params: serde_json::Value,
+        extra_headers: &[(String, String)],
+    ) -> Result<serde_json::Value> {
+        self.request_raw("resources/read", Some(params), extra_headers)
+            .await
     }
 
     pub async fn list_prompts(&self) -> Result<Vec<Prompt>> {
@@ -663,8 +674,13 @@ impl McpClient {
     /// `prompts/get` returning the raw result, preserving MRTR interim
     /// results for the caller to relay. See [`Self::read_resource_raw`] for
     /// why this takes whole `params`.
-    pub async fn get_prompt_raw(&self, params: serde_json::Value) -> Result<serde_json::Value> {
-        self.request_raw("prompts/get", Some(params)).await
+    pub async fn get_prompt_raw(
+        &self,
+        params: serde_json::Value,
+        extra_headers: &[(String, String)],
+    ) -> Result<serde_json::Value> {
+        self.request_raw("prompts/get", Some(params), extra_headers)
+            .await
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -733,6 +749,12 @@ fn fatal_probe_hint(
     )
 }
 
+/// RFC 9110 `tchar`, re-exported so the identity-forwarding path in
+/// `serve::proxy` validates header names with the SAME predicate — two copies
+/// of a header-injection check is how one of them drifts. Only this one item
+/// leaves the module; the rest of `x_mcp_header` stays private.
+pub(crate) use x_mcp_header::is_tchar;
+
 /// Client-side handling of the 2026-07-28 `x-mcp-header` annotation, which
 /// lets a server mirror chosen `tools/call` arguments into HTTP headers so
 /// intermediaries can route on them without parsing the body.
@@ -743,7 +765,7 @@ fn fatal_probe_hint(
 /// CRLF in it, and every intermediary between us and the server sees whatever
 /// it wanted there. The spec's answer is to treat a violating annotation as
 /// invalidating the whole tool definition.
-pub(crate) mod x_mcp_header {
+mod x_mcp_header {
     use serde_json::Value;
 
     /// The annotation keyword, as it appears inside a property's schema.
@@ -863,9 +885,8 @@ pub(crate) mod x_mcp_header {
         }
     }
 
-    /// RFC 9110 §5.1 `tchar`. `pub(crate)` so the identity-forwarding path in
-    /// `serve::proxy` validates header names with the SAME rule — two copies of
-    /// a header-injection check is how one of them drifts.
+    /// RFC 9110 §5.1 `tchar`. Re-exported at the module's parent so
+    /// `serve::proxy` shares the predicate rather than copying it.
     pub(crate) fn is_tchar(b: u8) -> bool {
         b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
     }
@@ -1408,10 +1429,13 @@ mod tests {
         let client = connect_mock(Arc::clone(&t)).await.unwrap();
 
         client
-            .read_resource_raw(json!({"uri": "file:///x"}))
+            .read_resource_raw(json!({"uri": "file:///x"}), &[])
             .await
             .unwrap();
-        client.get_prompt_raw(json!({"name": "p"})).await.unwrap();
+        client
+            .get_prompt_raw(json!({"name": "p"}), &[])
+            .await
+            .unwrap();
 
         assert_eq!(
             t.request_for("resources/read")["params"],
@@ -1453,6 +1477,7 @@ mod tests {
             .request_raw(
                 "tools/call",
                 Some(json!({"name": "x", "_meta": {"progressToken": 7}})),
+                &[],
             )
             .await
             .unwrap();
@@ -1476,7 +1501,7 @@ mod tests {
         ]);
         let client = connect_mock(Arc::clone(&t)).await.unwrap();
         client
-            .request_raw("weird/method", Some(json!([1, 2, 3])))
+            .request_raw("weird/method", Some(json!([1, 2, 3])), &[])
             .await
             .unwrap();
 
@@ -1548,7 +1573,7 @@ mod tests {
         assert!(is_input_required(&raw));
 
         let raw = client
-            .request_raw("tools/call", Some(json!({"name": "t"})))
+            .request_raw("tools/call", Some(json!({"name": "t"})), &[])
             .await
             .unwrap();
         assert!(is_input_required(&raw));
@@ -1885,12 +1910,15 @@ mod tests {
 
         assert!(is_input_required(
             &client
-                .read_resource_raw(json!({"uri": "file:///x"}))
+                .read_resource_raw(json!({"uri": "file:///x"}), &[])
                 .await
                 .unwrap()
         ));
         assert!(is_input_required(
-            &client.get_prompt_raw(json!({"name": "p"})).await.unwrap()
+            &client
+                .get_prompt_raw(json!({"name": "p"}), &[])
+                .await
+                .unwrap()
         ));
     }
 
@@ -1964,11 +1992,11 @@ mod tests {
         let client = connect_mock(Arc::clone(&t)).await.unwrap();
 
         client
-            .read_resource_raw(json!({"uri": "file:///x"}))
+            .read_resource_raw(json!({"uri": "file:///x"}), &[])
             .await
             .unwrap();
         client
-            .get_prompt_raw(json!({"name": "p", "arguments": {"a": 1}}))
+            .get_prompt_raw(json!({"name": "p", "arguments": {"a": 1}}), &[])
             .await
             .unwrap();
 

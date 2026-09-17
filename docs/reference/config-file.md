@@ -98,10 +98,18 @@ per request:
 > private link. This is the condition the proxy cannot verify, which is why the feature is
 > opt-in per server instead of on by default.
 
+The identity travels on every method that reaches the backend: `tools/call`, `resources/read`
+and `prompts/get`. A resource read is where per-user data comes *back*, so leaving it out
+would have a per-user backend answer every caller as the service account.
+
 Notes:
 
 - **HTTP backends only.** A stdio/CLI backend is a process the proxy owns, and there is no
   per-request channel to carry a header into a long-lived stdin pipe.
+- **The caller must be authenticated.** With no `serverAuth.providers` configured every
+  caller is `anonymous`, and forwarding that would have the backend record `anonymous` as
+  the author and believe it. Such a call is refused; configure a provider, or drop
+  `forward_identity` from the server.
 - A `subject` (or role) containing a control character is **refused**, not sent without
   identity: falling back to the shared credential is exactly the silent-wrong-owner
   outcome this feature removes.
@@ -110,6 +118,11 @@ Notes:
 - `roles_header` **may not equal** `header` (compared case-insensitively). Two same-named
   headers with unrelated values leave the choice to the receiver, which could read the
   roles value as the subject; the call is refused instead.
+- Neither header may share a name with an entry in this server's static `headers`
+  (case-insensitively). Both would be sent, as two lines of one field, and the backend
+  would pick the winner. This is what a migration off a hardcoded subject header looks
+  like when the old entry is left behind, so the call is refused rather than sent
+  ambiguous.
 - A backend's own `x-mcp-header` annotation **cannot claim** the identity header's name.
   Argument-derived headers are always emitted as `Mcp-Param-{Name}`, so a tool annotating
   `X-MCP-Subject` produces `Mcp-Param-X-MCP-Subject` and lands beside the identity header

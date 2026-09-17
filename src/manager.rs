@@ -223,6 +223,13 @@ fn merge_entry(fresh: &Value, existing: &Value) -> Value {
     }
 
     // Type-agnostic user fields preserved across updates.
+    //
+    // A field missing from this list is silently erased by `mcp update`, and
+    // the ones that hurt most are the security-shaped ones: `tool_acl` losing
+    // its read/write overrides, `forward_identity` below losing per-caller
+    // attribution. Neither failure raises anything — the config simply comes
+    // back weaker than the operator left it. Add new user-settable fields here
+    // when you add them to `ServerConfig`.
     const ALWAYS_PRESERVE: &[&str] = &[
         "idle_timeout",
         "min_idle_timeout",
@@ -232,6 +239,7 @@ fn merge_entry(fresh: &Value, existing: &Value) -> Value {
         "cli_depth",
         "cli_only",
         "tools",
+        "tool_acl",
     ];
     for key in ALWAYS_PRESERVE {
         if let Some(v) = existing_obj.get(*key) {
@@ -239,10 +247,12 @@ fn merge_entry(fresh: &Value, existing: &Value) -> Value {
         }
     }
 
-    // headers only carry over if both sides are http.
+    // HTTP-only fields carry over only when both sides are http.
     if same_type && now_http {
-        if let Some(v) = existing_obj.get("headers") {
-            merged_obj.insert("headers".to_string(), v.clone());
+        for key in ["headers", "forward_identity"] {
+            if let Some(v) = existing_obj.get(key) {
+                merged_obj.insert(key.to_string(), v.clone());
+            }
         }
     }
 
@@ -581,6 +591,43 @@ mod tests {
         assert!(!is_env_placeholder("${}"));
         assert!(!is_env_placeholder(""));
         assert!(!is_env_placeholder("$GITHUB_TOKEN"));
+    }
+
+    /// `mcp update` rebuilds the entry from the registry, so anything the
+    /// operator added by hand survives only if `merge_entry` carries it. The
+    /// two that matter here are security-shaped: dropping them leaves a
+    /// config that still works and enforces less than it did.
+    #[test]
+    fn test_merge_entry_preserves_security_settings() {
+        let fresh = json!({"url": "https://hub.example/mcp", "headers": {}});
+        let existing = json!({
+            "url": "https://hub.example/mcp",
+            "headers": {"Authorization": "Bearer ${HUB_TOKEN}"},
+            "forward_identity": {"header": "X-MCP-Subject"},
+            "tool_acl": {"write": ["publish"]},
+        });
+
+        let merged = merge_entry(&fresh, &existing);
+
+        assert_eq!(merged["forward_identity"]["header"], "X-MCP-Subject");
+        assert_eq!(merged["tool_acl"]["write"][0], "publish");
+        assert_eq!(merged["headers"]["Authorization"], "Bearer ${HUB_TOKEN}");
+    }
+
+    /// `forward_identity` is HTTP-only, so it must not ride along when the
+    /// registry moves a server to stdio — the type it lands on has no
+    /// per-request header channel to carry it.
+    #[test]
+    fn test_merge_entry_drops_forward_identity_when_type_changes() {
+        let fresh = json!({"command": "npx", "args": ["-y", "@scope/pkg"]});
+        let existing = json!({
+            "url": "https://hub.example/mcp",
+            "forward_identity": {"header": "X-MCP-Subject"},
+        });
+
+        let merged = merge_entry(&fresh, &existing);
+
+        assert!(merged.get("forward_identity").is_none());
     }
 
     #[test]

@@ -66,6 +66,8 @@ graph LR
 2. Client calls `tools/list`, `resources/list`, or `prompts/list` — the proxy returns items instantly from persistent cache (tools) or discovery (resources/prompts), aggregated across all backends. Each item is namespaced with `{server}__` prefix.
 3. Client calls `tools/call`, `resources/read`, or `prompts/get` — the proxy reconnects the target backend on demand (if it was shut down), routes the request, and tracks usage for adaptive timeout
 
+On step 3 the proxy speaks to the backend as itself, with the credential from that server's config. A backend that records an author per user needs to know which *caller* asked instead — see [forwarding caller identity](authentication.md#telling-the-backend-who-the-caller-is).
+
 ## Protocol revisions
 
 `mcp serve` speaks MCP **2026-07-28** and every earlier revision it knows, on the same endpoint. It advertises, newest first: `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`.
