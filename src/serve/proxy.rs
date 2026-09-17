@@ -1113,6 +1113,7 @@ const TRANSPORT_OWNED_HEADERS: &[&str] = &[
     "authorization",
     "content-type",
     "accept",
+    "mcp-session-id",
     "mcp-method",
     "mcp-name",
     "mcp-protocol-version",
