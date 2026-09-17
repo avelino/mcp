@@ -882,6 +882,7 @@ impl ProxyServer {
 
         let static_headers = entry.static_headers();
         let subject_name = valid_header_name(&cfg.header)?;
+        reject_transport_owned(&subject_name, "header")?;
         reject_static_collision(static_headers, &subject_name, "header")?;
 
         let mut out = Vec::with_capacity(2);
@@ -891,6 +892,7 @@ impl ProxyServer {
         ));
         if let Some(roles_header) = &cfg.roles_header {
             let roles_name = valid_header_name(roles_header)?;
+            reject_transport_owned(&roles_name, "roles_header")?;
             reject_static_collision(static_headers, &roles_name, "roles_header")?;
             // The same name for both sends two same-named headers with
             // unrelated values, and the receiver is the one that resolves a
@@ -1082,10 +1084,51 @@ fn reject_static_collision(
 /// legal), so the check is narrower: no control characters, which is what an
 /// injected header line would need.
 fn valid_header_value(value: &str, what: &str) -> std::result::Result<String, String> {
+    // An empty value is a header that asserts nothing. Many backends read it
+    // as no identity at all, which puts the write back under the shared
+    // credential without anyone noticing, so it is refused like the rest.
+    // Reachable through a bearer token configured with an empty subject.
+    if value.is_empty() {
+        return Err(format!("caller {what} is empty"));
+    }
     if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(format!("caller {what} contains a control character"));
     }
     Ok(value.to_string())
+}
+
+/// Header names the HTTP transport writes on its own, which `forward_identity`
+/// may not claim.
+///
+/// The static `headers` check cannot see these. `Authorization` is the one that
+/// bites: the transport re-adds a saved OAuth token whenever the config map has
+/// no usable `Authorization`, and the 401 retry path *removes* the config entry
+/// before doing so. A forwarded header of that name would then travel beside a
+/// bearer token the collision check never saw.
+///
+/// The rest are the routing and session fields. A forwarded value there does
+/// not leak a credential, it corrupts routing, and `-32020` from the far side
+/// is a worse way to learn about it than a refusal here.
+const TRANSPORT_OWNED_HEADERS: &[&str] = &[
+    "authorization",
+    "mcp-session-id",
+    "mcp-method",
+    "mcp-name",
+    "mcp-protocol-version",
+    "traceparent",
+    "tracestate",
+];
+
+fn reject_transport_owned(name: &str, field: &str) -> std::result::Result<(), String> {
+    let lower = name.to_ascii_lowercase();
+    if !TRANSPORT_OWNED_HEADERS.contains(&lower.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "forward_identity: {field} {name:?} is a header the HTTP transport sets itself; \
+         the caller's identity would travel beside the transport's own value and the \
+         backend would choose between them"
+    ))
 }
 
 #[cfg(test)]
@@ -1594,10 +1637,7 @@ mod tests {
     }
 
     fn identity(subject: &str, roles: &[&str]) -> AuthIdentity {
-        AuthIdentity {
-            subject: subject.to_string(),
-            roles: roles.iter().map(|r| r.to_string()).collect(),
-        }
+        AuthIdentity::new(subject, roles.iter().map(|r| r.to_string()).collect())
     }
 
     #[test]
@@ -1779,6 +1819,67 @@ mod tests {
         let p = http_server_with_headers(Some(forward("X-MCP-Subject", None)), headers);
         let out = p.identity_headers("hub", &identity("ana", &[])).unwrap();
         assert_eq!(out, vec![("X-MCP-Subject".to_string(), "ana".to_string())]);
+    }
+
+    #[test]
+    fn a_transport_owned_header_name_is_refused() {
+        // `Authorization` is the one that bites. The transport re-adds a saved
+        // OAuth token whenever the config map has no usable one, and the 401
+        // retry path removes the config entry first, so the static-headers
+        // check would find nothing to collide with and the identity would go
+        // out beside a bearer token anyway.
+        for name in [
+            "Authorization",
+            "authorization",
+            "Mcp-Session-Id",
+            "Mcp-Method",
+            "Mcp-Name",
+            "Mcp-Protocol-Version",
+            "traceparent",
+        ] {
+            let p = http_server(Some(forward(name, None)));
+            let err = p
+                .identity_headers("hub", &identity("ana", &[]))
+                .unwrap_err();
+            assert!(
+                err.contains("transport sets itself"),
+                "header name {name:?} should be refused, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transport_owned_roles_header_is_refused_too() {
+        let p = http_server(Some(forward("X-Who", Some("Authorization"))));
+        let err = p
+            .identity_headers("hub", &identity("ana", &["business"]))
+            .unwrap_err();
+        assert!(err.contains("roles_header"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_subject_is_refused() {
+        // A bearer token can be configured with an empty subject. An empty
+        // header asserts nothing, and a backend that reads it as "no identity"
+        // silently falls back to the shared credential.
+        let p = http_server(Some(forward("X-MCP-Subject", None)));
+        let err = p.identity_headers("hub", &identity("", &[])).unwrap_err();
+        assert!(err.contains("subject is empty"), "{err}");
+    }
+
+    #[test]
+    fn an_authenticated_caller_named_anonymous_is_still_forwarded() {
+        // `anonymous` is a legal subject for a bearer token, and such a caller
+        // WAS authenticated. The unauthenticated check reads provenance, not
+        // the subject string, so this one goes through.
+        let p = http_server(Some(forward("X-MCP-Subject", None)));
+        let out = p
+            .identity_headers("hub", &identity(crate::server_auth::ANONYMOUS_SUBJECT, &[]))
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![("X-MCP-Subject".to_string(), "anonymous".to_string())]
+        );
     }
 
     #[test]

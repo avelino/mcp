@@ -92,9 +92,10 @@ pub struct ToolOverrides {
 /// data needs to know whose data it is as much as a write does.
 ///
 /// Anything that would leave the subject ambiguous stops the call rather than
-/// resolving itself: an unauthenticated caller, a control character in the
-/// value, or a second header of the same name (from `roles_header` or from
-/// the server's static `headers`). See `ProxyServer::identity_headers`.
+/// resolving itself: an unauthenticated caller, an empty or control-character
+/// value, a name the HTTP transport writes itself (`Authorization` above all),
+/// or a second header of the same name, from `roles_header` or from the
+/// server's static `headers`. See `ProxyServer::identity_headers`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ForwardIdentity {
     /// Header carrying `AuthIdentity::subject`. Defaults to `X-MCP-Subject`.

@@ -25,6 +25,13 @@ pub type Credentials = HashMap<String, String>;
 pub struct AuthIdentity {
     pub subject: String,
     pub roles: Vec<String>,
+    /// False only for the identity [`AuthIdentity::anonymous`] hands out.
+    ///
+    /// Private, and not derived from `subject`, because `subject` is operator
+    /// data: a bearer token may be configured with any subject at all,
+    /// [`ANONYMOUS_SUBJECT`] included. Reading the string would refuse that
+    /// caller even though a provider did authenticate them.
+    authenticated: bool,
 }
 
 /// Subject of the identity every unauthenticated caller gets.
@@ -40,6 +47,7 @@ impl AuthIdentity {
         Self {
             subject: ANONYMOUS_SUBJECT.to_string(),
             roles: vec![],
+            authenticated: false,
         }
     }
 
@@ -49,14 +57,22 @@ impl AuthIdentity {
     /// `serverAuth` block, so this is the common case in development, not an
     /// exotic one. Anything that hands the subject to a backend as an
     /// assertion of *who* must check this first.
+    ///
+    /// Answered from provenance, not from the subject string. An operator may
+    /// map a bearer token to the subject `anonymous`, and that caller *was*
+    /// authenticated.
     pub fn is_anonymous(&self) -> bool {
-        self.subject == ANONYMOUS_SUBJECT
+        !self.authenticated
     }
 
+    /// An identity a provider produced, which is to say an authenticated one.
+    /// The unauthenticated identity has exactly one source,
+    /// [`Self::anonymous`].
     pub fn new(subject: impl Into<String>, roles: Vec<String>) -> Self {
         Self {
             subject: subject.into(),
             roles,
+            authenticated: true,
         }
     }
 }
