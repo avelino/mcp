@@ -1111,7 +1111,8 @@ fn valid_header_value(value: &str, what: &str) -> std::result::Result<String, St
 /// is a worse way to learn about it than a refusal here.
 const TRANSPORT_OWNED_HEADERS: &[&str] = &[
     "authorization",
-    "mcp-session-id",
+    "content-type",
+    "accept",
     "mcp-method",
     "mcp-name",
     "mcp-protocol-version",
