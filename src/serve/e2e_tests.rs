@@ -245,6 +245,12 @@ async fn spawn_legacy_backend() -> (String, BackendLog) {
                                     "mimeType": "text/plain"
                                 }]
                             }),
+                            "prompts/get" => json!({
+                                "messages": [{
+                                    "role": "user",
+                                    "content": {"type": "text", "text": "hello"}
+                                }]
+                            }),
                             "tools/call" => {
                                 match params["name"].as_str().unwrap_or_default() {
                                     // MRTR: keep asking until answers come back.
@@ -611,7 +617,7 @@ async fn resource_uri_needing_header_escaping_survives_the_round_trip() {
 
     let namespaced = format!("stub__{ENCODED_URI}");
     let result = client
-        .read_resource_raw(json!({"uri": namespaced}))
+        .read_resource_raw(json!({"uri": namespaced}), &[])
         .await
         .unwrap_or_else(|e| panic!("reading {namespaced} failed: {e:#}"));
 
@@ -643,7 +649,7 @@ async fn resource_uri_requiring_the_sentinel_survives_the_round_trip() {
 
     let namespaced = format!("stub__{UNICODE_URI}");
     let result = client
-        .read_resource_raw(json!({"uri": namespaced}))
+        .read_resource_raw(json!({"uri": namespaced}), &[])
         .await
         .unwrap_or_else(|e| panic!("reading {namespaced} failed: {e:#}"));
     assert_eq!(result["contents"][0]["uri"], namespaced);
@@ -967,6 +973,7 @@ async fn mrtr_round_trip_relays_through_the_proxy() {
                 "inputResponses": [{"id": "confirm", "value": true}],
                 "requestState": interim["requestState"],
             })),
+            &[],
         )
         .await
         .unwrap();
@@ -1067,4 +1074,270 @@ async fn annotated_tool_called_through_the_proxy_carries_headers_and_the_mrtr_co
     assert!(calls[0].params.get("inputResponses").is_none());
     assert_eq!(calls[1].params["inputResponses"][0]["value"], true);
     assert_eq!(calls[1].params["requestState"], "opaque-token");
+}
+
+// --- forward_identity --------------------------------------------------
+//
+// The two halves of identity forwarding were each covered in isolation
+// (`ProxyServer::identity_headers` in `proxy.rs`, the header merge in
+// `client.rs`) and the seam between them was not. Replacing the headers the
+// dispatcher passes with `&[]` used to leave the whole suite green, which is
+// the one mistake these tests exist to catch. Each one therefore asserts on
+// what reached the *backend*, over a real socket.
+
+/// A proxy whose single backend opts into identity forwarding.
+///
+/// `static_headers` is the server's ordinary `headers` map, so a test can set
+/// up the name collision the transport would otherwise resolve by appending.
+async fn proxy_forwarding_identity(
+    backend_url: &str,
+    audit: Arc<AuditLogger>,
+    static_headers: HashMap<String, String>,
+) -> SharedProxy {
+    let client = Arc::new(McpClient::connect_via_proxy(backend_url).await.unwrap());
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "stub".to_string(),
+        crate::config::ServerConfig::Http {
+            url: backend_url.to_string(),
+            headers: static_headers,
+            forward_identity: Some(crate::config::ForwardIdentity {
+                header: "X-MCP-Subject".to_string(),
+                roles_header: Some("X-MCP-Roles".to_string()),
+            }),
+            tool_acl: None,
+            idle_timeout: Default::default(),
+            min_idle_timeout: None,
+            max_idle_timeout: None,
+        },
+    );
+
+    let mut server = ProxyServer::new(
+        audit,
+        configs,
+        HashMap::new(),
+        ToolCacheStore::new(Arc::new(crate::db::DbPool::disabled())),
+    );
+    server.install_client(
+        "stub",
+        client,
+        &[Tool {
+            name: "echo".to_string(),
+            description: None,
+            input_schema: None,
+            annotations: None,
+        }],
+        &[Resource {
+            uri: ENCODED_URI.to_string(),
+            name: "weekly".to_string(),
+            description: None,
+            mime_type: Some("text/plain".to_string()),
+            annotations: None,
+        }],
+        &[Prompt {
+            name: "greet".to_string(),
+            description: None,
+            arguments: None,
+        }],
+    );
+    Arc::new(Mutex::new(server))
+}
+
+fn ana() -> crate::server_auth::AuthIdentity {
+    crate::server_auth::AuthIdentity::new("ana", vec!["business".to_string()])
+}
+
+/// One proxied call, as `identity`.
+async fn call_as(
+    proxy: &SharedProxy,
+    identity: &crate::server_auth::AuthIdentity,
+    method: &str,
+    params: Value,
+) -> crate::protocol::JsonRpcResponse {
+    super::dispatch::dispatch_request(
+        proxy,
+        crate::protocol::JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: json!(1),
+            method: method.to_string(),
+            params: Some(params),
+        },
+        identity,
+        &None,
+        "test",
+        true,
+    )
+    .await
+}
+
+/// The tool call the refusal tests use: routable, allowed by the ACL, and
+/// stopped only by whatever is wrong with the caller's identity.
+async fn echo_as(
+    proxy: &SharedProxy,
+    identity: &crate::server_auth::AuthIdentity,
+) -> crate::protocol::JsonRpcResponse {
+    call_as(
+        proxy,
+        identity,
+        "tools/call",
+        json!({"name": "stub__echo", "arguments": {}}),
+    )
+    .await
+}
+
+/// Assert the backend was never called — a refusal must not reach it under
+/// the shared credential.
+async fn assert_backend_untouched(backend_seen: &BackendLog, why: &str) {
+    assert!(
+        !backend_seen
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.method == "tools/call"),
+        "{why}"
+    );
+}
+
+/// Every method that reaches a backend carries the caller's identity.
+///
+/// `tools/call` was wired first and the other two were not, which left a
+/// backend owning data per user reading it back as the service account.
+#[tokio::test]
+async fn the_caller_identity_reaches_the_backend_on_every_proxied_method() {
+    let (backend_url, backend_seen) = spawn_legacy_backend().await;
+    let proxy = proxy_forwarding_identity(
+        &backend_url,
+        Arc::new(AuditLogger::Disabled),
+        HashMap::new(),
+    )
+    .await;
+
+    let calls = [
+        (
+            "tools/call",
+            json!({"name": "stub__echo", "arguments": {"q": "hi"}}),
+        ),
+        (
+            "resources/read",
+            json!({"uri": format!("stub__{ENCODED_URI}")}),
+        ),
+        ("prompts/get", json!({"name": "stub__greet"})),
+    ];
+
+    for (method, params) in &calls {
+        let resp = call_as(&proxy, &ana(), method, params.clone()).await;
+        assert!(resp.error.is_none(), "{method} failed: {:?}", resp.error);
+    }
+
+    for (method, _) in &calls {
+        let seen = backend_seen
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.method == *method)
+            .cloned()
+            .unwrap_or_else(|| panic!("{method} never reached the backend"));
+        assert_eq!(
+            seen.headers.get("x-mcp-subject").map(String::as_str),
+            Some("ana"),
+            "{method} reached the backend with no forwarded subject: {:?}",
+            seen.headers
+        );
+        assert_eq!(
+            seen.headers.get("x-mcp-roles").map(String::as_str),
+            Some("business"),
+            "{method} lost the forwarded roles"
+        );
+    }
+}
+
+/// A refusal is a response like any other, so it leaves through the same
+/// funnel and lands in the audit log.
+///
+/// It used to leave by an early `return` that skipped `finish_audit`
+/// entirely: a call the ACL had already allowed, stopped by the proxy, with
+/// no audit entry, no metric, and no result envelope. That is the one event
+/// an audit log is least able to do without.
+#[tokio::test]
+async fn a_refused_identity_is_still_audited() {
+    let (backend_url, backend_seen) = spawn_legacy_backend().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let proxy = proxy_forwarding_identity(
+        &backend_url,
+        Arc::new(AuditLogger::Stream { sender: tx }),
+        HashMap::new(),
+    )
+    .await;
+
+    // A subject carrying CRLF is header injection, so the call is refused.
+    let injected = crate::server_auth::AuthIdentity::new("ana\r\nX-Admin: 1", vec![]);
+    let resp = echo_as(&proxy, &injected).await;
+
+    let err = resp.error.expect("the call must be refused");
+    assert!(err.message.contains("cannot forward caller identity"));
+    assert_backend_untouched(
+        &backend_seen,
+        "a refused call must not reach the backend anyway",
+    )
+    .await;
+
+    let entry = rx.try_recv().expect("the refusal must be audited");
+    assert_eq!(entry.tool_name.as_deref(), Some("stub__echo"));
+    assert_eq!(entry.server_name.as_deref(), Some("stub"));
+    assert!(
+        !entry.success && entry.error_message.is_some(),
+        "the audit entry must record the refusal, got {entry:?}"
+    );
+}
+
+/// The static `headers` collision, refused end to end.
+///
+/// Without the check both headers go out — the transport appends rather than
+/// replaces — and the backend picks which one names the caller.
+#[tokio::test]
+async fn a_static_header_collision_stops_the_call_before_the_backend() {
+    let (backend_url, backend_seen) = spawn_legacy_backend().await;
+    let mut static_headers = HashMap::new();
+    static_headers.insert("X-MCP-Subject".to_string(), "svc-account".to_string());
+    let proxy = proxy_forwarding_identity(
+        &backend_url,
+        Arc::new(AuditLogger::Disabled),
+        static_headers,
+    )
+    .await;
+
+    let resp = echo_as(&proxy, &ana()).await;
+
+    assert!(resp
+        .error
+        .expect("the ambiguous call must be refused")
+        .message
+        .contains("static `headers`"));
+    assert_backend_untouched(
+        &backend_seen,
+        "the backend must never see two subject headers",
+    )
+    .await;
+}
+
+/// An unauthenticated caller is refused rather than announced as `anonymous`.
+#[tokio::test]
+async fn an_unauthenticated_caller_never_reaches_a_forwarding_backend() {
+    let (backend_url, backend_seen) = spawn_legacy_backend().await;
+    let proxy = proxy_forwarding_identity(
+        &backend_url,
+        Arc::new(AuditLogger::Disabled),
+        HashMap::new(),
+    )
+    .await;
+
+    let resp = echo_as(&proxy, &crate::server_auth::AuthIdentity::anonymous()).await;
+
+    assert!(resp
+        .error
+        .expect("an anonymous caller must be refused")
+        .message
+        .contains("not authenticated"));
+    assert_backend_untouched(&backend_seen, "anonymous must not reach the backend").await;
 }

@@ -267,6 +267,30 @@ Groups header value is parsed as a comma-separated list: each entry is trimmed a
 
 > Only use `forwarded` behind a trusted reverse proxy that strips these headers from incoming client requests — otherwise clients could forge identities and roles.
 
+### Telling the backend who the caller is
+
+Authenticating the caller and forwarding that identity are different jobs, and the proxy does the second one only when you ask. By default it authenticates the caller, enforces the ACL, and then talks to every backend with **one credential resolved at startup** — the shared token *is* the service account.
+
+That is the right model when the backend's data has no per-row owner (Sentry, Slack, Databricks). It stops being right when the data *is* owned per user: every write lands under the same name, and it does not fail loudly, it records the wrong owner.
+
+`forward_identity` on an HTTP server sends the authenticated caller's subject to that backend as a header, per request:
+
+```json
+{
+  "mcpServers": {
+    "hub": {
+      "url": "http://hub.internal/mcp",
+      "headers": { "Authorization": "Bearer ${HUB_SERVICE_TOKEN}" },
+      "forward_identity": { "header": "X-MCP-Subject" }
+    }
+  }
+}
+```
+
+It is opt-in per server because it is only safe under a condition the proxy cannot check: the backend must not be reachable by anyone who could set that header themselves. If it is, the header is a complete authentication bypass. Requires an authenticated caller — with no `providers` configured everyone is `anonymous`, and such a call is refused rather than attributed to a user who does not exist.
+
+See [`forward_identity` in the config reference](../reference/config-file.md#forwarding-caller-identity) for the full field list and every case the proxy refuses.
+
 ### Access control (ACL)
 
 The ACL controls which authenticated users can access which tools. It supports two schemas:

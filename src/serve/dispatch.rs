@@ -256,26 +256,10 @@ pub(crate) async fn dispatch_request(
                 let mut p = proxy.lock().await;
                 match p.resolve_tool_call(&id, req.params.clone(), identity, acl) {
                     Ok((server, orig, args, decision)) => {
-                        // Identity headers are resolved HERE, under the same
-                        // lock that resolved the route: the config and the
-                        // caller are both in hand, and phase 3 runs unlocked.
-                        match p.identity_headers(&server, identity) {
-                            Ok(h) => identity_headers = h,
-                            Err(why) => {
-                                // Refuse rather than fall back to the shared
-                                // credential: silently writing under the wrong
-                                // owner is the failure this feature exists to
-                                // prevent.
-                                return JsonRpcResponse::error(
-                                    id.clone(),
-                                    error_codes::INVALID_PARAMS,
-                                    &format!("cannot forward caller identity: {why}"),
-                                );
-                            }
-                        }
-                        let client = p.try_get_client(&server);
                         // Refine the audit entry now that we know the
-                        // namespaced tool resolves to a real backend.
+                        // namespaced tool resolves to a real backend. Done
+                        // before the identity check so a refusal below is
+                        // attributable to the same tool and server.
                         tool_name_for_audit = Some(format!("{server}{SEPARATOR}{orig}"));
                         server_name_for_audit = Some(server.clone());
                         // Fill the OTel span attributes now that resolution
@@ -284,7 +268,33 @@ pub(crate) async fn dispatch_request(
                         let span = tracing::Span::current();
                         span.record("mcp.server", server.as_str());
                         span.record("mcp.tool", orig.as_str());
-                        Ok((server, orig, args, client, decision))
+
+                        // Identity headers are resolved HERE, under the same
+                        // lock that resolved the route: the config and the
+                        // caller are both in hand, and phase 3 runs unlocked.
+                        match p.identity_headers(&server, identity) {
+                            Ok(h) => {
+                                identity_headers = h;
+                                let client = p.try_get_client(&server);
+                                Ok((server, orig, args, client, decision))
+                            }
+                            Err(why) => {
+                                // Refuse rather than fall back to the shared
+                                // credential: silently writing under the wrong
+                                // owner is the failure this feature exists to
+                                // prevent.
+                                //
+                                // The refusal leaves as `Err` and not as an
+                                // early `return`, so it still goes out through
+                                // `finish_audit`. A call the ACL allowed and
+                                // the proxy then stopped is precisely what the
+                                // audit log is for, and returning here would
+                                // drop the entry along with the OTel metrics
+                                // and the 2026-07-28 result envelope.
+                                decision_for_audit = Some(decision);
+                                Err(identity_refusal(&id, &why))
+                            }
+                        }
                     }
                     Err((maybe_decision, resp)) => {
                         decision_for_audit = maybe_decision;
@@ -438,6 +448,7 @@ pub(crate) async fn dispatch_request(
             }
 
             // Resolve: lookup resource_map, check ACL.
+            let mut identity_headers: Vec<(String, String)> = Vec::new();
             let resolved: std::result::Result<ResolvedResourceRead, JsonRpcResponse> = {
                 let mut p = proxy.lock().await;
                 match p.resource_map.get(&uri) {
@@ -467,9 +478,22 @@ pub(crate) async fn dispatch_request(
                         } else {
                             let server = server.clone();
                             let original = original_uri.clone();
-                            let client = p.try_get_client(&server);
                             server_name_for_audit = Some(server.clone());
-                            Ok((server, original, client, decision))
+                            // A resource read is where per-user data comes
+                            // back, so it carries the caller's identity for
+                            // the same reason `tools/call` does. Same refusal
+                            // rule too: no identity beats a wrong one.
+                            match p.identity_headers(&server, identity) {
+                                Ok(h) => {
+                                    identity_headers = h;
+                                    let client = p.try_get_client(&server);
+                                    Ok((server, original, client, decision))
+                                }
+                                Err(why) => {
+                                    decision_for_audit = Some(decision);
+                                    Err(identity_refusal(&id, &why))
+                                }
+                            }
                         }
                     }
                     None => Err(JsonRpcResponse::error(
@@ -494,7 +518,10 @@ pub(crate) async fn dispatch_request(
                         Ok(client) => {
                             let backend_params =
                                 backend_resource_read_params(req.params.as_ref(), &original_uri);
-                            match client.read_resource_raw(backend_params).await {
+                            match client
+                                .read_resource_raw(backend_params, &identity_headers)
+                                .await
+                            {
                                 Ok(mut result) => {
                                     sanitize_relayed_result(&mut result, stateless_peer);
                                     namespace_resource_contents(
@@ -623,6 +650,7 @@ pub(crate) async fn dispatch_request(
                 DiscoveryAction::None => {}
             }
 
+            let mut identity_headers: Vec<(String, String)> = Vec::new();
             let resolved: std::result::Result<ResolvedPromptGet, JsonRpcResponse> = {
                 let mut p = proxy.lock().await;
                 match p.prompt_map.get(&prompt_name) {
@@ -652,11 +680,22 @@ pub(crate) async fn dispatch_request(
                         } else {
                             let server = server.clone();
                             let original = original_name.clone();
-                            let client = p.try_get_client(&server);
                             server_name_for_audit = Some(server.clone());
                             let backend_params =
                                 backend_prompt_get_params(req.params.as_ref(), &original);
-                            Ok((server, original, backend_params, client, decision))
+                            // `prompts/get` reaches the backend like the other
+                            // two, so it forwards identity like the other two.
+                            match p.identity_headers(&server, identity) {
+                                Ok(h) => {
+                                    identity_headers = h;
+                                    let client = p.try_get_client(&server);
+                                    Ok((server, original, backend_params, client, decision))
+                                }
+                                Err(why) => {
+                                    decision_for_audit = Some(decision);
+                                    Err(identity_refusal(&id, &why))
+                                }
+                            }
                         }
                     }
                     None => Err(JsonRpcResponse::error(
@@ -677,7 +716,10 @@ pub(crate) async fn dispatch_request(
                         // that may answer with an interim `input_required`
                         // result, which has no `messages` and so cannot be
                         // parsed into `PromptGetResult`.
-                        Ok(client) => match client.get_prompt_raw(backend_params).await {
+                        Ok(client) => match client
+                            .get_prompt_raw(backend_params, &identity_headers)
+                            .await
+                        {
                             Ok(mut result) => {
                                 sanitize_relayed_result(&mut result, stateless_peer);
                                 JsonRpcResponse::success(id, result)
@@ -769,6 +811,21 @@ async fn discover_for_list(proxy: &SharedProxy) -> Arc<AuditLogger> {
         discover_pending_backends(proxy).await;
     }
     audit
+}
+
+/// The response for a call the proxy stopped because it could not say who
+/// the caller is.
+///
+/// All three backend-reaching methods refuse identically, and they must:
+/// `tools/call`, `resources/read` and `prompts/get` are one decision wearing
+/// three names, and a message that drifts between them would read as three
+/// different problems.
+fn identity_refusal(id: &Value, why: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id.clone(),
+        error_codes::INVALID_PARAMS,
+        &format!("cannot forward caller identity: {why}"),
+    )
 }
 
 /// The backend's client: the pooled one, or a fresh connection.

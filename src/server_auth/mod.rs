@@ -27,12 +27,30 @@ pub struct AuthIdentity {
     pub roles: Vec<String>,
 }
 
+/// Subject of the identity every unauthenticated caller gets.
+///
+/// Named rather than spelled inline because code that forwards the subject
+/// onward has to be able to recognize it: a backend told the caller is
+/// `anonymous` records that as if it were a person. See
+/// [`AuthIdentity::is_anonymous`].
+pub const ANONYMOUS_SUBJECT: &str = "anonymous";
+
 impl AuthIdentity {
     pub fn anonymous() -> Self {
         Self {
-            subject: "anonymous".to_string(),
+            subject: ANONYMOUS_SUBJECT.to_string(),
             roles: vec![],
         }
+    }
+
+    /// True when nothing authenticated this caller.
+    ///
+    /// `NoAuth` is the default for stdio and for a config with no
+    /// `serverAuth` block, so this is the common case in development, not an
+    /// exotic one. Anything that hands the subject to a backend as an
+    /// assertion of *who* must check this first.
+    pub fn is_anonymous(&self) -> bool {
+        self.subject == ANONYMOUS_SUBJECT
     }
 
     pub fn new(subject: impl Into<String>, roles: Vec<String>) -> Self {

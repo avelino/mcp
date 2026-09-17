@@ -850,16 +850,39 @@ impl ProxyServer {
     /// request, so such a call is refused rather than sent without identity —
     /// sending it anyway would land the write under the shared credential,
     /// which is exactly the silent-wrong-owner outcome this feature removes.
+    ///
+    /// Every refusal below is a refusal to *guess*. The backend trusts this
+    /// header, so anything that leaves the subject ambiguous — unauthenticated,
+    /// injectable, or duplicated by a second header of the same name — has to
+    /// stop the call rather than resolve itself into a plausible answer.
     pub(crate) fn identity_headers(
         &self,
         server: &str,
         identity: &AuthIdentity,
     ) -> std::result::Result<Vec<(String, String)>, String> {
-        let Some(cfg) = self.configs.get(server).and_then(|c| c.forward_identity()) else {
+        let Some(entry) = self.configs.get(server) else {
+            return Ok(Vec::new());
+        };
+        let Some(cfg) = entry.forward_identity() else {
             return Ok(Vec::new());
         };
 
+        // Nothing authenticated this caller, so there is no identity to
+        // assert. `NoAuth` is the default for stdio and for a config with no
+        // `serverAuth` block, so this is reachable by omission rather than by
+        // mistake — and forwarding the placeholder would have the backend
+        // record `anonymous` as the author, in good faith.
+        if identity.is_anonymous() {
+            return Err(
+                "the caller is not authenticated, so there is no identity to forward; \
+                 configure serverAuth.providers, or drop forward_identity from this server"
+                    .to_string(),
+            );
+        }
+
+        let static_headers = entry.static_headers();
         let subject_name = valid_header_name(&cfg.header)?;
+        reject_static_collision(static_headers, &subject_name, "header")?;
 
         let mut out = Vec::with_capacity(2);
         out.push((
@@ -868,6 +891,7 @@ impl ProxyServer {
         ));
         if let Some(roles_header) = &cfg.roles_header {
             let roles_name = valid_header_name(roles_header)?;
+            reject_static_collision(static_headers, &roles_name, "roles_header")?;
             // The same name for both sends two same-named headers with
             // unrelated values, and the receiver is the one that resolves a
             // duplicate — it could take the roles value as the subject. Refused
@@ -1015,14 +1039,43 @@ pub(crate) async fn shutdown_clients_in_parallel(clients: Vec<(String, Arc<McpCl
 /// path uses. Rejects CR, LF and every other control character by construction.
 fn valid_header_name(name: &str) -> std::result::Result<String, String> {
     if name.is_empty() {
-        return Err("forwardIdentity header name must not be empty".to_string());
+        return Err("forward_identity header name must not be empty".to_string());
     }
-    if !name.bytes().all(crate::client::x_mcp_header::is_tchar) {
+    if !name.bytes().all(crate::client::is_tchar) {
         return Err(format!(
-            "forwardIdentity header name {name:?} is not an RFC 9110 field-name token"
+            "forward_identity header name {name:?} is not an RFC 9110 field-name token"
         ));
     }
     Ok(name.to_string())
+}
+
+/// Refuse when a forwarded header shares its name with one of the server's
+/// static `headers`.
+///
+/// Both would be sent: the HTTP transport appends every header it is given
+/// (`reqwest`'s builder calls `HeaderMap::append`, not `insert`), so the two
+/// travel as two lines of the same field and the backend picks the winner —
+/// Go's `Header.Get` takes the first, several proxies and frameworks take the
+/// last. That is the receiver deciding who the caller is, which is precisely
+/// the decision this feature exists to take away from it.
+///
+/// This is the reachable twin of the `roles_header == header` collision, and
+/// it arrives the same way: an operator moving a backend off a hardcoded
+/// subject header onto `forward_identity` and leaving the old entry behind.
+fn reject_static_collision(
+    headers: Option<&HashMap<String, String>>,
+    name: &str,
+    field: &str,
+) -> std::result::Result<(), String> {
+    let collides = headers.is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case(name)));
+    if !collides {
+        return Ok(());
+    }
+    Err(format!(
+        "forward_identity: {field} {name:?} is also set in this server's static `headers`; \
+         both would be sent and the backend would choose between them — remove it from \
+         `headers` or give {field} a different name"
+    ))
 }
 
 /// Field values are laxer than names (spaces and most printable bytes are
@@ -1504,13 +1557,20 @@ mod tests {
     // --- forwardIdentity tests ---
 
     fn http_server(forward: Option<crate::config::ForwardIdentity>) -> ProxyServer {
+        http_server_with_headers(forward, HashMap::new())
+    }
+
+    fn http_server_with_headers(
+        forward: Option<crate::config::ForwardIdentity>,
+        headers: HashMap<String, String>,
+    ) -> ProxyServer {
         let pool = Arc::new(crate::db::DbPool::disabled());
         let mut configs = HashMap::new();
         configs.insert(
             "hub".to_string(),
             ServerConfig::Http {
                 url: "http://hub.internal/mcp".to_string(),
-                headers: HashMap::new(),
+                headers,
                 forward_identity: forward,
                 tool_acl: None,
                 idle_timeout: crate::config::IdleTimeoutPolicy::default(),
@@ -1647,6 +1707,90 @@ mod tests {
                 "header name {name:?} deveria ser recusado"
             );
         }
+    }
+
+    #[test]
+    fn an_unauthenticated_caller_is_refused_not_forwarded_as_anonymous() {
+        // `NoAuth` is the default for stdio and for a config with no
+        // `serverAuth` block, so this arrives by omission. Forwarding the
+        // placeholder would have the backend record `anonymous` as the
+        // author and believe it — the same silent-wrong-owner outcome the
+        // feature exists to remove, wearing a different name.
+        let p = http_server(Some(forward("X-MCP-Subject", None)));
+        let err = p
+            .identity_headers("hub", &AuthIdentity::anonymous())
+            .unwrap_err();
+        assert!(err.contains("not authenticated"), "{err}");
+    }
+
+    #[test]
+    fn an_unauthenticated_caller_is_fine_when_the_server_did_not_opt_in() {
+        // The refusal is scoped to servers that asked for identity. Every
+        // other backend keeps working unauthenticated exactly as before.
+        let p = http_server(None);
+        let out = p
+            .identity_headers("hub", &AuthIdentity::anonymous())
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_static_header_of_the_same_name_is_refused() {
+        // The transport appends rather than replaces, so both would go out as
+        // two lines of the same field and the backend would pick a winner.
+        // This is the reachable twin of `roles_header == header`: an operator
+        // moving off a hardcoded subject header and leaving the old entry.
+        let mut headers = HashMap::new();
+        headers.insert("X-MCP-Subject".to_string(), "svc-account".to_string());
+        let p = http_server_with_headers(Some(forward("X-MCP-Subject", None)), headers);
+        let err = p
+            .identity_headers("hub", &identity("ana", &["business"]))
+            .unwrap_err();
+        assert!(err.contains("static `headers`"), "{err}");
+    }
+
+    #[test]
+    fn a_static_header_colliding_on_case_is_also_refused() {
+        // Field names are case-insensitive on the wire, so `x-mcp-subject`
+        // and `X-MCP-Subject` are one header, not two.
+        let mut headers = HashMap::new();
+        headers.insert("x-mcp-subject".to_string(), "svc-account".to_string());
+        let p = http_server_with_headers(Some(forward("X-MCP-Subject", None)), headers);
+        assert!(p.identity_headers("hub", &identity("ana", &[])).is_err());
+    }
+
+    #[test]
+    fn a_static_header_colliding_with_the_roles_header_is_refused() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Roles".to_string(), "admin".to_string());
+        let p = http_server_with_headers(Some(forward("X-Who", Some("X-Roles"))), headers);
+        let err = p
+            .identity_headers("hub", &identity("ana", &["business"]))
+            .unwrap_err();
+        assert!(err.contains("roles_header"), "{err}");
+    }
+
+    #[test]
+    fn unrelated_static_headers_do_not_block_forwarding() {
+        // Only a name collision matters. The shared credential travels on
+        // every one of these calls and must keep doing so.
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer svc".to_string());
+        let p = http_server_with_headers(Some(forward("X-MCP-Subject", None)), headers);
+        let out = p.identity_headers("hub", &identity("ana", &[])).unwrap();
+        assert_eq!(out, vec![("X-MCP-Subject".to_string(), "ana".to_string())]);
+    }
+
+    #[test]
+    fn a_refusal_names_the_config_key_that_exists() {
+        // The operator has to be able to grep for what the message blames.
+        // `forwardIdentity` is not a key in any config file.
+        let p = http_server(Some(forward("X Subject", None)));
+        let err = p
+            .identity_headers("hub", &identity("ana", &[]))
+            .unwrap_err();
+        assert!(err.contains("forward_identity"), "{err}");
+        assert!(!err.contains("forwardIdentity"), "{err}");
     }
 
     // --- is_backend_undiscovered tests ---

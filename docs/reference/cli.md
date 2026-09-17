@@ -326,7 +326,8 @@ Use this when the registry metadata for a server changed (new package version, n
 **What is preserved (your customizations):**
 - Filled-in `env` values (anything that isn't a `${VAR_NAME}` placeholder)
 - `idle_timeout`, `min_idle_timeout`, `max_idle_timeout`
-- `headers` (HTTP servers)
+- `headers`, `forward_identity` (HTTP servers)
+- `tool_acl`
 - `cli`, `cli_help`, `cli_depth`, `cli_only`, `tools`
 
 If the entry already matches the registry, the file is not rewritten and `mcp` reports `already up to date`. New env vars introduced by the update are listed at the end so you know what to fill in.

@@ -86,6 +86,15 @@ pub struct ToolOverrides {
 ///
 /// In practice: the backend accepts it only from the proxy's address, over a
 /// private link.
+///
+/// The identity travels on every method that reaches the backend —
+/// `tools/call`, `resources/read`, `prompts/get` — because a read of per-user
+/// data needs to know whose data it is as much as a write does.
+///
+/// Anything that would leave the subject ambiguous stops the call rather than
+/// resolving itself: an unauthenticated caller, a control character in the
+/// value, or a second header of the same name (from `roles_header` or from
+/// the server's static `headers`). See `ProxyServer::identity_headers`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ForwardIdentity {
     /// Header carrying `AuthIdentity::subject`. Defaults to `X-MCP-Subject`.
@@ -222,6 +231,19 @@ impl ServerConfig {
             ServerConfig::Http {
                 forward_identity, ..
             } => forward_identity.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The static headers sent on every request to an HTTP backend, `None`
+    /// for stdio/CLI backends which have no header channel.
+    ///
+    /// Read by the identity-forwarding path: a static header sharing a name
+    /// with a forwarded one would go out as a second line of the same field,
+    /// and the receiver picks the winner.
+    pub fn static_headers(&self) -> Option<&HashMap<String, String>> {
+        match self {
+            ServerConfig::Http { headers, .. } => Some(headers),
             _ => None,
         }
     }
@@ -681,6 +703,41 @@ mod tests {
         write!(file, "{}", json).unwrap();
         let path = file.path().to_path_buf();
         load_config_from_path(&path)
+    }
+
+    /// A config written before `forward_identity` existed must keep loading,
+    /// and must forward nothing. The field is the addition; silence is the
+    /// behavior every existing install already has and must keep.
+    #[test]
+    fn test_config_without_forward_identity_still_loads_and_forwards_nothing() {
+        let config = config_from_json(
+            r#"{
+                "mcpServers": {
+                    "sentry": {
+                        "url": "https://mcp.sentry.dev/mcp",
+                        "headers": {"Authorization": "Bearer ${SENTRY_TOKEN}"}
+                    },
+                    "slack": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-slack"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.servers.len(), 2);
+        assert!(config.servers["sentry"].forward_identity().is_none());
+        assert!(config.servers["slack"].forward_identity().is_none());
+        // The untagged enum still picks the same variants it always did.
+        assert!(matches!(
+            config.servers["sentry"],
+            ServerConfig::Http { .. }
+        ));
+        assert!(matches!(
+            config.servers["slack"],
+            ServerConfig::Stdio { .. }
+        ));
     }
 
     #[test]
