@@ -110,9 +110,16 @@ Notes:
   caller is `anonymous`, and forwarding that would have the backend record `anonymous` as
   the author and believe it. Such a call is refused; configure a provider, or drop
   `forward_identity` from the server.
-- A `subject` (or role) containing a control character is **refused**, not sent without
-  identity: falling back to the shared credential is exactly the silent-wrong-owner
-  outcome this feature removes.
+- A `subject` (or role) that is **empty** or contains a **control character** is refused,
+  not sent without identity: falling back to the shared credential is exactly the
+  silent-wrong-owner outcome this feature removes. An empty header asserts nothing, and
+  most backends read it as no caller at all.
+- Neither header may be one the HTTP transport writes itself: `Authorization`,
+  `Mcp-Session-Id`, `Mcp-Method`, `Mcp-Name`, `Mcp-Protocol-Version`, `traceparent`,
+  `tracestate`. `Authorization` is the one worth naming. The transport re-adds a saved
+  OAuth token whenever the config map has no usable one, and the 401 retry path removes
+  the config entry before doing so, so a forwarded header of that name would travel
+  beside a bearer token that the `headers` check below never sees.
 - `roles_header` is off by default — most backends only need to know *who*, and sending
   roles a backend does not read is avoidable exposure.
 - `roles_header` **may not equal** `header` (compared case-insensitively). Two same-named
