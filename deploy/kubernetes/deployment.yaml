@@ -40,6 +40,10 @@ spec:
 
       containers:
         - name: mcp
+          # The scratch image carries only the mcp binary, so every backend
+          # behind it must be an HTTP one (`url`). A backend with a `command`
+          # needs ghcr.io/avelino/mcp:full, which adds npx, uvx, docker,
+          # kubectl and gh. `mcp --list` names what cannot start here.
           image: ghcr.io/avelino/mcp:latest
           args: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
           # --insecure is required because the pod binds 0.0.0.0 (non-loopback).
@@ -71,9 +75,10 @@ spec:
             # Only read when serverAuth.providers includes "oauth_as", but
             # when it does, this MUST resolve to durable storage.
             #
-            # Left unset, the state lands in config_dir() (~/.config/mcp,
-            # or /tmp/mcp when HOME is unset) — read-only or ephemeral in
-            # this pod either way. Every restart then forces every user to
+            # Left unset, the state lands in config_dir(), which in this image
+            # is /root/.config/mcp: the image pins HOME=/root, so the old
+            # /tmp/mcp fallback never applies here, and /root sits on the
+            # read-only rootfs below. Every restart then forces every user to
             # reconnect the MCP by hand, because the provider rejects any
             # token whose `aud` is no longer a registered client. Unexpired
             # access tokens included.

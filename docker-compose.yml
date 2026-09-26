@@ -18,12 +18,17 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
+# Backends with a `command` (npx, uvx, docker, kubectl, gh) need runtimes the
+# default scratch stage does not carry. Add `target: full-source` to the build
+# blocks below for those; HTTP backends work as-is.
+
 services:
   # Option A: inline config via environment variable
   mcp-proxy:
     build:
       context: .
       dockerfile: Dockerfile
+      # target: full-source   # uncomment for backends that spawn a command
     command: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
     ports:
       - "8080:8080"
@@ -55,6 +60,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # target: full-source   # uncomment for backends that spawn a command
     command: ["serve", "--http", "0.0.0.0:8080", "--insecure"]
     ports:
       - "8080:8080"

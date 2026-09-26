@@ -278,6 +278,8 @@ securityContext:
 
 The image is based on `scratch` — a static binary with no shell, no package manager, no libc. The process runs as UID 0 by default (the Dockerfile doesn't set `USER`), but `scratch` itself does not require root. The attack surface is minimal regardless of UID: no shell to exec into, no tools to exploit, read-only filesystem.
 
+The trade-off is that a backend with a `command` has nothing to spawn: no `npx`, no `uvx`, no `docker`. Only HTTP backends (`url`) run on this image. `ghcr.io/avelino/mcp:full` carries those runtimes on an alpine base, at the cost of the minimal attack surface described above. Run `mcp --list` in the pod to see which backends cannot start.
+
 If your cluster policy requires `runAsNonRoot: true`, set a numeric `runAsUser` and ensure mounted volumes (`/tmp`, `/data`) are writable for that UID — either via `fsGroup` or an initContainer:
 
 ```yaml
@@ -298,7 +300,7 @@ Scaling to N replicas means:
 - N copies of the tool/resource/prompt cache in memory
 - Clients are load-balanced across replicas by the Service
 
-This is fine for most deployments. Be aware that stdio-based backends (which spawn child processes) will have N copies of each process running across the cluster.
+This is fine for most deployments. Be aware that stdio-based backends (which spawn child processes) will have N copies of each process running across the cluster — and that they need the `:full` image to spawn at all.
 
 ## Graceful shutdown
 

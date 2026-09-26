@@ -8,7 +8,7 @@ These variables configure `mcp` behavior:
 |---|---|---|
 | `MCP_SERVERS_CONFIG` | — | Inline JSON config (entire `servers.json` content). Highest priority — skips file read entirely. |
 | `MCP_CONFIG_PATH` | `~/.config/mcp/servers.json` | Path to the config file |
-| `MCP_CONFIG_DIR` | `~/.config/mcp` | Config directory. Falls back to `/tmp/mcp` when `HOME` is not set. |
+| `MCP_CONFIG_DIR` | `~/.config/mcp` | Config directory. Falls back to `/tmp/mcp` when `HOME` is not set (the official images pin `HOME=/root`, so there it is `/root/.config/mcp`). |
 | `MCP_TIMEOUT` | `60` | Timeout in seconds for server responses (stdio, CLI, and HTTP transports) |
 | `MCP_MAX_OUTPUT` | `1048576` | Maximum output bytes from CLI server commands |
 | `MCP_PROXY_REQUEST_TIMEOUT` | `120` | (proxy mode) Hard upper bound, in seconds, that any single client request can spend inside `mcp serve` before the proxy returns a JSON-RPC error. Acts as a belt-and-suspenders boundary on top of the per-transport `MCP_TIMEOUT`. |
@@ -35,7 +35,7 @@ These variables configure `mcp` behavior:
 2. **`MCP_CONFIG_PATH`** — path to a config file
 3. **`MCP_CONFIG_DIR`/servers.json** — config directory override
 4. **`~/.config/mcp/servers.json`** — default file location
-5. **`/tmp/mcp/servers.json`** — last-resort fallback when `HOME` is not set
+5. **`/tmp/mcp/servers.json`** — last-resort fallback when `HOME` is not set (not reachable in the official images, which set `HOME`)
 
 Environment variable substitution (`${VAR_NAME}`) works in all cases, including inline config.
 
@@ -79,7 +79,13 @@ Override the base config directory (default `~/.config/mcp`). All default paths 
 MCP_CONFIG_DIR=/data/mcp mcp serve --http 0.0.0.0:8080
 ```
 
-When `HOME` is not set (common in `scratch` and `distroless` containers), `mcp` falls back to `/tmp/mcp` with a warning.
+When `HOME` is not set, `mcp` falls back to `/tmp/mcp` with a warning. Docker leaves `HOME` at `/` for an image with no `/etc/passwd`, which is why `ghcr.io/avelino/mcp` pins `HOME=/root` — so the config resolves at `/root/.config/mcp` and that is the path to mount:
+
+```bash
+docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp --list
+```
+
+The `/tmp/mcp` fallback only applies to a derived image that clears `HOME`. If your base is read-only except for a writable `/tmp`, set `MCP_CONFIG_DIR=/tmp/mcp` explicitly rather than relying on the fallback.
 
 ### `MCP_TIMEOUT`
 

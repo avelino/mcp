@@ -72,6 +72,29 @@ For a package-based server (most common), the config looks like:
 }
 ```
 
+For a server distributed as a container image (`oci` package):
+
+```json
+{
+  "mcpServers": {
+    "discord": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-e", "DISCORD_TOKEN", "example/discord-mcp:latest"],
+      "env": {
+        "DISCORD_TOKEN": "${DISCORD_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Each declared variable gets a `-e NAME` in `args`, and that pair is load-bearing: `env` reaches the `docker` CLI process, never the container, so a secret listed only in `env` arrives empty inside the image. Keep the value in `env` as `${VAR}` rather than writing `-e NAME=value` into `args`, which would put the secret in your config file and in `docker inspect`.
+
+Two consequences worth knowing:
+
+- `-e NAME` forwards the variable even when it is unset on your machine, which **shadows** an `ENV NAME=default` baked into the image. If you want the image's own default for a declared variable, delete its `-e NAME` pair from `args` and its entry from `env`.
+- A variable name the registry declares that isn't a valid shell variable name is skipped with a warning, since it would otherwise end up on a `docker run` command line.
+
 For a remote server with HTTP transport:
 
 ```json
@@ -85,6 +108,8 @@ For a remote server with HTTP transport:
 ```
 
 The registry entry determines which type is used. Packages (stdio) take priority over remotes (HTTP).
+
+> Added an `oci` server before this behavior existed? Its config has no `-e` flags, so its secrets never reached the container. `mcp update <name>` regenerates `command` and `args` from the registry and keeps the values you filled in.
 
 ## Already exists?
 

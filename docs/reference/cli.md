@@ -50,6 +50,41 @@ JSON output (`--json` or piped):
 ]
 ```
 
+#### Backends that cannot start here
+
+A `stdio` or `cli` backend whose `command` is not executable in this environment is reported without spawning anything. This is the common case inside a container, where a binary installed on your host is absent.
+
+```json
+[
+  { "name": "notes", "type": "stdio", "command": "/opt/homebrew/bin/notes-tui", "args": [],
+    "available": false,
+    "unavailable_reason": "command does not exist: /opt/homebrew/bin/notes-tui" }
+]
+```
+
+| Field | When it appears |
+|---|---|
+| `available` | Only on a backend that cannot start, always `false` |
+| `unavailable_reason` | Alongside `available`, one of the three messages below |
+
+A runnable backend carries **neither** key, so `select(.available)` matches nothing even when everything is healthy. Filter on the reason instead:
+
+```bash
+mcp --list --json | jq -r '.[] | select(.unavailable_reason) | "\(.name): \(.unavailable_reason)"'
+```
+
+The reasons:
+
+| Message | Meaning |
+|---|---|
+| `command not found in PATH: <name>` | Bare name, no `PATH` entry provides it |
+| `command does not exist: <path>` | Explicit path, nothing there |
+| `command is not executable: <path>` | Exists, but is a directory or has no execute bit |
+
+An `http` backend is never marked unavailable: reachability needs a request, and `--list` reads config without touching the network. A backend that pins its own `PATH` in `env` is resolved against that `PATH`, not the one `mcp` runs with.
+
+In the table output, a `Status` column appears only when at least one backend is unavailable, and the footer becomes `N server(s) configured, M unavailable here`.
+
 ## Global flags
 
 ### `--json`

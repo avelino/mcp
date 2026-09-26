@@ -316,22 +316,32 @@ Pick the small one for a config that is entirely HTTP. Pick `:full` when the reg
 
 A backend whose `command` is a binary installed on your host (`/opt/homebrew/bin/something`, `~/.local/bin/something`, a Go or Rust tool on your `PATH`) does not exist inside any of these images, and a macOS binary would not execute on Linux even if mounted. Neither image can run it.
 
-`mcp --list` reports this without spawning anything, so you can check before switching a client over:
+`mcp --list` reports this without spawning anything, so you can check before switching a client over. Output is JSON here, because `mcp` only prints the table when stdout is a terminal and `docker run` without `-t` gives it a pipe:
 
-```
-$ docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp:full --list
-
- Server        Type   Endpoint                        Status
- buser_sentry  http   https://mcp.sentry.dev/mcp      ok
- buser_slack   stdio  npx -y slack-mcp-server@latest  ok
- github        cli    gh                              ok
- outl          stdio  outl                            unavailable: command not found in PATH: outl
- roam          stdio  /opt/homebrew/bin/roam-tui      unavailable: command does not exist: /opt/homebrew/bin/roam-tui
-
- 5 server(s) configured, 2 unavailable here
+```bash
+docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp:full --list
 ```
 
-In JSON those backends carry `"available": false` and `"unavailable_reason"`. The proxy reports the same reason when a client calls one of their tools, instead of an OS spawn error.
+```json
+[
+  { "name": "sentry", "type": "http", "url": "https://mcp.sentry.dev/mcp" },
+  { "name": "slack", "type": "stdio", "command": "npx",
+    "args": ["-y", "slack-mcp-server@latest"] },
+  { "name": "notes", "type": "stdio", "command": "/opt/homebrew/bin/notes-tui",
+    "args": [],
+    "available": false,
+    "unavailable_reason": "command does not exist: /opt/homebrew/bin/notes-tui" }
+]
+```
+
+Only a backend that cannot start carries `available` and `unavailable_reason`, so filter on the reason rather than on a truthy `available`:
+
+```bash
+docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp:full --list \
+  | jq -r '.[] | select(.unavailable_reason) | "\(.name): \(.unavailable_reason)"'
+```
+
+Add `-t` to get the human table instead, with a `Status` column that appears only when something is unavailable. The proxy reports the same reason when a client calls one of those tools, instead of an OS spawn error.
 
 If that list has entries you need, keep running `mcp serve` on the host. A mixed setup can also split: host-native binaries stay in a local `mcp serve`, everything else moves into a container.
 

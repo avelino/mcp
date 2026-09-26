@@ -27,9 +27,38 @@ MCP_TIMEOUT=120 mcp slack --list
 
 Some servers (especially npm-based ones) take a long time on first run because they need to download packages. Subsequent runs are faster.
 
+### "command not found in PATH: <command>"
+
+### "command does not exist: <path>"
+
+### "command is not executable: <path>"
+
+The command in your config can't be executed here. `mcp` checks this before spawning, so you get the reason instead of the OS error. `mcp --list` reports the same thing for every backend at once, without running any of them.
+
+- **not found in PATH** — a bare name (`npx`, `uvx`, `gh`) that no `PATH` entry provides. Install it, or use an absolute path.
+- **does not exist** — an absolute or relative path pointing at nothing. Check for a typo or a tool that moved.
+- **is not executable** — the file is there but is a directory, or has no execute bit. `chmod +x` it.
+
+**If the command works in your shell but not here**, the process running `mcp` has a different `PATH` than your shell. GUI clients (Claude Desktop, Cursor) are the usual case: they launch with a minimal environment. Pin the `PATH` for that backend:
+
+```json
+{
+  "mcpServers": {
+    "mytool": {
+      "command": "mytool",
+      "env": { "PATH": "/opt/homebrew/bin:/usr/bin:/bin" }
+    }
+  }
+}
+```
+
+`mcp` resolves the command against that `PATH`, the same one the spawn will use.
+
+**Inside a container**, a backend whose `command` is a binary from your host isn't in the image. See the [Docker guide](./docker.md) for which image carries which runtime.
+
 ### "failed to spawn process: <command>"
 
-The command in your config doesn't exist or isn't in your PATH.
+The command resolved, but the OS refused to run it — wrong architecture, missing shared library, or a permission the execute bit doesn't cover.
 
 **Check:**
 

@@ -271,6 +271,21 @@ impl CliTransport {
             }
         }
 
+        // Same PATH gate the discovery path has. Discovery is skippable: a
+        // backend that declares `tools` in its config never runs `--help`, so
+        // without this the tool call is the first thing to touch the command
+        // and reports the raw OS error, while `mcp --list` already said
+        // "unavailable" with the reason.
+        if let Err(e) = super::which::resolve_command(&self.command, &self.env) {
+            return Ok(JsonRpcResponse::success(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": e.to_string() }],
+                    "isError": true
+                }),
+            ));
+        }
+
         // Run the command with timeout. kill_on_drop ensures the child is
         // reaped if the request is cancelled (e.g. caller dropped, server
         // shutting down) instead of leaking as an orphan.
@@ -424,6 +439,66 @@ mod tests {
             .await
             .subcommand_map
             .insert(name.to_string(), sub.to_string());
+    }
+
+    /// A CLI backend that declares `tools` in its config never runs `--help`,
+    /// so discovery (the other PATH gate) is skipped entirely. Without the
+    /// gate in `run_command`, the tool call is the first thing to touch the
+    /// command and reports the raw OS error, while `mcp --list` has already
+    /// said "unavailable" with the reason. This asserts both agree.
+    #[tokio::test]
+    async fn test_missing_command_reports_the_reason_not_the_os_error() {
+        let transport = test_transport("mcp-not-a-real-binary");
+        override_subcommand(&transport, "mcp-not-a-real-binary_test", "").await;
+
+        let resp = transport
+            .handle_tools_call(
+                json!(1),
+                Some(json!({"name": "mcp-not-a-real-binary_test", "arguments": {}})),
+            )
+            .await
+            .unwrap();
+
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "command not found in PATH: mcp-not-a-real-binary");
+        assert!(
+            !text.contains("No such file or directory"),
+            "the raw OS error is what this gate exists to replace, got: {text}"
+        );
+    }
+
+    /// The gate must respect a backend that pins its own PATH, the same way
+    /// the spawn would.
+    #[tokio::test]
+    async fn test_backend_pinned_path_is_honored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("pinned-cli");
+        std::fs::write(&tool, b"#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut transport = test_transport("pinned-cli");
+        transport
+            .env
+            .insert("PATH".to_string(), dir.path().to_string_lossy().to_string());
+        override_subcommand(&transport, "pinned-cli_test", "").await;
+
+        let resp = transport
+            .handle_tools_call(
+                json!(1),
+                Some(json!({"name": "pinned-cli_test", "arguments": {}})),
+            )
+            .await
+            .unwrap();
+
+        let result = resp.result.unwrap();
+        assert_ne!(
+            result["isError"],
+            json!(true),
+            "a backend that pins its PATH must not be refused: {result}"
+        );
     }
 
     #[tokio::test]

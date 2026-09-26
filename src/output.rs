@@ -69,43 +69,54 @@ pub fn print_search_results(servers: &[RegistryServer], fmt: OutputFormat) -> Re
 /// HTTP backends always report `None`: reachability needs a request, and
 /// `--list` is a config view, not a health check.
 fn server_unavailable_reason(config: &ServerConfig) -> Option<String> {
-    match config {
-        ServerConfig::Stdio { command, .. } | ServerConfig::Cli { command, .. } => {
-            crate::transport::which::unavailable_reason(command)
+    // `env` is not decoration here: a backend may pin its own PATH, and that
+    // is the PATH the spawn would use. Reading only ours would report a
+    // working backend as unavailable.
+    let (command, env) = match config {
+        ServerConfig::Stdio { command, env, .. } | ServerConfig::Cli { command, env, .. } => {
+            (command, env)
         }
-        ServerConfig::Http { .. } => None,
+        ServerConfig::Http { .. } => return None,
+    };
+    crate::transport::which::resolve_command(command, env)
+        .err()
+        .map(|e| e.to_string())
+}
+
+/// One `mcp --list --json` element. `available` and `unavailable_reason`
+/// appear only on a backend that cannot start here, so the shape of a healthy
+/// entry is unchanged from before this existed.
+fn server_json_entry(name: &str, config: &ServerConfig) -> serde_json::Value {
+    let mut entry = match config {
+        ServerConfig::Stdio { command, args, .. } => json!({
+            "name": name,
+            "type": "stdio",
+            "command": command,
+            "args": args,
+        }),
+        ServerConfig::Http { url, .. } => json!({
+            "name": name,
+            "type": "http",
+            "url": url,
+        }),
+        ServerConfig::Cli { command, args, .. } => json!({
+            "name": name,
+            "type": "cli",
+            "command": command,
+            "args": args,
+        }),
+    };
+    if let Some(reason) = server_unavailable_reason(config) {
+        entry["available"] = json!(false);
+        entry["unavailable_reason"] = json!(reason);
     }
+    entry
 }
 
 fn print_servers_json(servers: &HashMap<String, ServerConfig>) -> Result<()> {
     let list: Vec<serde_json::Value> = servers
         .iter()
-        .map(|(name, config)| {
-            let mut entry = match config {
-                ServerConfig::Stdio { command, args, .. } => json!({
-                    "name": name,
-                    "type": "stdio",
-                    "command": command,
-                    "args": args,
-                }),
-                ServerConfig::Http { url, .. } => json!({
-                    "name": name,
-                    "type": "http",
-                    "url": url,
-                }),
-                ServerConfig::Cli { command, args, .. } => json!({
-                    "name": name,
-                    "type": "cli",
-                    "command": command,
-                    "args": args,
-                }),
-            };
-            if let Some(reason) = server_unavailable_reason(config) {
-                entry["available"] = json!(false);
-                entry["unavailable_reason"] = json!(reason);
-            }
-            entry
-        })
+        .map(|(name, config)| server_json_entry(name, config))
         .collect();
 
     println!("{}", serde_json::to_string_pretty(&list)?);
@@ -729,6 +740,34 @@ mod tests {
     #[test]
     fn test_unavailable_reason_is_none_for_an_installed_command() {
         assert!(server_unavailable_reason(&stdio_server("sh")).is_none());
+    }
+
+    /// The unit tests above cover the reason; this covers the two keys
+    /// actually reaching the JSON, which is the part scripts consume.
+    #[test]
+    fn test_servers_json_carries_the_availability_keys() {
+        let entry = server_json_entry("broken", &stdio_server("mcp-not-a-real-binary"));
+        assert_eq!(entry["available"], json!(false));
+        assert_eq!(
+            entry["unavailable_reason"],
+            json!("command not found in PATH: mcp-not-a-real-binary")
+        );
+    }
+
+    /// A runnable backend carries neither key, which is the shape documented
+    /// in the CLI reference.
+    #[test]
+    fn test_servers_json_omits_the_keys_when_runnable() {
+        let entry = server_json_entry("fine", &stdio_server("sh"));
+        assert!(entry.get("available").is_none());
+        assert!(entry.get("unavailable_reason").is_none());
+    }
+
+    #[test]
+    fn test_servers_json_never_marks_http_unavailable() {
+        let entry = server_json_entry("remote", &http_server("https://example.com/mcp"));
+        assert!(entry.get("available").is_none());
+        assert_eq!(entry["type"], "http");
     }
 
     #[test]

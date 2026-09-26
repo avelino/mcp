@@ -40,8 +40,17 @@ pub struct StdioTransport {
 impl StdioTransport {
     pub fn new(command: &str, args: &[String], env: &HashMap<String, String>) -> Result<Self> {
         // Resolve against PATH first so a missing runtime reports what is
-        // missing instead of the OS "No such file or directory".
-        super::which::resolve_command(command)?;
+        // missing instead of the OS "No such file or directory". `env` goes
+        // in because it may pin the child's PATH, which is the one the spawn
+        // resolves against.
+        //
+        // Logged as well as returned: under `mcp serve` the error travels back
+        // to the client, and nothing in the server's own log would otherwise
+        // name the command that failed to start.
+        if let Err(e) = super::which::resolve_command(command, env) {
+            tracing::warn!(command = %command, error = %e, "backend command unavailable");
+            return Err(e.into());
+        }
 
         let mut cmd = Command::new(command);
         cmd.args(args)

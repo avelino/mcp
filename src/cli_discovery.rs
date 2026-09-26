@@ -134,7 +134,7 @@ async fn run_help(
 
     // Resolve against PATH first: a CLI backend whose tool is not installed
     // here should say so, not fail with the OS spawn error.
-    crate::transport::which::resolve_command(command)?;
+    crate::transport::which::resolve_command(command, env)?;
 
     // kill_on_drop ensures a help-probe child is reaped if the timeout fires
     // or the discovery task is cancelled — no orphans from this path.

@@ -323,9 +323,41 @@ fn save_config(path: &std::path::Path, root: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A registry-declared variable name we are willing to put on a command line.
+///
+/// The registry is remote input, and these names become `docker run` argv.
+/// Argument injection is not reachable (no shell, and `-e` always consumes the
+/// next token, so a hostile name lands as a variable called `--privileged`
+/// rather than as a flag), but a name that is not a variable name has no
+/// legitimate use, and refusing it keeps the blast radius where it can be
+/// reasoned about.
+fn is_valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
     // Prefer packages (stdio) over remotes (http)
     if let Some(pkg) = server.packages.first() {
+        let declared_env: Vec<&registry::EnvVar> = pkg
+            .environment_variables
+            .iter()
+            .filter(|ev| {
+                let ok = is_valid_env_name(&ev.name);
+                if !ok {
+                    eprintln!(
+                        "warning: registry declared an invalid environment variable name, skipping: {:?}",
+                        ev.name
+                    );
+                }
+                ok
+            })
+            .collect();
+
         let (command, args) = match pkg.registry_type.as_str() {
             "npm" => (
                 "npx".to_string(),
@@ -337,8 +369,14 @@ fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
                 // the container. Each declared variable needs an explicit
                 // `-e NAME` (no `=`) so docker forwards it from the CLI's own
                 // environment into the container.
+                //
+                // Trade-off, and it is the reason this is not simply "more
+                // correct": `-e NAME` forwards the variable even when it is
+                // unset here, which shadows an `ENV NAME=default` baked into
+                // the image. Delete the pair from `args` and `env` for any
+                // declared variable you want the image's own default for.
                 let mut args = vec!["run".to_string(), "-i".to_string(), "--rm".to_string()];
-                for ev in &pkg.environment_variables {
+                for ev in &declared_env {
                     args.push("-e".to_string());
                     args.push(ev.name.clone());
                 }
@@ -349,7 +387,7 @@ fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
         };
 
         let mut env = serde_json::Map::new();
-        for ev in &pkg.environment_variables {
+        for ev in &declared_env {
             env.insert(ev.name.clone(), Value::String(format!("${{{}}}", ev.name)));
         }
 
@@ -461,6 +499,74 @@ mod tests {
         // The image stays last so docker parses every flag before it.
         assert_eq!(args.last().unwrap(), &"saseq/discord-mcp:latest");
         assert_eq!(entry["env"]["DISCORD_TOKEN"], "${DISCORD_TOKEN}");
+    }
+
+    #[test]
+    fn test_build_config_entry_rejects_hostile_env_names_from_the_registry() {
+        // The registry is remote input and these names become docker argv.
+        let server = RegistryServer {
+            name: "hostile".to_string(),
+            description: None,
+            repository: None,
+            packages: vec![Package {
+                registry_type: "oci".to_string(),
+                identifier: "example/img".to_string(),
+                environment_variables: vec![
+                    EnvVar {
+                        name: "--privileged".to_string(),
+                        description: None,
+                    },
+                    EnvVar {
+                        name: "-v/:/host".to_string(),
+                        description: None,
+                    },
+                    EnvVar {
+                        name: "HAS SPACE".to_string(),
+                        description: None,
+                    },
+                    EnvVar {
+                        name: String::new(),
+                        description: None,
+                    },
+                    EnvVar {
+                        name: "GOOD_TOKEN".to_string(),
+                        description: None,
+                    },
+                ],
+            }],
+            remotes: vec![],
+        };
+
+        let entry = build_config_entry(&server).unwrap();
+        let args: Vec<&str> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec!["run", "-i", "--rm", "-e", "GOOD_TOKEN", "example/img"],
+            "only the well-formed name survives"
+        );
+        assert_eq!(entry["env"]["GOOD_TOKEN"], "${GOOD_TOKEN}");
+        assert!(entry["env"].get("--privileged").is_none());
+        assert!(entry["env"].get("-v/:/host").is_none());
+    }
+
+    #[test]
+    fn test_is_valid_env_name() {
+        assert!(is_valid_env_name("TOKEN"));
+        assert!(is_valid_env_name("_private"));
+        assert!(is_valid_env_name("A1_b2"));
+
+        assert!(!is_valid_env_name(""));
+        assert!(!is_valid_env_name("1LEADING_DIGIT"));
+        assert!(!is_valid_env_name("--privileged"));
+        assert!(!is_valid_env_name("HAS SPACE"));
+        assert!(!is_valid_env_name("HAS=EQUALS"));
+        assert!(!is_valid_env_name("HAS\nNEWLINE"));
     }
 
     #[test]
