@@ -39,6 +39,15 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
+          # musl targets are what the Docker images run: a glibc binary needs
+          # a dynamic loader that scratch does not have, and alpine (the full
+          # image) has musl, not glibc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
           - target: x86_64-apple-darwin
             os: macos-15-large
             cross: false
@@ -151,11 +160,24 @@ jobs:
       - name: Prepare Docker contexts
         run: |
           mkdir -p docker-amd64 docker-arm64
-          cp artifacts/mcp-x86_64-unknown-linux-gnu/mcp-x86_64-unknown-linux-gnu docker-amd64/mcp
-          cp artifacts/mcp-aarch64-unknown-linux-gnu/mcp-aarch64-unknown-linux-gnu docker-arm64/mcp
+          # musl, not gnu: these binaries are statically linked, so they run
+          # both on scratch (no loader at all) and on alpine (musl libc).
+          cp artifacts/mcp-x86_64-unknown-linux-musl/mcp-x86_64-unknown-linux-musl docker-amd64/mcp
+          cp artifacts/mcp-aarch64-unknown-linux-musl/mcp-aarch64-unknown-linux-musl docker-arm64/mcp
           chmod +x docker-amd64/mcp docker-arm64/mcp
           cp Dockerfile docker-amd64/
           cp Dockerfile docker-arm64/
+
+      - name: Verify the binaries are static
+        run: |
+          for f in docker-amd64/mcp docker-arm64/mcp; do
+            if file "$f" | grep -q "dynamically linked"; then
+              echo "::error::$f is dynamically linked and will not run on scratch"
+              file "$f"
+              exit 1
+            fi
+            echo "ok: $(file -b "$f")"
+          done
 
       - name: Build and push (amd64)
         uses: docker/build-push-action@v6
@@ -177,7 +199,27 @@ jobs:
           tags: ghcr.io/avelino/mcp:${{ steps.meta.outputs.version }}-arm64
           provenance: false
 
-      - name: Create multi-arch manifest
+      - name: Build and push full (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-amd64
+          target: full
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/avelino/mcp:${{ steps.meta.outputs.version }}-full-amd64
+          provenance: false
+
+      - name: Build and push full (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-arm64
+          target: full
+          platforms: linux/arm64
+          push: true
+          tags: ghcr.io/avelino/mcp:${{ steps.meta.outputs.version }}-full-arm64
+          provenance: false
+
+      - name: Create multi-arch manifests
         run: |
           VERSION="${{ steps.meta.outputs.version }}"
           docker buildx imagetools create \
@@ -185,3 +227,20 @@ jobs:
             -t ghcr.io/avelino/mcp:${VERSION} \
             ghcr.io/avelino/mcp:${VERSION}-amd64 \
             ghcr.io/avelino/mcp:${VERSION}-arm64
+          docker buildx imagetools create \
+            -t ghcr.io/avelino/mcp:full \
+            -t ghcr.io/avelino/mcp:${VERSION}-full \
+            ghcr.io/avelino/mcp:${VERSION}-full-amd64 \
+            ghcr.io/avelino/mcp:${VERSION}-full-arm64
+
+      - name: Smoke test the published images
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          for tag in "${VERSION}" "${VERSION}-full"; do
+            echo "--- ghcr.io/avelino/mcp:${tag}"
+            docker run --rm "ghcr.io/avelino/mcp:${tag}" --version
+          done
+          # The full image exists for backends with a `command`; if a runtime
+          # went missing the image is pointless, so fail the release here.
+          docker run --rm --entrypoint sh "ghcr.io/avelino/mcp:${VERSION}-full" -c \
+            'for c in npx uvx docker kubectl gh; do command -v "$c" >/dev/null || { echo "missing: $c"; exit 1; }; echo "ok: $c"; done'

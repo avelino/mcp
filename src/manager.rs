@@ -332,15 +332,19 @@ fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
                 vec!["-y".to_string(), pkg.identifier.clone()],
             ),
             "pip" | "pypi" => ("uvx".to_string(), vec![pkg.identifier.clone()]),
-            "oci" | "docker" => (
-                "docker".to_string(),
-                vec![
-                    "run".to_string(),
-                    "-i".to_string(),
-                    "--rm".to_string(),
-                    pkg.identifier.clone(),
-                ],
-            ),
+            "oci" | "docker" => {
+                // `envs` on the spawned process reaches the `docker` CLI, not
+                // the container. Each declared variable needs an explicit
+                // `-e NAME` (no `=`) so docker forwards it from the CLI's own
+                // environment into the container.
+                let mut args = vec!["run".to_string(), "-i".to_string(), "--rm".to_string()];
+                for ev in &pkg.environment_variables {
+                    args.push("-e".to_string());
+                    args.push(ev.name.clone());
+                }
+                args.push(pkg.identifier.clone());
+                ("docker".to_string(), args)
+            }
             _ => (pkg.identifier.clone(), vec![]),
         };
 
@@ -408,6 +412,75 @@ mod tests {
         assert_eq!(entry["args"][0], "-y");
         assert_eq!(entry["args"][1], "@modelcontextprotocol/server-github");
         assert_eq!(entry["env"]["GITHUB_TOKEN"], "${GITHUB_TOKEN}");
+    }
+
+    #[test]
+    fn test_build_config_entry_from_oci_package_forwards_env_into_container() {
+        let server = RegistryServer {
+            name: "discord".to_string(),
+            description: None,
+            repository: None,
+            packages: vec![Package {
+                registry_type: "oci".to_string(),
+                identifier: "saseq/discord-mcp:latest".to_string(),
+                environment_variables: vec![
+                    EnvVar {
+                        name: "DISCORD_TOKEN".to_string(),
+                        description: None,
+                    },
+                    EnvVar {
+                        name: "DISCORD_GUILD_ID".to_string(),
+                        description: None,
+                    },
+                ],
+            }],
+            remotes: vec![],
+        };
+
+        let entry = build_config_entry(&server).unwrap();
+        assert_eq!(entry["command"], "docker");
+        let args: Vec<&str> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-i",
+                "--rm",
+                "-e",
+                "DISCORD_TOKEN",
+                "-e",
+                "DISCORD_GUILD_ID",
+                "saseq/discord-mcp:latest",
+            ]
+        );
+        // The image stays last so docker parses every flag before it.
+        assert_eq!(args.last().unwrap(), &"saseq/discord-mcp:latest");
+        assert_eq!(entry["env"]["DISCORD_TOKEN"], "${DISCORD_TOKEN}");
+    }
+
+    #[test]
+    fn test_build_config_entry_from_oci_package_without_env() {
+        let server = RegistryServer {
+            name: "plain".to_string(),
+            description: None,
+            repository: None,
+            packages: vec![Package {
+                registry_type: "docker".to_string(),
+                identifier: "ghcr.io/example/plain".to_string(),
+                environment_variables: vec![],
+            }],
+            remotes: vec![],
+        };
+
+        let entry = build_config_entry(&server).unwrap();
+        assert_eq!(entry["command"], "docker");
+        assert_eq!(entry["args"][3], "ghcr.io/example/plain");
+        assert!(entry.get("env").is_none());
     }
 
     #[test]

@@ -39,6 +39,10 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn new(command: &str, args: &[String], env: &HashMap<String, String>) -> Result<Self> {
+        // Resolve against PATH first so a missing runtime reports what is
+        // missing instead of the OS "No such file or directory".
+        super::which::resolve_command(command)?;
+
         let mut cmd = Command::new(command);
         cmd.args(args)
             .envs(env)
@@ -253,5 +257,36 @@ impl Transport for StdioTransport {
             let _ = timeout(Duration::from_secs(2), child.wait()).await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `StdioTransport` is not `Debug`, so `expect_err` is unavailable.
+    fn spawn_error(command: &str) -> String {
+        match StdioTransport::new(command, &[], &HashMap::new()) {
+            Ok(_) => panic!("{command} should not have spawned"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn missing_command_names_the_command_and_the_reason() {
+        // The OS spawn error is "No such file or directory", which names
+        // neither the command nor why it failed. That is what this guards.
+        assert_eq!(
+            spawn_error("mcp-not-a-real-binary"),
+            "command not found in PATH: mcp-not-a-real-binary"
+        );
+    }
+
+    #[test]
+    fn missing_absolute_path_reports_the_path() {
+        assert_eq!(
+            spawn_error("/opt/homebrew/bin/mcp-not-real"),
+            "command does not exist: /opt/homebrew/bin/mcp-not-real"
+        );
     }
 }

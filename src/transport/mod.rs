@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod http;
 pub mod stdio;
+pub mod which;
 
 use anyhow::Result;
 use async_trait::async_trait;

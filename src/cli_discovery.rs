@@ -132,6 +132,10 @@ async fn run_help(
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
 
+    // Resolve against PATH first: a CLI backend whose tool is not installed
+    // here should say so, not fail with the OS spawn error.
+    crate::transport::which::resolve_command(command)?;
+
     // kill_on_drop ensures a help-probe child is reaped if the timeout fires
     // or the discovery task is cancelled — no orphans from this path.
     let mut cmd = Command::new(command);

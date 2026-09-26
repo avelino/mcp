@@ -167,9 +167,29 @@ Available tags:
 
 | Tag | Description |
 |---|---|
-| `latest` | Latest stable release |
-| `x.y.z` | Pinned version |
-| `beta` | Latest build from main branch |
+| `latest` | Latest stable release (`scratch`, ~30 MB, HTTP backends) |
+| `full` | Same binary plus `npx`, `uvx`, `docker`, `kubectl`, `gh` (~390 MB) |
+| `x.y.z` / `x.y.z-full` | Pinned version |
+| `beta` / `beta-full` | Latest build from main branch |
+
+You can also run the proxy as a container instead of a background service. Your MCP client starts and stops it:
+
+```json
+{
+  "mcpServers": {
+    "all": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-v", "/Users/you/.config/mcp:/root/.config/mcp",
+        "ghcr.io/avelino/mcp:full", "serve"
+      ]
+    }
+  }
+}
+```
+
+A backend whose `command` is a binary from your host isn't in either image. `mcp --list` marks those `unavailable` with the reason, so run it in the container before switching a client over. See the [Docker guide](docs/howto/docker.md).
 
 ## CLI as MCP
 

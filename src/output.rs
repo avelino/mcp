@@ -64,27 +64,47 @@ pub fn print_search_results(servers: &[RegistryServer], fmt: OutputFormat) -> Re
 
 // --- JSON output (existing behavior) ---
 
+/// Reason a `command` backend cannot start here, or `None` when it can.
+///
+/// HTTP backends always report `None`: reachability needs a request, and
+/// `--list` is a config view, not a health check.
+fn server_unavailable_reason(config: &ServerConfig) -> Option<String> {
+    match config {
+        ServerConfig::Stdio { command, .. } | ServerConfig::Cli { command, .. } => {
+            crate::transport::which::unavailable_reason(command)
+        }
+        ServerConfig::Http { .. } => None,
+    }
+}
+
 fn print_servers_json(servers: &HashMap<String, ServerConfig>) -> Result<()> {
     let list: Vec<serde_json::Value> = servers
         .iter()
-        .map(|(name, config)| match config {
-            ServerConfig::Stdio { command, args, .. } => json!({
-                "name": name,
-                "type": "stdio",
-                "command": command,
-                "args": args,
-            }),
-            ServerConfig::Http { url, .. } => json!({
-                "name": name,
-                "type": "http",
-                "url": url,
-            }),
-            ServerConfig::Cli { command, args, .. } => json!({
-                "name": name,
-                "type": "cli",
-                "command": command,
-                "args": args,
-            }),
+        .map(|(name, config)| {
+            let mut entry = match config {
+                ServerConfig::Stdio { command, args, .. } => json!({
+                    "name": name,
+                    "type": "stdio",
+                    "command": command,
+                    "args": args,
+                }),
+                ServerConfig::Http { url, .. } => json!({
+                    "name": name,
+                    "type": "http",
+                    "url": url,
+                }),
+                ServerConfig::Cli { command, args, .. } => json!({
+                    "name": name,
+                    "type": "cli",
+                    "command": command,
+                    "args": args,
+                }),
+            };
+            if let Some(reason) = server_unavailable_reason(config) {
+                entry["available"] = json!(false);
+                entry["unavailable_reason"] = json!(reason);
+            }
+            entry
         })
         .collect();
 
@@ -186,53 +206,80 @@ fn print_servers_text(servers: &HashMap<String, ServerConfig>) -> Result<()> {
         return Ok(());
     }
 
-    let mut rows: Vec<(String, String, String)> = servers
+    let mut rows: Vec<(String, String, String, Option<String>)> = servers
         .iter()
-        .map(|(name, config)| match config {
-            ServerConfig::Stdio { command, args, .. } => {
-                let endpoint = if args.is_empty() {
-                    command.clone()
-                } else {
-                    format!("{} {}", command, args.join(" "))
-                };
-                (name.clone(), "stdio".to_string(), endpoint)
-            }
-            ServerConfig::Http { url, .. } => (name.clone(), "http".to_string(), url.clone()),
-            ServerConfig::Cli { command, args, .. } => {
-                let endpoint = if args.is_empty() {
-                    command.clone()
-                } else {
-                    format!("{} {}", command, args.join(" "))
-                };
-                (name.clone(), "cli".to_string(), endpoint)
+        .map(|(name, config)| {
+            let unavailable = server_unavailable_reason(config);
+            match config {
+                ServerConfig::Stdio { command, args, .. } => {
+                    let endpoint = if args.is_empty() {
+                        command.clone()
+                    } else {
+                        format!("{} {}", command, args.join(" "))
+                    };
+                    (name.clone(), "stdio".to_string(), endpoint, unavailable)
+                }
+                ServerConfig::Http { url, .. } => {
+                    (name.clone(), "http".to_string(), url.clone(), unavailable)
+                }
+                ServerConfig::Cli { command, args, .. } => {
+                    let endpoint = if args.is_empty() {
+                        command.clone()
+                    } else {
+                        format!("{} {}", command, args.join(" "))
+                    };
+                    (name.clone(), "cli".to_string(), endpoint, unavailable)
+                }
             }
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // The Status column only shows up when something is actually broken, so
+    // the common case keeps the narrower three-column table.
+    let any_unavailable = rows.iter().any(|(_, _, _, u)| u.is_some());
+
     let mut table = Table::new();
+    let mut header = vec![
+        header_cell("Server"),
+        header_cell("Type"),
+        header_cell("Endpoint"),
+    ];
+    if any_unavailable {
+        header.push(header_cell("Status"));
+    }
     table
         .load_preset(presets::NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            header_cell("Server"),
-            header_cell("Type"),
-            header_cell("Endpoint"),
-        ]);
+        .set_header(header);
 
-    for (name, stype, endpoint) in &rows {
-        table.add_row(vec![
+    for (name, stype, endpoint, unavailable) in &rows {
+        let mut row = vec![
             Cell::new(name).add_attribute(Attribute::Bold),
             type_cell(stype),
             Cell::new(endpoint).fg(Color::DarkGrey),
-        ]);
+        ];
+        if any_unavailable {
+            row.push(match unavailable {
+                Some(reason) => Cell::new(format!("unavailable: {reason}")).fg(Color::Red),
+                None => Cell::new("ok").fg(Color::Green),
+            });
+        }
+        table.add_row(row);
     }
 
     println!("{table}");
-    println!(
-        "\n{}",
-        style(format!("{} server(s) configured", rows.len())).dim()
-    );
+    let unavailable_count = rows.iter().filter(|(_, _, _, u)| u.is_some()).count();
+    let summary = if unavailable_count > 0 {
+        format!(
+            "{} server(s) configured, {} unavailable here",
+            rows.len(),
+            unavailable_count
+        )
+    } else {
+        format!("{} server(s) configured", rows.len())
+    };
+    println!("\n{}", style(summary).dim());
     Ok(())
 }
 
@@ -609,6 +656,87 @@ mod tests {
     }
 
     // --- Servers ---
+
+    fn stdio_server(command: &str) -> ServerConfig {
+        ServerConfig::Stdio {
+            command: command.to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            tool_acl: None,
+            idle_timeout: Default::default(),
+            min_idle_timeout: None,
+            max_idle_timeout: None,
+        }
+    }
+
+    fn cli_server(command: &str) -> ServerConfig {
+        ServerConfig::Cli {
+            command: command.to_string(),
+            cli: true,
+            cli_help: "--help".to_string(),
+            cli_depth: 1,
+            cli_only: vec![],
+            args: vec![],
+            env: HashMap::new(),
+            tools: vec![],
+            tool_acl: None,
+            idle_timeout: Default::default(),
+            min_idle_timeout: None,
+            max_idle_timeout: None,
+        }
+    }
+
+    fn http_server(url: &str) -> ServerConfig {
+        ServerConfig::Http {
+            url: url.to_string(),
+            headers: HashMap::new(),
+            forward_identity: None,
+            tool_acl: None,
+            idle_timeout: Default::default(),
+            min_idle_timeout: None,
+            max_idle_timeout: None,
+        }
+    }
+
+    #[test]
+    fn test_unavailable_reason_flags_a_missing_stdio_command() {
+        let reason = server_unavailable_reason(&stdio_server("mcp-not-a-real-binary"));
+        assert_eq!(
+            reason.as_deref(),
+            Some("command not found in PATH: mcp-not-a-real-binary")
+        );
+    }
+
+    #[test]
+    fn test_unavailable_reason_flags_a_missing_cli_command() {
+        let reason = server_unavailable_reason(&cli_server("mcp-not-a-real-binary"));
+        assert_eq!(
+            reason.as_deref(),
+            Some("command not found in PATH: mcp-not-a-real-binary")
+        );
+    }
+
+    #[test]
+    fn test_unavailable_reason_flags_a_missing_absolute_path() {
+        // A Homebrew-installed backend seen from inside a container.
+        let reason = server_unavailable_reason(&stdio_server("/opt/homebrew/bin/mcp-not-real"));
+        assert_eq!(
+            reason.as_deref(),
+            Some("command does not exist: /opt/homebrew/bin/mcp-not-real")
+        );
+    }
+
+    #[test]
+    fn test_unavailable_reason_is_none_for_an_installed_command() {
+        assert!(server_unavailable_reason(&stdio_server("sh")).is_none());
+    }
+
+    #[test]
+    fn test_unavailable_reason_never_flags_http() {
+        // Reachability needs a request; --list is a config view, not a probe.
+        assert!(server_unavailable_reason(&http_server("https://example.com/mcp")).is_none());
+        assert!(server_unavailable_reason(&http_server("http://127.0.0.1:9/mcp")).is_none());
+    }
 
     #[test]
     fn test_print_servers_json_includes_both_types() {

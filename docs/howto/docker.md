@@ -12,9 +12,14 @@ docker pull ghcr.io/avelino/mcp
 
 | Tag | Description |
 |---|---|
-| `latest` | Latest stable release |
+| `latest` | Latest stable release, `scratch` base, `mcp` binary only |
 | `x.y.z` | Pinned version (e.g. `0.1.0`) |
+| `full` | Latest stable release plus `npx`, `uvx`, `docker`, `kubectl` and `gh`, for backends that spawn a command |
+| `x.y.z-full` | Pinned version of the full image |
 | `beta` | Latest build from main branch |
+| `beta-full` | Latest full build from main branch |
+
+Both images ship the same `mcp` binary; `full` only adds runtimes. See [which image](#which-image) for how to choose.
 
 ## Basic usage
 
@@ -233,8 +238,125 @@ For CI/CD or reproducible environments, pin to a specific version:
 docker run --rm ghcr.io/avelino/mcp:0.1.0 --help
 ```
 
+## Backends that ship as a Docker image
+
+Some MCP servers are distributed as an image instead of an npm or pip package. They run on stdio like any other local server, so the only difference in your config is that `command` is `docker`:
+
+```json
+{
+  "mcpServers": {
+    "discord": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "DISCORD_TOKEN",
+        "-e", "DISCORD_GUILD_ID",
+        "saseq/discord-mcp:latest"
+      ],
+      "env": {
+        "DISCORD_TOKEN": "${DISCORD_TOKEN}",
+        "DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"
+      }
+    }
+  }
+}
+```
+
+Three flags matter:
+
+- `-i` keeps stdin open. Without it the container gets EOF immediately and the handshake never happens.
+- `--rm` removes the container when it exits, so idle shutdown in `mcp serve` doesn't pile up dead containers.
+- `-e NAME` (no `=`) tells docker to copy that variable from the CLI's environment into the container. `env` in the config only reaches the `docker` process, never the container, so a secret declared there and not listed with `-e` silently arrives empty.
+
+`mcp add <name>` writes all three for you when the registry entry is an OCI package.
+
+Never pass secrets as `-e NAME=value` in `args`: that value lands in your config file and in the container's `docker inspect`. Keep it in `env` with `${VAR}` and let `-e NAME` forward it.
+
+Backends in a container behave like any other stdio backend under the proxy: one process per backend, shared across clients, idle shutdown, `--list` and tool calls unchanged.
+
+## Serving `mcp` itself over stdio
+
+`mcp serve` without `--http` speaks MCP on stdio, so the proxy can be wired into a client as a container, the same shape a dockerized MCP server uses. No port, no service to keep running, no boot script: the client starts it and stops it.
+
+```json
+{
+  "mcpServers": {
+    "all": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-v", "/Users/you/.config/mcp:/root/.config/mcp",
+        "ghcr.io/avelino/mcp:full", "serve"
+      ]
+    }
+  }
+}
+```
+
+`-i` is what makes it work: without it the container gets EOF before the handshake. Most clients don't expand `~`, so write the host path out.
+
+Use `-e MCP_SERVERS_CONFIG` instead of the volume when the config is inline and you don't need OAuth tokens or the tool cache to survive a restart.
+
+### Which image
+
+| | `ghcr.io/avelino/mcp` | `ghcr.io/avelino/mcp:full` |
+|---|---|---|
+| Base | `scratch` | `alpine` |
+| Size | ~30 MB | ~390 MB |
+| HTTP backends (`url`) | yes | yes |
+| `npx` / `uvx` backends | no | yes |
+| `docker` backends | no | yes, with the socket mounted |
+| `cli: true` on `kubectl` / `gh` | no | yes, with credentials mounted |
+| Any other host binary | no | no |
+| Audit | off by default | off by default |
+
+Pick the small one for a config that is entirely HTTP. Pick `:full` when the registry handed you `npx` or `uvx` backends.
+
+### What cannot follow you into a container
+
+A backend whose `command` is a binary installed on your host (`/opt/homebrew/bin/something`, `~/.local/bin/something`, a Go or Rust tool on your `PATH`) does not exist inside any of these images, and a macOS binary would not execute on Linux even if mounted. Neither image can run it.
+
+`mcp --list` reports this without spawning anything, so you can check before switching a client over:
+
+```
+$ docker run --rm -v ~/.config/mcp:/root/.config/mcp ghcr.io/avelino/mcp:full --list
+
+ Server        Type   Endpoint                        Status
+ buser_sentry  http   https://mcp.sentry.dev/mcp      ok
+ buser_slack   stdio  npx -y slack-mcp-server@latest  ok
+ github        cli    gh                              ok
+ outl          stdio  outl                            unavailable: command not found in PATH: outl
+ roam          stdio  /opt/homebrew/bin/roam-tui      unavailable: command does not exist: /opt/homebrew/bin/roam-tui
+
+ 5 server(s) configured, 2 unavailable here
+```
+
+In JSON those backends carry `"available": false` and `"unavailable_reason"`. The proxy reports the same reason when a client calls one of their tools, instead of an OS spawn error.
+
+If that list has entries you need, keep running `mcp serve` on the host. A mixed setup can also split: host-native binaries stay in a local `mcp serve`, everything else moves into a container.
+
+### Backends that need more than the runtime
+
+```bash
+# a dockerized backend inside the full image
+docker run --rm -i \
+  -v ~/.config/mcp:/root/.config/mcp \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  ghcr.io/avelino/mcp:full serve
+
+# kubectl and gh as CLI-as-MCP backends
+docker run --rm -i \
+  -v ~/.config/mcp:/root/.config/mcp \
+  -v ~/.kube:/root/.kube:ro \
+  -e GH_TOKEN \
+  ghcr.io/avelino/mcp:full serve
+```
+
+A backend pointing at `127.0.0.1` on the host needs `host.docker.internal` instead of `127.0.0.1`, plus `--add-host=host.docker.internal:host-gateway` on Linux.
+
 ## Limitations
 
-- **Stdio servers only work if the runtime is available inside the container.** The default image includes only the `mcp` binary and `ca-certificates`. Servers that require `npx`, `python`, or other runtimes won't work unless you build a custom image. HTTP servers (configured with `url`) work out of the box.
+- **Stdio servers only work if the runtime is available inside the container.** The default image includes only the `mcp` binary and `ca-certificates`. Use `ghcr.io/avelino/mcp:full` for backends that need `npx`, `uvx`, `docker`, `kubectl` or `gh`; anything else needs an image derived from it. HTTP servers (configured with `url`) work in both. Either way `mcp --list` names what is unavailable before you hit it.
 - **OAuth browser flow doesn't work in Docker.** For HTTP servers that need OAuth, run `mcp add <server>` on your host first to complete authentication, then either mount the config directory (which includes `auth.json`), set `MCP_AUTH_PATH` to a mounted volume, or pass the JSON inline via `MCP_AUTH_CONFIG` (read-only — useful for read-only containers and Kubernetes Secrets).
 - **Audit logging is disabled by default** in the Docker image because `scratch` images have no writable filesystem. Use `MCP_AUDIT_OUTPUT=stdout` to stream to the container log driver, or mount a volume and set `MCP_AUDIT_ENABLED=true`.
+- **A dockerized backend that ignores stdin EOF survives idle shutdown.** When the proxy reaps an idle backend it kills the `docker run` client, which closes the container's stdin but does not stop the container. A server that exits on EOF (most do) shuts down and `--rm` cleans up; one that keeps running stays up until you `docker rm -f` it. Check with `docker ps` if you suspect a backend is lingering.
