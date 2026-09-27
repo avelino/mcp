@@ -123,6 +123,7 @@ Tokens are saved in `~/.config/mcp/auth.json` and refreshed automatically.
 | `mcp <server> --list` | List available tools |
 | `mcp <server> --info` | List tools with input schemas |
 | `mcp <server> <tool> [json]` | Call a tool |
+| `mcp <server> <tool> [json] --dry-run` | Print the JSON-RPC request for a tool call without connecting to the server |
 | `mcp search <query>` | Search the MCP server registry |
 | `mcp add <name>` | Add a server from registry |
 | `mcp add --url <url> <name>` | Add an HTTP server |

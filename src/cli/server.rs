@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 
 use crate::audit;
@@ -6,7 +6,7 @@ use crate::client;
 use crate::config;
 use crate::output;
 use crate::output::OutputFormat;
-use crate::protocol::Tool;
+use crate::protocol::{JsonRpcRequest, Tool, ToolCallParams};
 use crate::spinner;
 
 pub async fn handle_server_command(
@@ -244,6 +244,55 @@ pub async fn handle_server_command(
     Ok(())
 }
 
+/// `mcp <server> <tool> [json] --dry-run`: print the `tools/call` request that
+/// would be sent and return without connecting to or spawning the server.
+pub fn handle_dry_run(args: &[String], cfg: &config::Config) -> Result<()> {
+    let (server_name, tool_name) = dry_run_target(args)?;
+    if !cfg.servers.contains_key(server_name) {
+        bail!("server \"{server_name}\" not found in config");
+    }
+    let arguments = match args.get(2) {
+        Some(raw) => serde_json::from_str(raw).context("tool arguments are not valid JSON")?,
+        None => crate::read_stdin_or_empty()?,
+    };
+    let request = build_tool_call_request(tool_name, arguments)?;
+    println!("{}", serde_json::to_string_pretty(&request)?);
+    Ok(())
+}
+
+/// Server and tool names of a dry run. `--dry-run` only means something for a
+/// tool call, so `--list`, `--info`, `--health` and the built-in subcommands
+/// are rejected instead of silently running without it.
+fn dry_run_target(args: &[String]) -> Result<(&str, &str)> {
+    match args {
+        [server, tool, ..]
+            if !server.starts_with('-')
+                && !tool.starts_with('-')
+                && !config::is_reserved_name(server) =>
+        {
+            Ok((server, tool))
+        }
+        _ => bail!("--dry-run only applies to tool calls: mcp <server> <tool> [json] --dry-run"),
+    }
+}
+
+/// The `tools/call` request for a direct call to `tool_name`. The id is a
+/// placeholder: a live session numbers requests after the handshake.
+fn build_tool_call_request(
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<JsonRpcRequest> {
+    let params = ToolCallParams {
+        name: tool_name.to_string(),
+        arguments,
+    };
+    Ok(JsonRpcRequest::new(
+        1,
+        "tools/call",
+        Some(serde_json::to_value(&params)?),
+    ))
+}
+
 /// Strip a `{server}__` namespace prefix, returning the bare tool name when the
 /// prefix matches this exact server (not a longer one). `None` for tools that
 /// belong to a different backend or carry no namespace.
@@ -316,6 +365,68 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, vec!["get_page", "search"]);
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn test_dry_run_request_is_tools_call() {
+        let request = build_tool_call_request(
+            "send_message",
+            serde_json::json!({"channel": "#general", "text": "hello"}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": {"channel": "#general", "text": "hello"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_dry_run_request_keeps_empty_arguments() {
+        let request = build_tool_call_request("ping", serde_json::json!({})).unwrap();
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["params"],
+            serde_json::json!({"name": "ping", "arguments": {}})
+        );
+    }
+
+    #[test]
+    fn test_dry_run_target_accepts_tool_call() {
+        let args = strings(&["slack", "send_message", "{}"]);
+        assert_eq!(dry_run_target(&args).unwrap(), ("slack", "send_message"));
+        let args = strings(&["slack", "send_message"]);
+        assert_eq!(dry_run_target(&args).unwrap(), ("slack", "send_message"));
+    }
+
+    #[test]
+    fn test_dry_run_target_rejects_non_tool_calls() {
+        for args in [
+            vec!["slack"],
+            vec!["slack", "--list"],
+            vec!["slack", "--info"],
+            vec!["slack", "--health"],
+            vec!["--list"],
+            vec!["search", "slack"],
+            vec!["logs", "--errors"],
+            vec!["serve", "--http"],
+        ] {
+            assert!(
+                dry_run_target(&strings(&args)).is_err(),
+                "{args:?} is not a tool call"
+            );
+        }
     }
 
     #[test]
