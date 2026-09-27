@@ -92,6 +92,7 @@ fn print_usage() {
     eprintln!("  --version, -V                       Print the version");
     eprintln!("  --help, -h                          Show this help");
     eprintln!("  --json                              Force JSON output");
+    eprintln!("  --dry-run                           Print a tool call's JSON-RPC request without sending it");
     eprintln!("  --insecure                          Allow HTTP on non-loopback interfaces");
     eprintln!();
     eprintln!("Output defaults to human-readable tables when run interactively.");
@@ -102,7 +103,11 @@ async fn run() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     let json_flag = raw_args.iter().any(|a| a == "--json");
-    let args: Vec<String> = raw_args.into_iter().filter(|a| a != "--json").collect();
+    let dry_run = raw_args.iter().any(|a| a == "--dry-run");
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .filter(|a| a != "--json" && a != "--dry-run")
+        .collect();
     let fmt = OutputFormat::detect(json_flag);
 
     // Answered before anything reads the config or opens the database. These
@@ -126,6 +131,12 @@ async fn run() -> Result<()> {
             config = %cfg.path.display(),
             "server name conflicts with a reserved command name — rename it to avoid unexpected behavior"
         );
+    }
+
+    // Before the db pool, audit logger and any connection: a dry run must work
+    // with the backend unreachable and must not spawn a stdio server.
+    if dry_run {
+        return cli::handle_dry_run(&args, &cfg);
     }
 
     // Built-in HTTP health probe for container health checks (scratch/distroless
