@@ -68,10 +68,14 @@ That's it. You're using MCP.
 
 ## How it works
 
-```
-You  -->  mcp CLI  -->  MCP Server  -->  Service API
-              |
-         servers.json
+```mermaid
+graph LR
+    You["You<br/>(terminal)"] --> CLI["mcp CLI"]
+    CLI <-->|"JSON-RPC 2.0<br/>stdio or HTTP"| Server["MCP Server"]
+    Server <--> API["Service API"]
+    Config[("servers.json")] -.-> CLI
+
+    style CLI fill:#4a9,color:#fff
 ```
 
 The CLI reads your config (`~/.config/mcp/servers.json`), connects to the server using stdio or HTTP, and speaks [JSON-RPC 2.0](https://www.jsonrpc.org/specification) to call tools. Authentication (OAuth 2.0, API tokens) is handled automatically.
