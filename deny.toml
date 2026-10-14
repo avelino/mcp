@@ -1,0 +1,10 @@
+# cargo-deny config. CI runs `cargo deny check advisories` only (RustSec gate).
+# Dependabot misses most RustSec advisories for this repo, so this is the
+# check that catches them.
+[graph]
+all-features = true
+
+[advisories]
+# Fail on vulnerabilities, unsound and unmaintained crates in the whole graph.
+# Add an entry here only with a reason and a link.
+ignore = []
