@@ -260,7 +260,7 @@ fn print_servers_text(servers: &HashMap<String, ServerConfig>) -> Result<()> {
         header.push(header_cell("Status"));
     }
     table
-        .load_preset(presets::NOTHING)
+        .load_style(presets::NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(header);
 
@@ -302,7 +302,7 @@ fn print_tools_text(tools: &[Tool]) -> Result<()> {
 
     let mut table = Table::new();
     table
-        .load_preset(presets::NOTHING)
+        .load_style(presets::NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![header_cell("Tool"), header_cell("Description")]);
 
@@ -515,7 +515,7 @@ fn print_search_results_text(servers: &[RegistryServer]) -> Result<()> {
 
     let mut table = Table::new();
     table
-        .load_preset(presets::NOTHING)
+        .load_style(presets::NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
             header_cell("Name"),
@@ -598,7 +598,7 @@ pub fn print_audit_log_entry(entry: &AuditEntry, fmt: OutputFormat) -> Result<()
 fn print_audit_logs_text(entries: &[AuditEntry]) -> Result<()> {
     let mut table = Table::new();
     table
-        .load_preset(presets::NOTHING)
+        .load_style(presets::NOTHING)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
             header_cell("Timestamp"),
