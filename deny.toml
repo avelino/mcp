@@ -5,6 +5,9 @@
 all-features = true
 
 [advisories]
+# Defaults are "workspace" in cargo-deny 0.20; check the whole graph.
+unmaintained = "all"
+unsound = "all"
 # Fail on vulnerabilities, unsound and unmaintained crates in the whole graph.
 # Add an entry here only with a reason and a link.
 ignore = []
