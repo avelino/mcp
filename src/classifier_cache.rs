@@ -137,6 +137,37 @@ impl ClassifierCache {
             }
         }
     }
+
+    /// Forgets every entry for a server. The `:` in the prefix keeps `buser`
+    /// from matching `buser_sentry`. Returns how many entries were dropped.
+    /// Every server this cache holds an entry for.
+    ///
+    /// A server removed from the config leaves entries behind that nothing
+    /// else reclaims: the tool cache has its own eviction path, but a
+    /// classification outlives it whenever the backend was classified without
+    /// a tool cache entry to match. `mcp reload` uses this to find them.
+    pub fn known_servers(&self) -> Vec<String> {
+        let mut servers: Vec<String> = self
+            .entries
+            .keys()
+            // Keys are `server:tool:hash`, and a server name never contains a
+            // colon, so the first segment is the whole name.
+            .filter_map(|key| key.split(':').next())
+            .map(str::to_string)
+            .collect();
+        servers.sort();
+        servers.dedup();
+        servers
+    }
+
+    pub fn forget_server(&mut self, server: &str) -> usize {
+        let prefix = format!("{server}:");
+        let before = self.entries.len();
+        self.entries.retain(|k, _| !k.starts_with(&prefix));
+        let dropped = before - self.entries.len();
+        self.dirty = true;
+        dropped
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +261,116 @@ mod tests {
         std::env::set_var("MCP_CLASSIFIER_CACHE", &path);
         let cache = ClassifierCache::load();
         assert!(cache.get("anything").is_none());
+        std::env::remove_var("MCP_CLASSIFIER_CACHE");
+    }
+
+    fn cache_at(path: &std::path::Path) -> ClassifierCache {
+        std::env::set_var("MCP_CLASSIFIER_CACHE", path);
+        ClassifierCache::load()
+    }
+
+    #[test]
+    fn known_servers_lists_each_server_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut cache = cache_at(&dir.path().join("c.json"));
+        cache.put("grafana:get_a:h1".to_string(), sample());
+        cache.put("grafana:get_b:h2".to_string(), sample());
+        cache.put("sentry:get_a:h3".to_string(), sample());
+
+        assert_eq!(cache.known_servers(), vec!["grafana", "sentry"]);
+
+        std::env::remove_var("MCP_CLASSIFIER_CACHE");
+    }
+
+    /// `buser` and `buser_sentry` are distinct servers, and the colon in the
+    /// key is what keeps them apart.
+    #[test]
+    fn known_servers_keeps_shared_prefixes_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut cache = cache_at(&dir.path().join("c.json"));
+        cache.put("buser:a:h1".to_string(), sample());
+        cache.put("buser_sentry:a:h2".to_string(), sample());
+
+        assert_eq!(cache.known_servers(), vec!["buser", "buser_sentry"]);
+
+        std::env::remove_var("MCP_CLASSIFIER_CACHE");
+    }
+
+    #[test]
+    fn known_servers_on_an_empty_cache_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cache = cache_at(&dir.path().join("c.json"));
+
+        assert!(cache.known_servers().is_empty());
+
+        std::env::remove_var("MCP_CLASSIFIER_CACHE");
+    }
+
+    #[test]
+    fn forget_server_removes_only_that_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut cache = cache_at(&dir.path().join("c.json"));
+        cache.put("grafana:get_a:h1".to_string(), sample());
+        cache.put("grafana:get_b:h2".to_string(), sample());
+        cache.put("sentry:get_a:h3".to_string(), sample());
+
+        assert_eq!(cache.forget_server("grafana"), 2);
+        assert!(cache.get("grafana:get_a:h1").is_none());
+        assert!(cache.get("grafana:get_b:h2").is_none());
+        assert!(cache.get("sentry:get_a:h3").is_some());
+
+        std::env::remove_var("MCP_CLASSIFIER_CACHE");
+    }
+
+    #[test]
+    fn forget_server_does_not_touch_server_with_shared_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut cache = cache_at(&dir.path().join("c.json"));
+        cache.put("buser:get_a:h1".to_string(), sample());
+        cache.put("buser_sentry:get_a:h2".to_string(), sample());
+
+        assert_eq!(cache.forget_server("buser"), 1);
+        assert!(cache.get("buser:get_a:h1").is_none());
+        assert!(cache.get("buser_sentry:get_a:h2").is_some());
+
+        std::env::remove_var("MCP_CLASSIFIER_CACHE");
+    }
+
+    #[test]
+    fn forget_server_persists_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut cache = cache_at(&path);
+        cache.put("a:t:h1".to_string(), sample());
+        cache.put("b:t:h2".to_string(), sample());
+        cache.save();
+
+        assert_eq!(cache.forget_server("a"), 1);
+        cache.save();
+
+        let reloaded = ClassifierCache::load();
+        assert!(reloaded.get("a:t:h1").is_none());
+        assert!(reloaded.get("b:t:h2").is_some());
+
+        std::env::remove_var("MCP_CLASSIFIER_CACHE");
+    }
+
+    #[test]
+    fn forget_unknown_server_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut cache = cache_at(&dir.path().join("c.json"));
+        cache.put("a:t:h1".to_string(), sample());
+
+        assert_eq!(cache.forget_server("nope"), 0);
+        assert!(cache.get("a:t:h1").is_some());
+
         std::env::remove_var("MCP_CLASSIFIER_CACHE");
     }
 }

@@ -121,7 +121,7 @@ You named a server with a reserved name. Rename it in `servers.json`:
 warning: server "search" conflicts with a reserved command name
 ```
 
-Reserved names: `search`, `add`, `remove`, `list`, `help`, `version`.
+Reserved names: `search`, `add`, `remove`, `list`, `help`, `version`, `reload`.
 
 ### "failed to parse config file"
 
@@ -138,6 +138,36 @@ python3 -m json.tool ~/.config/mcp/servers.json
 ```
 
 ## Proxy mode errors
+
+### I added or edited a server and the proxy does not see it
+
+`mcp serve` reads `servers.json` once, at boot. `mcp add`, `mcp remove`, `mcp update` and manual edits do not reach a proxy that is already running.
+
+**Fix:** reload it. No restart needed, and running backends are left alone:
+
+```bash
+mcp reload
+```
+
+For a proxy on another host:
+
+```bash
+MCP_ADMIN_TOKEN=... mcp reload --url https://mcp.example.com
+```
+
+To confirm it worked:
+
+```bash
+mcp reload --json                      # instances[].reloaded, remote.body.added/changed/removed
+curl -s http://127.0.0.1:8080/health   # backends_configured and tools should have moved
+```
+
+If it still does not show up:
+
+- **`requires_restart` is not empty.** The change is one that is fixed at boot (`oauth_as` on or off, `audit.output`, bind address). Restart the proxy.
+- **The proxy was started with `--only` or `--exclude`.** A reload keeps that filter, so a server it hides stays hidden.
+- **The proxy rejected the new config.** It keeps serving the old one and logs why on stderr. A `SIGHUP` reload gives no error back to `mcp reload`, so check the proxy log. `--url` returns it as a `500`.
+- **`POST /reload` answers `404`, `401` or `403`.** `404`: `serverAuth.adminRoles` is empty. `401`: missing or wrong `MCP_ADMIN_TOKEN`. `403`: the token's roles are not in `adminRoles`.
 
 ### Backend stuck in discovery retry
 

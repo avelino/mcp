@@ -7,14 +7,29 @@ use tokio::sync::Mutex;
 use crate::audit::AuditLogger;
 use crate::cache::ToolCacheStore;
 use crate::config::Config;
+use crate::instances::{self, InstanceFilter};
 use crate::protocol::JsonRpcRequest;
 use crate::server_auth::AuthIdentity;
 
 use super::discovery::discover_pending_backends;
 use super::dispatch::dispatch_request;
 use super::proxy::{shutdown_clients_in_parallel, ProxyServer, SharedProxy};
+use super::reload::AuthSnapshot;
+// SIGHUP is the only way into a reload on this transport, so on a platform
+// without it there is no reload path to carry invariants for.
+#[cfg(unix)]
+use super::reload::{reload_in_place, BootInvariants};
 
-pub async fn run_stdio(mut config: Config) -> Result<()> {
+pub async fn run_stdio(mut config: Config, filter: InstanceFilter) -> Result<()> {
+    // Raw value, captured before the resolution below rewrites it: a reload
+    // compares what the operator wrote, not what serve mode defaulted to.
+    #[cfg(unix)]
+    let boot = BootInvariants {
+        oauth_as_enabled: false,
+        audit_output: config.audit.output.clone(),
+        bind_addr: None,
+    };
+
     // Serve-mode default resolution: when `audit.output` is unset
     // (`None`), auto-promote to `FileAndStderr` (not `FileAndStdout`)
     // because in stdio mode stdout carries the JSON-RPC channel. Any
@@ -66,7 +81,16 @@ pub async fn run_stdio(mut config: Config) -> Result<()> {
     server.load_from_cache();
     let needs_refresh = Arc::new(std::sync::atomic::AtomicBool::new(!server.tools.is_empty()));
     let identity = AuthIdentity::anonymous();
-    let acl = config.server_auth.acl.clone();
+    // Nothing authenticates on this transport, so the provider is `NoAuth` and
+    // there is no reload gate. The snapshot exists for the ACL: it is the only
+    // part of `serverAuth` stdio enforces, and a reload has to be able to
+    // replace it under the requests already in flight.
+    let auth = AuthSnapshot::new(
+        Arc::new(crate::server_auth::NoAuth),
+        config.server_auth.acl.clone(),
+        Vec::new(),
+    )
+    .shared();
 
     let proxy: SharedProxy = Arc::new(Mutex::new(server));
 
@@ -99,6 +123,47 @@ pub async fn run_stdio(mut config: Config) -> Result<()> {
         });
     }
 
+    let filter = Arc::new(filter);
+
+    // SIGHUP → reload, installed before the instance file exists. The order is
+    // the point: SIGHUP's default disposition is terminate, so a pid published
+    // before the handler is taken can be signalled into killing this process —
+    // and on stdio that kills the client session that spawned it, which is the
+    // exact state the feature exists to preserve.
+    #[cfg(unix)]
+    {
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .map_err(|e| anyhow::anyhow!("failed to register SIGHUP handler: {e}"))?;
+        let proxy = Arc::clone(&proxy);
+        let auth = Arc::clone(&auth);
+        let filter = Arc::clone(&filter);
+        let boot = Arc::new(boot);
+        tokio::spawn(async move {
+            // A loop: the second SIGHUP has to be handled too, or it falls
+            // through to the default disposition and takes the session down.
+            while sighup.recv().await.is_some() {
+                if let Err(e) = reload_in_place(&proxy, &auth, &filter, &boot, None).await {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "SIGHUP reload rejected; serving the previous config"
+                    );
+                }
+            }
+        });
+    }
+
+    // Held until this function returns; the drop unlinks the instance file.
+    let _instance = match instances::register("stdio", None, &filter) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "could not register this instance — `mcp reload` will not discover it"
+            );
+            None
+        }
+    };
+
     tracing::info!("waiting for MCP client");
 
     loop {
@@ -118,7 +183,7 @@ pub async fn run_stdio(mut config: Config) -> Result<()> {
             let proxy = Arc::clone(&proxy);
             let stdout = Arc::clone(&stdout);
             let identity = identity.clone();
-            let acl = acl.clone();
+            let acl = AuthSnapshot::read(&auth).acl;
             // No headers on this transport, so the body is the only place a
             // peer can declare the revision.
             let stateless_peer = super::dispatch::body_declares_stateless(&req);

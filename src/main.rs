@@ -8,6 +8,7 @@ mod cli_discovery;
 mod client;
 mod config;
 mod db;
+mod instances;
 mod logging;
 mod manager;
 mod output;
@@ -63,6 +64,8 @@ fn print_usage() {
     eprintln!("  mcp add --url <url> <name>          Add HTTP server manually");
     eprintln!("  mcp remove <name>                   Remove server from config");
     eprintln!("  mcp update <name>                   Refresh server config from registry");
+    eprintln!("  mcp reload                          Reload config, caches and running proxies");
+    eprintln!("  mcp reload --url <url>              Reload a remote proxy over HTTP");
     eprintln!("  mcp serve                           Start proxy server (stdio)");
     eprintln!("  mcp serve --http [addr]             Start proxy server over HTTP");
     eprintln!("  mcp logs                            Show recent audit log entries");
@@ -190,11 +193,14 @@ async fn run() -> Result<()> {
         // `--only` / `--exclude` narrow the catalog for one instance, so a
         // model-facing proxy can publish a handful of backends while the
         // terminal keeps all of them.
-        let only = value_of("--only");
-        let exclude = value_of("--exclude");
-        if only.is_some() || exclude.is_some() {
+        let filter = instances::InstanceFilter {
+            only: value_of("--only"),
+            exclude: value_of("--exclude"),
+        };
+        if !filter.is_empty() {
             let before = cfg.servers.len();
-            let unknown = config::filter_servers(&mut cfg, only.as_deref(), exclude.as_deref());
+            let unknown =
+                config::filter_servers(&mut cfg, filter.only.as_deref(), filter.exclude.as_deref());
             for name in &unknown {
                 tracing::warn!(server = %name, "unknown server in --only/--exclude — ignored");
             }
@@ -204,7 +210,7 @@ async fn run() -> Result<()> {
                 "catalog filtered for this instance"
             );
         }
-        return serve::run(cfg, http_addr.as_deref(), insecure).await;
+        return serve::run(cfg, http_addr.as_deref(), insecure, filter).await;
     }
 
     // Shared database pool for audit logging and tool cache.
@@ -363,8 +369,11 @@ async fn run() -> Result<()> {
         "config" => {
             return cli::handle_config_command(&args[1..], fmt);
         }
+        "reload" => {
+            return cli::handle_reload_command(&args[1..], fmt, &audit, db_pool.clone()).await;
+        }
         "completions" => {
-            return cli::handle_completions_command(&args[1..]);
+            return cli::handle_completions_command(&args[1..], &cfg);
         }
         _ => {}
     }

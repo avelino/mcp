@@ -23,6 +23,7 @@ const RESERVED_NAMES: &[&str] = &[
     "config",
     "completions",
     "healthcheck",
+    "reload",
 ];
 
 #[derive(Debug, Default, Deserialize, Clone, PartialEq)]

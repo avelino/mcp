@@ -16,14 +16,18 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::audit::{AuditEntry, AuditLogger};
 use crate::cache::ToolCacheStore;
 use crate::config::Config;
+use crate::instances::{self, InstanceFilter};
 use crate::protocol::{error_codes, JsonRpcRequest, JsonRpcResponse};
 use crate::server_auth::oauth_as::{self, AsState};
-use crate::server_auth::{self, AclConfig, AuthIdentity, AuthProvider, Credentials};
+use crate::server_auth::{
+    self, AuthIdentity, AuthProvider, Credentials, ReloadGate, ServerAuthConfig,
+};
 use crate::telemetry::extract_parent_context;
 
 use super::discovery::discover_pending_backends;
 use super::dispatch::dispatch_request;
 use super::proxy::{shutdown_clients_in_parallel, BackendState, ProxyServer, SharedProxy};
+use super::reload::{reload_in_place, AuthSnapshot, BootInvariants, ReloadContext, SharedAuth};
 
 type SseSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
 type SessionMap = Arc<Mutex<HashMap<String, SseSender>>>;
@@ -31,8 +35,11 @@ type SessionMap = Arc<Mutex<HashMap<String, SseSender>>>;
 #[derive(Clone)]
 struct AppState {
     proxy: SharedProxy,
-    auth_provider: Arc<dyn AuthProvider>,
-    acl: Option<AclConfig>,
+    /// Provider, ACL and admin roles as one swappable value — a reload
+    /// replaces all three in a single write, so a request can never be
+    /// authenticated by one config and authorized by another.
+    auth: SharedAuth,
+    reload: ReloadContext,
     sessions: SessionMap,
     shutdown: tokio::sync::watch::Receiver<bool>,
 }
@@ -50,13 +57,18 @@ fn extract_credentials(headers: &HeaderMap) -> Credentials {
 
 /// Authenticate an HTTP request. Returns identity on success, or a 401 response.
 /// Logs authentication failures to the audit log.
+///
+/// The provider is passed in rather than read from `state`: the caller already
+/// holds a snapshot, and taking a second read would reintroduce exactly the
+/// split the single-write swap removes.
 async fn authenticate_request(
     state: &AppState,
+    provider: &Arc<dyn AuthProvider>,
     headers: &HeaderMap,
     source: &str,
 ) -> Result<AuthIdentity, (StatusCode, Json<Value>)> {
     let creds = extract_credentials(headers);
-    match state.auth_provider.authenticate(&creds).await {
+    match provider.authenticate(&creds).await {
         Ok(identity) => Ok(identity),
         Err(e) => {
             // Log auth failure using async lock (safe in async context).
@@ -311,7 +323,12 @@ fn validate_bind_addr(addr: &str, insecure: bool) -> Result<std::net::SocketAddr
     Ok(sock_addr)
 }
 
-pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Result<()> {
+pub async fn run_http(
+    mut config: Config,
+    bind_addr: &str,
+    insecure: bool,
+    filter: InstanceFilter,
+) -> Result<()> {
     let sock_addr = validate_bind_addr(bind_addr, insecure)?;
 
     // OAuth AS state — only allocated when the operator opted in via
@@ -328,7 +345,21 @@ pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Re
     };
 
     let auth_provider = server_auth::build_auth_provider(&config.server_auth, as_state.as_ref())?;
-    let acl = config.server_auth.acl.clone();
+    let shared_auth = AuthSnapshot::new(
+        auth_provider,
+        config.server_auth.acl.clone(),
+        config.server_auth.admin_roles.clone(),
+    )
+    .shared();
+
+    // Captured here because `audit.output` is rewritten a few lines down with
+    // the serve-mode default. A reload compares the raw values an operator
+    // wrote, so the raw one is what has to be remembered.
+    let boot = Arc::new(BootInvariants {
+        oauth_as_enabled: as_enabled,
+        audit_output: config.audit.output.clone(),
+        bind_addr: Some(bind_addr.to_string()),
+    });
 
     // Serve-mode default resolution: when `audit.output` is unset
     // (`None`), auto-promote to `FileAndStdout` so audit also streams
@@ -363,10 +394,16 @@ pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Re
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let reload_ctx = ReloadContext {
+        filter: Arc::new(filter),
+        boot,
+        as_state: as_state.clone(),
+    };
+
     let state = AppState {
         proxy: shared.clone(),
-        auth_provider,
-        acl,
+        auth: shared_auth,
+        reload: reload_ctx,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         shutdown: shutdown_rx,
     };
@@ -476,6 +513,7 @@ pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Re
         .route("/health", get(health_handler))
         .route("/mcp", post(mcp_handler).get(mcp_sse_handler))
         .route("/mcp/sse", get(mcp_sse_handler))
+        .route("/reload", post(reload_handler))
         .with_state(state.clone());
 
     // Mount the OAuth AS sub-router when the operator enabled it.
@@ -507,6 +545,57 @@ pub async fn run_http(mut config: Config, bind_addr: &str, insecure: bool) -> Re
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
         })
         .layer(request_logger);
+
+    // SIGHUP → reload. Registered before the instance file exists, and in that
+    // order on purpose: the default disposition of SIGHUP is *terminate*, so
+    // between publishing the pid and taking the handler there is a window
+    // where a concurrent `mcp reload` kills this proxy instead of reloading
+    // it. Failing to take the handler aborts the boot for the same reason —
+    // an instance nobody can signal is better than one a signal kills.
+    #[cfg(unix)]
+    {
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .map_err(|e| anyhow::anyhow!("failed to register SIGHUP handler: {e}"))?;
+        let proxy = shared.clone();
+        let auth = state.auth.clone();
+        let reload = state.reload.clone();
+        tokio::spawn(async move {
+            // A loop, not a single `recv`: a proxy is reloaded many times over
+            // its life, and a handler that stops listening after the first one
+            // lets the second SIGHUP fall through to the default disposition.
+            while sighup.recv().await.is_some() {
+                if let Err(e) = reload_in_place(
+                    &proxy,
+                    &auth,
+                    &reload.filter,
+                    &reload.boot,
+                    reload.as_state.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "SIGHUP reload rejected; serving the previous config"
+                    );
+                }
+            }
+        });
+    }
+
+    // Held for the rest of the function: dropping it unlinks the instance
+    // file, which is how `mcp reload` learns this proxy is gone. A registry it
+    // cannot write is not worth refusing to serve over — `mcp reload --url`
+    // still reaches this proxy — so the failure warns and serving continues.
+    let _instance = match instances::register("http", Some(bind_addr), &state.reload.filter) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "could not register this instance — `mcp reload` will not discover it"
+            );
+            None
+        }
+    };
 
     tracing::info!(addr = %sock_addr, "HTTP server listening");
     if sock_addr.ip().is_loopback() {
@@ -590,6 +679,133 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(body)
 }
 
+/// `404 Not Found`, byte-identical to the router's fallback.
+///
+/// An operator who never set `adminRoles` must not be able to tell that
+/// `/reload` is routed at all, and a body that differs from the fallback's is
+/// precisely that tell.
+fn reload_not_found() -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+}
+
+/// Record a reload attempt — allowed or denied — against the identity that
+/// made it. Reload replaces the config every other client is being served
+/// from, so who asked is the whole point of auditing it.
+async fn audit_reload(
+    state: &AppState,
+    identity: &AuthIdentity,
+    duration_ms: u64,
+    error_message: Option<String>,
+) {
+    let audit = Arc::clone(&state.proxy.lock().await.audit);
+    audit.log(AuditEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        source: "serve:http".to_string(),
+        method: "config/reload".to_string(),
+        tool_name: None,
+        server_name: None,
+        identity: identity.subject.clone(),
+        duration_ms,
+        success: error_message.is_none(),
+        error_message,
+        arguments: None,
+        acl_decision: None,
+        acl_matched_rule: None,
+        acl_access_kind: None,
+        classification_kind: None,
+        classification_source: None,
+        classification_confidence: None,
+    });
+}
+
+// POST /reload — re-read the config from disk and apply it in place.
+async fn reload_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    let auth = AuthSnapshot::read(&state.auth);
+    // `is_reload_allowed` reads nothing but `adminRoles`, and the snapshot
+    // carries exactly that. The rest of the `serverAuth` block lives inside
+    // the provider, where no second copy of it can drift out of step.
+    let gate_config = ServerAuthConfig {
+        admin_roles: auth.admin_roles.as_ref().clone(),
+        ..Default::default()
+    };
+
+    // `Disabled` is answered before a credential is demanded. Authenticating
+    // first would hand an anonymous probe a 401, and a 401 is an answer: it
+    // says the route is there.
+    if server_auth::is_reload_allowed(&AuthIdentity::anonymous(), &gate_config)
+        == ReloadGate::Disabled
+    {
+        return reload_not_found();
+    }
+
+    let identity = match authenticate_request(&state, &auth.provider, &headers, "serve:http").await
+    {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    match server_auth::is_reload_allowed(&identity, &gate_config) {
+        ReloadGate::Allowed => {}
+        // `Disabled` was already answered above, before credentials.
+        ReloadGate::Denied | ReloadGate::Disabled => {
+            audit_reload(
+                &state,
+                &identity,
+                0,
+                Some("identity holds none of serverAuth.adminRoles".to_string()),
+            )
+            .await;
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "reload requires one of serverAuth.adminRoles"})),
+            );
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let outcome = reload_in_place(
+        &state.proxy,
+        &state.auth,
+        &state.reload.filter,
+        &state.reload.boot,
+        state.reload.as_state.as_ref(),
+    )
+    .await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    match outcome {
+        Ok(outcome) => {
+            audit_reload(&state, &identity, duration_ms, None).await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "reloaded": true,
+                    "added": outcome.added,
+                    "changed": outcome.changed,
+                    "removed": outcome.removed,
+                    "tools": outcome.tools,
+                    "requires_restart": outcome.requires_restart,
+                })),
+            )
+        }
+        // The proxy is still serving the config it had before the attempt —
+        // `reload_in_place` validates everything before it mutates anything —
+        // so this is a failed request, not a degraded server.
+        Err(e) => {
+            let message = format!("{e:#}");
+            tracing::warn!(error = %message, "reload rejected; serving the previous config");
+            audit_reload(&state, &identity, duration_ms, Some(message.clone())).await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"reloaded": false, "error": message})),
+            )
+        }
+    }
+}
+
 // POST /mcp — JSON-RPC request/response
 async fn mcp_handler(
     State(state): State<AppState>,
@@ -611,8 +827,11 @@ async fn mcp_handler(
         return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!(err)));
     }
 
-    // Authenticate
-    let identity = match authenticate_request(&state, &headers, "serve:http").await {
+    // Authenticate. One snapshot serves this whole request: the ACL below
+    // belongs to the same config as the provider that produced the identity.
+    let auth = AuthSnapshot::read(&state.auth);
+    let identity = match authenticate_request(&state, &auth.provider, &headers, "serve:http").await
+    {
         Ok(id) => id,
         Err(resp) => return resp,
     };
@@ -671,7 +890,7 @@ async fn mcp_handler(
         &state.proxy,
         req,
         &identity,
-        &state.acl,
+        &auth.acl,
         "serve:http",
         stateless_peer,
     )
@@ -733,7 +952,8 @@ async fn mcp_handler(
 // and receives JSON-RPC responses as SSE `message` events.
 async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Authenticate
-    if let Err(resp) = authenticate_request(&state, &headers, "serve:http").await {
+    let provider = AuthSnapshot::read(&state.auth).provider;
+    if let Err(resp) = authenticate_request(&state, &provider, &headers, "serve:http").await {
         return resp.into_response();
     }
 
@@ -831,17 +1051,22 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
 /// reapers). Everything on the request path — authentication, routing-header
 /// validation, `dispatch_request`, the SSE fallback — is shared with it, so a
 /// test driving this router is driving the real thing.
+///
+/// The `fallback` is part of that: `/reload` answers a disabled gate with the
+/// fallback's own 404 body, and a test that it is indistinguishable from an
+/// unrouted path needs the unrouted path to answer the same way it does in
+/// production.
 #[cfg(test)]
 pub(super) fn test_router(
     proxy: SharedProxy,
-    auth_provider: Arc<dyn AuthProvider>,
-    acl: Option<AclConfig>,
+    auth: SharedAuth,
+    reload: ReloadContext,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Router {
     let state = AppState {
         proxy,
-        auth_provider,
-        acl,
+        auth,
+        reload,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         shutdown,
     };
@@ -849,7 +1074,9 @@ pub(super) fn test_router(
         .route("/health", get(health_handler))
         .route("/mcp", post(mcp_handler).get(mcp_sse_handler))
         .route("/mcp/sse", get(mcp_sse_handler))
+        .route("/reload", post(reload_handler))
         .with_state(state)
+        .fallback(|| async { reload_not_found() })
 }
 
 #[cfg(test)]

@@ -299,9 +299,17 @@ These names cannot be used as server names:
 - `search`
 - `add`
 - `remove`
+- `update`
 - `list`
 - `help`
 - `version`
+- `serve`
+- `logs`
+- `acl`
+- `config`
+- `completions`
+- `healthcheck`
+- `reload`
 
 Using a reserved name won't break the config, but you'll get a warning and the server may be shadowed by built-in commands.
 
@@ -317,7 +325,8 @@ Optional. Configures authentication for `mcp serve --http`. Ignored for direct C
     "bearer": { ... },
     "forwarded": { ... },
     "oauthAs": { ... },
-    "acl": { ... }
+    "acl": { ... },
+    "adminRoles": ["<role>"]
   }
 }
 ```
@@ -428,6 +437,34 @@ Required when `"oauth_as"` is in `providers`. Turns `mcp serve` into an OAuth 2.
 | `injectedRoles` | string[] | no | `[]` | Roles always added to issued JWTs — useful as a "came in via OAuth" marker for ACL discrimination. |
 
 State (registered clients via DCR + refresh tokens) persists to `auth_server.json` in the config directory; override with `MCP_AUTH_SERVER_PATH` or inline via `MCP_AUTH_SERVER_CONFIG`. See the [OAuth AS how-to](../howto/oauth-as.md) for setup, security notes, and troubleshooting.
+
+### Admin roles (`adminRoles`)
+
+Optional. Array of role names allowed to call `POST /reload` on the proxy. Default `[]`, which leaves the endpoint off (it answers `404`). A config without the key behaves exactly as before.
+
+```json
+{
+  "serverAuth": {
+    "providers": ["bearer"],
+    "bearer": {
+      "tokens": {
+        "secret-abc": { "subject": "alice", "roles": ["dev"] },
+        "secret-ops": { "subject": "ops-bot", "roles": ["admin"] }
+      }
+    },
+    "adminRoles": ["admin"]
+  }
+}
+```
+
+Here only `ops-bot` can reload the proxy. `alice` gets `403`.
+
+- Only `adminRoles` grants reload. A tool or resource grant in the ACL never implies it, including a `*` grant.
+- `"*"` in `adminRoles` is not a wildcard. Roles are compared exactly, so it only matches a role literally named `*`. A wildcard would hand the proxy to any role an upstream identity provider happens to emit.
+- An anonymous identity is always denied, whatever the roles say.
+- The list is part of `serverAuth`, so changing it takes effect on the next [reload](./cli.md#mcp-reload).
+
+See [Reloading a running proxy](../guides/proxy-mode.md#reloading-a-running-proxy) for the endpoint.
 
 ### ACL config
 

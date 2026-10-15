@@ -2,10 +2,12 @@ mod acl;
 mod completions;
 mod config;
 mod logs;
+mod reload;
 mod server;
 
 pub use acl::handle_acl_command;
 pub use completions::handle_completions_command;
 pub use config::handle_config_command;
 pub use logs::handle_logs_command;
+pub use reload::handle_reload_command;
 pub use server::{handle_dry_run, handle_server_command};

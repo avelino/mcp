@@ -26,6 +26,7 @@ These variables configure `mcp` behavior:
 | `MCP_AUTH_SERVER_CONFIG` | — | Inline JSON of the OAuth Authorization Server state (`auth_server.json`). Same precedence model as `MCP_AUTH_CONFIG`: read-only on disk, mutable in memory. Used when `serverAuth.providers` includes `"oauth_as"`. |
 | `MCP_AUTH_SERVER_PATH` | `~/.config/mcp/auth_server.json` | File path for AS state (registered DCR clients + refresh tokens). Used when `serverAuth.providers` includes `"oauth_as"`. |
 | `MCP_OAUTH_AS_JWT_SECRET` | — | HMAC-SHA256 signing key for issued JWTs when running the OAuth Authorization Server. Must be ≥ 32 bytes. Typically referenced from `serverAuth.oauthAs.jwtSecret` via `${MCP_OAUTH_AS_JWT_SECRET}`. Rotation invalidates every previously issued token. |
+| `MCP_ADMIN_TOKEN` | — | Bearer token sent by `mcp reload --url` to `POST /reload`. Must belong to an identity with a role listed in `serverAuth.adminRoles`. |
 
 ### Config loading priority
 
@@ -301,6 +302,18 @@ export MCP_OAUTH_AS_JWT_SECRET=$(openssl rand -hex 32)
 Reference it from `serverAuth.oauthAs.jwtSecret` via `${MCP_OAUTH_AS_JWT_SECRET}` so the secret never lives in the config file.
 
 > Rotation invalidates every previously issued access and refresh token. v1 has no in-place rotation — plan for a forced re-login when changing the secret.
+
+### `MCP_ADMIN_TOKEN`
+
+Bearer token that [`mcp reload --url`](./cli.md#mcp-reload) sends to the remote proxy. It is an env var and not a flag on purpose: a token on the command line shows up in `ps` and in your shell history.
+
+```bash
+MCP_ADMIN_TOKEN=secret-ops mcp reload --url https://mcp.example.com
+```
+
+The token has to resolve to an identity holding a role from [`serverAuth.adminRoles`](./config-file.md#admin-roles-adminroles). Without it the proxy answers `401`. Unset or empty, no `Authorization` header is sent. Only `--url` reads it.
+
+Sending it over plain HTTP to a host that is not loopback is refused, because the token administers a proxy fronting every configured backend. Use `https`, or pass `--insecure` to accept the risk.
 
 ## Config variables
 

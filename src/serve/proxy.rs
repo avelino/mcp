@@ -302,6 +302,20 @@ pub(crate) type ResolvedPromptGet = (
     server_auth::Decision,
 );
 
+/// What a config swap did to the backend set. Sorted, so a reload's log line
+/// and its `/reload` response body read the same on every run.
+pub(crate) struct ConfigDiff {
+    pub(crate) added: Vec<String>,
+    pub(crate) changed: Vec<String>,
+    pub(crate) removed: Vec<String>,
+}
+
+impl ConfigDiff {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+}
+
 pub(crate) struct ProxyServer {
     pub(crate) configs: HashMap<String, ServerConfig>,
     pub(crate) backends: HashMap<String, BackendState>,
@@ -367,6 +381,70 @@ impl ProxyServer {
             discovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             connect_locks: HashMap::new(),
         }
+    }
+
+    /// Swap in a new config, in place. A backend the new config did not touch
+    /// is left strictly alone — same `Arc<McpClient>`, same child process,
+    /// same `UsageStats` — because the only alternative to an in-place reload
+    /// is a restart, which kills every one of those.
+    ///
+    /// Returns the diff and the clients the **caller** must shut down with the
+    /// proxy lock released: `shutdown()` waits on a child's exit, and waiting
+    /// for that under the lock stalls every in-flight request.
+    ///
+    /// Invalidating the persistent caches (`cache_store`, `classifier_cache`)
+    /// is deliberately *not* done here. Both touch disk, so they belong
+    /// outside the lock too, driven by the returned diff.
+    pub(crate) fn apply_config(
+        &mut self,
+        servers: HashMap<String, ServerConfig>,
+        hashes: HashMap<String, String>,
+    ) -> (ConfigDiff, Vec<(String, Arc<McpClient>)>) {
+        let mut diff = ConfigDiff {
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: Vec::new(),
+        };
+
+        for name in servers.keys() {
+            if !self.configs.contains_key(name) {
+                diff.added.push(name.clone());
+                continue;
+            }
+            // A hash missing on either side is no proof the backend is
+            // unchanged, and serving a stale tool list is the worse failure of
+            // the two, so an unprovable comparison re-discovers.
+            match (self.config_hashes.get(name), hashes.get(name)) {
+                (Some(old), Some(new)) if old == new => {}
+                _ => diff.changed.push(name.clone()),
+            }
+        }
+        for name in self.configs.keys() {
+            if !servers.contains_key(name) {
+                diff.removed.push(name.clone());
+            }
+        }
+        diff.added.sort();
+        diff.changed.sort();
+        diff.removed.sort();
+
+        self.configs = servers;
+        self.config_hashes = hashes;
+
+        let mut clients = Vec::new();
+        for name in diff.changed.iter().chain(diff.removed.iter()) {
+            self.unregister_tools(name);
+            self.unregister_resources(name);
+            self.unregister_prompts(name);
+            self.discovered_backends.remove(name);
+            self.discovery_failures.remove(name);
+            self.connect_locks.remove(name);
+            if let Some(BackendState::Connected { client, .. }) = self.backends.remove(name) {
+                clients.push((name.clone(), client));
+            }
+        }
+
+        (diff, clients)
     }
 
     /// Return (creating on first call) the per-backend connect lock.
@@ -2150,5 +2228,234 @@ mod tests {
             mrtr_continuation_fields(Some(&json!({"inputResponses": {}, "requestState": "s"}))),
             vec!["inputResponses", "requestState"]
         );
+    }
+
+    // --- apply_config (`mcp reload`) ---
+
+    fn hashes(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(name, hash)| (name.to_string(), hash.to_string()))
+            .collect()
+    }
+
+    /// A client that spawns nothing: the CLI transport answers `initialize`
+    /// itself, and a preset tool list keeps `tools/list` off the real command.
+    /// The tests below only ever compare its `Arc` identity.
+    async fn inert_client() -> Arc<McpClient> {
+        let config = ServerConfig::Cli {
+            command: "true".to_string(),
+            cli: true,
+            cli_help: "--help".to_string(),
+            cli_depth: 0,
+            cli_only: vec![],
+            args: vec![],
+            env: HashMap::new(),
+            tools: vec![crate::config::CliToolConfig {
+                name: "noop".to_string(),
+                args: vec![],
+                description: None,
+                input_schema: None,
+            }],
+            tool_acl: None,
+            idle_timeout: crate::config::IdleTimeoutPolicy::default(),
+            min_idle_timeout: None,
+            max_idle_timeout: None,
+        };
+        Arc::new(McpClient::connect(&config).await.unwrap())
+    }
+
+    #[test]
+    fn apply_config_sorts_backends_into_added_changed_and_removed() {
+        let mut server = test_server_with_configs(&["keep", "change", "drop"]);
+        server.config_hashes = hashes(&[("keep", "h1"), ("change", "h2"), ("drop", "h3")]);
+
+        let (diff, clients) = server.apply_config(
+            make_configs(&["keep", "change", "new"]),
+            hashes(&[("keep", "h1"), ("change", "h2-rotated"), ("new", "h4")]),
+        );
+
+        assert_eq!(diff.added, vec!["new"]);
+        assert_eq!(diff.changed, vec!["change"]);
+        assert_eq!(diff.removed, vec!["drop"]);
+        assert!(!diff.is_empty());
+        assert!(clients.is_empty());
+    }
+
+    /// A hash we cannot compare is not proof that a backend is unchanged, and
+    /// serving a stale tool list is the worse of the two failures.
+    #[test]
+    fn apply_config_counts_a_missing_hash_as_changed() {
+        let mut server = test_server_with_configs(&["only-old", "only-new", "neither"]);
+        server.config_hashes = hashes(&[("only-old", "h")]);
+
+        let (diff, _) = server.apply_config(
+            make_configs(&["only-old", "only-new", "neither"]),
+            hashes(&[("only-new", "h")]),
+        );
+
+        assert_eq!(diff.changed, vec!["neither", "only-new", "only-old"]);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+    }
+
+    /// The whole point of the feature: a backend the new config did not touch
+    /// keeps its client, its child process and its usage stats. The
+    /// alternative is a restart, which kills all three.
+    #[tokio::test]
+    async fn apply_config_leaves_an_untouched_backend_alone() {
+        let mut server = test_server_with_configs(&["keep"]);
+        server.config_hashes = hashes(&[("keep", "h1")]);
+        let client = inert_client().await;
+        let mut usage_stats = UsageStats::new();
+        usage_stats.record_request();
+        usage_stats.record_request();
+        server.backends.insert(
+            "keep".to_string(),
+            BackendState::Connected {
+                client: Arc::clone(&client),
+                usage_stats,
+            },
+        );
+        server.discovered_backends.insert("keep".to_string());
+        server.register_tools("keep", &[tool("search")]);
+
+        let (diff, clients) =
+            server.apply_config(make_configs(&["keep"]), hashes(&[("keep", "h1")]));
+
+        assert!(diff.is_empty());
+        assert!(clients.is_empty());
+        match server.backends.get("keep") {
+            Some(BackendState::Connected {
+                client: still,
+                usage_stats,
+            }) => {
+                assert!(Arc::ptr_eq(still, &client));
+                assert_eq!(usage_stats.request_count, 2);
+            }
+            _ => panic!("keep must still be connected"),
+        }
+        assert!(server.discovered_backends.contains("keep"));
+        assert!(server.tool_map.contains_key("keep__search"));
+    }
+
+    #[tokio::test]
+    async fn a_changed_backend_hands_its_client_back_for_shutdown() {
+        let mut server = test_server_with_configs(&["gh"]);
+        server.config_hashes = hashes(&[("gh", "h1")]);
+        let client = inert_client().await;
+        server.backends.insert(
+            "gh".to_string(),
+            BackendState::Connected {
+                client: Arc::clone(&client),
+                usage_stats: UsageStats::new(),
+            },
+        );
+        server.discovered_backends.insert("gh".to_string());
+        server.connect_lock_for("gh");
+
+        let (diff, clients) = server.apply_config(make_configs(&["gh"]), hashes(&[("gh", "h2")]));
+
+        assert_eq!(diff.changed, vec!["gh"]);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].0, "gh");
+        assert!(Arc::ptr_eq(&clients[0].1, &client));
+        assert!(!server.backends.contains_key("gh"));
+        assert!(!server.connect_locks.contains_key("gh"));
+        // Still configured, so the next discovery pass picks it up again.
+        assert!(server.is_backend_undiscovered("gh"));
+    }
+
+    #[test]
+    fn a_removed_backend_leaves_no_trace_in_the_registry() {
+        let mut server = test_server_with_configs(&["gh", "keep"]);
+        server.config_hashes = hashes(&[("gh", "h1"), ("keep", "h2")]);
+        server.register_tools("gh", &[tool("issue")]);
+        server.register_resources(
+            "gh",
+            &[Resource {
+                uri: "repo://x".to_string(),
+                name: "Repo".to_string(),
+                description: None,
+                mime_type: None,
+                annotations: None,
+            }],
+        );
+        server.register_prompts(
+            "gh",
+            &[Prompt {
+                name: "review".to_string(),
+                description: None,
+                arguments: None,
+            }],
+        );
+        server.register_tools("keep", &[tool("search")]);
+        server.discovered_backends.insert("gh".to_string());
+        server
+            .discovery_failures
+            .insert("gh".to_string(), DiscoveryFailure::new());
+
+        let (diff, _) = server.apply_config(make_configs(&["keep"]), hashes(&[("keep", "h2")]));
+
+        assert_eq!(diff.removed, vec!["gh"]);
+        assert!(!server.configs.contains_key("gh"));
+        assert!(!server.config_hashes.contains_key("gh"));
+        assert!(server.tools.iter().all(|t| !t.name.starts_with("gh__")));
+        assert!(!server.tool_map.contains_key("gh__issue"));
+        assert!(server.resources.iter().all(|r| !r.uri.starts_with("gh__")));
+        assert!(!server.resource_map.contains_key("gh__repo://x"));
+        assert!(server.prompts.iter().all(|p| !p.name.starts_with("gh__")));
+        assert!(!server.prompt_map.contains_key("gh__review"));
+        assert!(!server.classifications.contains_key("gh__issue"));
+        assert!(!server.discovered_backends.contains("gh"));
+        assert!(!server.discovery_failures.contains_key("gh"));
+        // The backend the reload did not touch keeps its registration.
+        assert!(server.tool_map.contains_key("keep__search"));
+    }
+
+    /// Replacing `configs` without replacing `config_hashes` would make the
+    /// second apply report a change that never happened.
+    #[tokio::test]
+    async fn applying_the_same_config_twice_is_a_no_op() {
+        let mut server = test_server_with_configs(&["gh"]);
+        server.config_hashes = hashes(&[("gh", "h1")]);
+        let client = inert_client().await;
+        server.backends.insert(
+            "gh".to_string(),
+            BackendState::Connected {
+                client: Arc::clone(&client),
+                usage_stats: UsageStats::new(),
+            },
+        );
+
+        for _ in 0..2 {
+            let (diff, clients) =
+                server.apply_config(make_configs(&["gh"]), hashes(&[("gh", "h1")]));
+            assert!(diff.is_empty());
+            assert!(clients.is_empty());
+        }
+
+        match server.backends.get("gh") {
+            Some(BackendState::Connected { client: still, .. }) => {
+                assert!(Arc::ptr_eq(still, &client));
+            }
+            _ => panic!("gh must still be connected"),
+        }
+    }
+
+    #[test]
+    fn an_added_backend_lands_in_configs_awaiting_discovery() {
+        let mut server = test_server();
+
+        let (diff, clients) = server.apply_config(make_configs(&["new"]), hashes(&[("new", "h1")]));
+
+        assert_eq!(diff.added, vec!["new"]);
+        assert!(clients.is_empty());
+        assert!(server.configs.contains_key("new"));
+        assert_eq!(
+            server.config_hashes.get("new").map(String::as_str),
+            Some("h1")
+        );
+        assert!(server.is_backend_undiscovered("new"));
     }
 }

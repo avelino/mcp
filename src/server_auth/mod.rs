@@ -112,6 +112,9 @@ pub struct ServerAuthConfig {
     pub oauth_as: Option<OAuthAsConfig>,
     #[serde(default)]
     pub acl: Option<AclConfig>,
+    /// Roles allowed to reload the proxy's config. See [`is_reload_allowed`].
+    #[serde(default, rename = "adminRoles")]
+    pub admin_roles: Vec<String>,
 }
 
 /// A single bearer token entry. Accepts two shapes for backwards compatibility:
@@ -278,6 +281,50 @@ pub fn is_tool_allowed(
             access_evaluated: None,
         },
     }
+}
+
+/// Outcome of the reload-endpoint gate.
+///
+/// Three-valued rather than a bool because the transport answers each case
+/// differently: `Disabled` is a 404 — an operator who never set `adminRoles`
+/// is not told that an administrative route exists at all — while `Denied` is
+/// a 403 and `Allowed` lets the reload run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReloadGate {
+    Disabled,
+    Denied,
+    Allowed,
+}
+
+/// Fail-closed gate for the reload endpoint.
+///
+/// Reload replaces the config of a proxy that is serving every other client,
+/// so [`ServerAuthConfig::admin_roles`] is the only thing that grants it. The
+/// ACL is deliberately not consulted: a role with write access to tools must
+/// not be able to escalate into administering the proxy.
+///
+/// An anonymous caller never passes, even with `adminRoles` set. With
+/// `providers: ["none"]` every request arrives anonymous, and a proxy that
+/// authenticates nobody cannot be allowed to reload config over HTTP.
+///
+/// Roles are compared exactly, as the ACL rule matcher does, and no wildcard
+/// is honored here — `"*"` in `adminRoles` would hand the proxy to any role
+/// an upstream identity provider happens to emit.
+pub fn is_reload_allowed(identity: &AuthIdentity, config: &ServerAuthConfig) -> ReloadGate {
+    if config.admin_roles.is_empty() {
+        return ReloadGate::Disabled;
+    }
+    if identity.is_anonymous() {
+        return ReloadGate::Denied;
+    }
+    if identity
+        .roles
+        .iter()
+        .any(|r| config.admin_roles.contains(r))
+    {
+        return ReloadGate::Allowed;
+    }
+    ReloadGate::Denied
 }
 
 #[cfg(test)]
@@ -547,5 +594,180 @@ mod tests {
         let cfg: ForwardedConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.header, "x-user");
         assert_eq!(cfg.groups_header, "x-groups");
+    }
+
+    // -----------------------------------------------------------------------
+    // Reload gate
+    // -----------------------------------------------------------------------
+
+    /// Legacy ACL that grants a role unrestricted tool access, used to prove
+    /// that such a grant still does not buy reload.
+    fn acl_granting_all_tools_to(role: &str) -> AclConfig {
+        AclConfig::legacy(
+            AclPolicy::Deny,
+            vec![AclRule {
+                subjects: vec![],
+                roles: vec![role.to_string()],
+                tools: vec!["*".to_string()],
+                policy: AclPolicy::Allow,
+            }],
+        )
+    }
+
+    #[test]
+    fn test_reload_gate_disabled_when_admin_roles_empty() {
+        let config = ServerAuthConfig::default();
+        let id = AuthIdentity::new("alice", vec!["admin".to_string()]);
+        assert_eq!(
+            is_reload_allowed(&id, &config),
+            ReloadGate::Disabled,
+            "an operator who never set adminRoles gets no reload surface"
+        );
+    }
+
+    #[test]
+    fn test_reload_gate_denies_anonymous_even_with_admin_roles_configured() {
+        // `providers: ["none"]` makes every caller anonymous. A proxy that
+        // authenticates nobody must never reload config over HTTP.
+        let config = ServerAuthConfig {
+            providers: vec!["none".to_string()],
+            admin_roles: vec!["admin".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            is_reload_allowed(&AuthIdentity::anonymous(), &config),
+            ReloadGate::Denied
+        );
+    }
+
+    #[test]
+    fn test_reload_gate_disabled_for_anonymous_when_admin_roles_empty() {
+        let config = ServerAuthConfig::default();
+        assert_eq!(
+            is_reload_allowed(&AuthIdentity::anonymous(), &config),
+            ReloadGate::Disabled
+        );
+    }
+
+    #[test]
+    fn test_reload_gate_denies_authenticated_identity_with_no_roles() {
+        let config = ServerAuthConfig {
+            admin_roles: vec!["admin".to_string()],
+            ..Default::default()
+        };
+        let id = AuthIdentity::new("alice", vec![]);
+        assert_eq!(is_reload_allowed(&id, &config), ReloadGate::Denied);
+    }
+
+    #[test]
+    fn test_reload_gate_denies_non_intersecting_roles() {
+        let config = ServerAuthConfig {
+            admin_roles: vec!["admin".to_string(), "ops".to_string()],
+            ..Default::default()
+        };
+        let id = AuthIdentity::new("alice", vec!["dev".to_string(), "oncall".to_string()]);
+        assert_eq!(is_reload_allowed(&id, &config), ReloadGate::Denied);
+    }
+
+    #[test]
+    fn test_reload_gate_ignores_tool_acl_grants() {
+        // Escalation guard: `writer` can call every tool, including write
+        // ones, and still cannot administer the proxy.
+        let acl = acl_granting_all_tools_to("writer");
+        let id = AuthIdentity::new("alice", vec!["writer".to_string()]);
+        let acl_opt = Some(acl);
+        assert!(
+            is_tool_allowed(&id, "roam__create_page", &acl_opt, None).allowed,
+            "fixture must actually grant write tool access"
+        );
+
+        let config = ServerAuthConfig {
+            providers: vec!["bearer".to_string()],
+            admin_roles: vec!["admin".to_string()],
+            acl: acl_opt,
+            ..Default::default()
+        };
+        assert_eq!(is_reload_allowed(&id, &config), ReloadGate::Denied);
+    }
+
+    #[test]
+    fn test_reload_gate_role_comparison_is_exact() {
+        let config = ServerAuthConfig {
+            admin_roles: vec!["admin".to_string()],
+            ..Default::default()
+        };
+        for near_miss in ["Admin", "ADMIN", "admins", "adm", " admin"] {
+            let id = AuthIdentity::new("alice", vec![near_miss.to_string()]);
+            assert_eq!(
+                is_reload_allowed(&id, &config),
+                ReloadGate::Denied,
+                "role {near_miss:?} must not match adminRoles entry \"admin\""
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_without_admin_roles_key_disables_reload() {
+        // Backwards-compat: every config already in production lacks the key.
+        let json = r#"{
+            "providers": ["bearer"],
+            "bearer": { "tokens": { "tok-1": "alice" } }
+        }"#;
+        let config: ServerAuthConfig = serde_json::from_str(json).unwrap();
+        assert!(config.admin_roles.is_empty());
+        let id = AuthIdentity::new("alice", vec!["admin".to_string()]);
+        assert_eq!(is_reload_allowed(&id, &config), ReloadGate::Disabled);
+    }
+
+    #[test]
+    fn test_config_with_explicit_empty_admin_roles_disables_reload() {
+        let json = r#"{"providers":["bearer"],"adminRoles":[]}"#;
+        let config: ServerAuthConfig = serde_json::from_str(json).unwrap();
+        assert!(config.admin_roles.is_empty());
+        let id = AuthIdentity::new("alice", vec!["admin".to_string()]);
+        assert_eq!(is_reload_allowed(&id, &config), ReloadGate::Disabled);
+    }
+
+    #[test]
+    fn test_admin_roles_json_key_is_camel_case() {
+        // Pins the wire name: the rest of the schema is camelCase
+        // (`oauthAs`, `strictClassification`), so a snake_case key must not
+        // be what grants admin.
+        let camel = r#"{"adminRoles":["admin","ops"]}"#;
+        let config: ServerAuthConfig = serde_json::from_str(camel).unwrap();
+        assert_eq!(
+            config.admin_roles,
+            vec!["admin".to_string(), "ops".to_string()]
+        );
+
+        let snake = r#"{"admin_roles":["admin"]}"#;
+        let config: ServerAuthConfig = serde_json::from_str(snake).unwrap();
+        assert!(
+            config.admin_roles.is_empty(),
+            "`admin_roles` is not the wire name and must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_reload_gate_allows_admin_role() {
+        let config = ServerAuthConfig {
+            admin_roles: vec!["admin".to_string()],
+            ..Default::default()
+        };
+        let id = AuthIdentity::new("alice", vec!["admin".to_string()]);
+        assert_eq!(is_reload_allowed(&id, &config), ReloadGate::Allowed);
+    }
+
+    #[test]
+    fn test_reload_gate_allows_when_one_of_several_roles_matches() {
+        let config = ServerAuthConfig {
+            admin_roles: vec!["ops".to_string()],
+            ..Default::default()
+        };
+        let id = AuthIdentity::new(
+            "alice",
+            vec!["dev".to_string(), "ops".to_string(), "oncall".to_string()],
+        );
+        assert_eq!(is_reload_allowed(&id, &config), ReloadGate::Allowed);
     }
 }

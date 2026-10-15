@@ -22,6 +22,7 @@ use crate::server_auth::NoAuth;
 
 use super::http::test_router;
 use super::proxy::{ProxyServer, SharedProxy};
+use super::reload::{AuthSnapshot, ReloadContext};
 
 /// A live server on a loopback port, plus the URL of its `/mcp` endpoint.
 struct TestServer {
@@ -33,7 +34,8 @@ struct TestServer {
 impl TestServer {
     async fn start(proxy: SharedProxy) -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let app = test_router(proxy, Arc::new(NoAuth), None, rx);
+        let auth = AuthSnapshot::new(Arc::new(NoAuth), None, Vec::new()).shared();
+        let app = test_router(proxy, auth, ReloadContext::default(), rx);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

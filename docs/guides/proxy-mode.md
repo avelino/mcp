@@ -205,6 +205,7 @@ mcp serve --http 0.0.0.0:9090 --insecure
 | `GET` | `/mcp` | SSE stream (same as `/mcp/sse`, for backward compatibility) |
 | `GET` | `/mcp/sse` | SSE stream (old HTTP+SSE transport) |
 | `GET` | `/health` | Health check (JSON) |
+| `POST` | `/reload` | Reload config from disk (off unless `serverAuth.adminRoles` is set, see [Reloading](#reloading-a-running-proxy)) |
 
 The proxy supports both the **Streamable HTTP** transport and the older **HTTP+SSE** transport for backward compatibility. See [Protocol revisions](#protocol-revisions) for which MCP revisions each speaks.
 
@@ -270,6 +271,58 @@ Returns the proxy status, including backend pool size and live client sessions:
 ```
 
 `active_clients` is the number of SSE sessions currently registered. Combined with `backends_connected`, this is the metric that proves the proxy is doing its job: **N clients sharing M backends, not N × M processes**. If you ever see `backends_connected` grow proportionally to `active_clients`, something is wrong (clients should be hitting the proxy, not bypassing it to spawn their own backends).
+
+### Reloading a running proxy
+
+The proxy reads `servers.json` once, at boot. To pick up an `mcp add`, an edit to the file or a changed `serverAuth` without restarting (which kills every stdio backend and every open session), reload it. Two ways in:
+
+- **`SIGHUP`** on the process. `mcp reload` finds local proxies and sends it for you.
+- **`POST /reload`** for a proxy you reach over the network. `mcp reload --url <url>` calls it.
+
+Both run the same reload. The new config is parsed and validated whole before anything changes. If it is rejected (bad JSON, a `serverAuth` that does not build), the proxy logs the error and keeps serving the old config. Backends whose config did not change keep their process and usage stats. See [`mcp reload`](../reference/cli.md#mcp-reload) for what is reloaded and what still needs a restart.
+
+#### POST /reload
+
+Only available when `serverAuth.adminRoles` lists at least one role. Without it the route answers `404`, on purpose: an operator who did not opt in gets no write endpoint and no hint that one exists.
+
+| Status | Meaning |
+|--------|---------|
+| `404` | Disabled: `adminRoles` is empty or absent |
+| `401` | No credentials, or credentials that did not authenticate |
+| `403` | Authenticated, but no role in `adminRoles` |
+| `200` | Reloaded |
+| `500` | The new config was rejected. The proxy keeps serving the previous one |
+
+A `500` answers `{"reloaded": false, "error": "<message>"}`, and the proxy logs the same error on stderr. A `403` answers `{"error": "reload requires one of serverAuth.adminRoles"}`. A `404` answers `{"error": "not found"}`, byte for byte what the router's fallback answers for any unrouted path, so a probe learns nothing about whether the route exists.
+
+```bash
+curl -X POST http://127.0.0.1:8080/reload \
+  -H "Authorization: Bearer $MCP_ADMIN_TOKEN"
+```
+
+```json
+{
+  "reloaded": true,
+  "added": ["novo"],
+  "changed": ["roam", "grafana"],
+  "removed": [],
+  "tools": 148,
+  "requires_restart": []
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `added`, `changed`, `removed` | Server names in the diff between the old and new config |
+| `tools` | Tools published after the reload |
+| `requires_restart` | Changes that were **not** applied because they are fixed at boot. Values are `"audit.output"` and `"serverAuth.providers.oauth_as"` |
+
+Two security decisions worth knowing:
+
+- **A tool grant never implies reload.** An identity with `*` on every tool still gets `403` unless one of its roles is in `adminRoles`.
+- **`"*"` in `adminRoles` is not a wildcard.** It matches only a role literally named `*`.
+
+Reloads are audited as `config/reload`, with the caller's identity.
 
 ### Graceful shutdown
 

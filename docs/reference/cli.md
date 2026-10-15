@@ -299,6 +299,111 @@ The HTTP server handles `SIGTERM` and `SIGINT` (Ctrl+C) gracefully: stops accept
 
 See **[Proxy mode guide](../guides/proxy-mode.md)** for full details, client configuration examples, and team setup.
 
+### `mcp reload`
+
+Apply a config change to proxies that are already running.
+
+```bash
+mcp reload                          # validate, refresh caches, signal local proxies
+mcp reload --url http://host:8080   # also reload a remote proxy via POST /reload
+mcp reload --json                   # report as JSON
+```
+
+`--url` sends `MCP_ADMIN_TOKEN` as a bearer token. Over plain HTTP to a host that is not loopback, that send is refused: the token administers a proxy fronting every configured backend, so leaking it is worse than a failed reload. Use `https`, or pass `--insecure` to accept the risk.
+
+`mcp serve` reads `servers.json` once, at boot. `mcp add foo` or an edit to the file does not reach a proxy that is already running. Restarting it works, but kills every stdio backend child and every open session. `mcp reload` avoids that.
+
+In order. Only step 1 aborts the command, because every later step assumes a valid config. Steps 2 to 5 all run, and failures among them are reported together at the end:
+
+1. **Validate** the config and report the server count and any [reserved-name](./config-file.md#reserved-names) conflicts. An invalid config exits non-zero and nothing else runs.
+2. **Evict stale cache entries.** Tool-cache entries are dropped when their config hash no longer matches, or when their server left the config. Classifier cache entries go with them, plus any entry for a server the config no longer knows: a classification outlives its tool cache entry, so without that second sweep a removed server would keep entries in `tool-classification.json` forever.
+3. **Rewrite installed completions.** Only files that already exist (fish and zsh). It never creates one, and never touches `.bashrc`.
+4. **Signal every local proxy** with `SIGHUP`.
+5. With `--url`, **`POST <url>/reload`** to a remote proxy, with the token from [`MCP_ADMIN_TOKEN`](./environment-variables.md#mcp_admin_token). `--url` adds to the local step, it does not replace it. See [Reloading a running proxy](../guides/proxy-mode.md#reloading-a-running-proxy) for the endpoint.
+
+#### What a running proxy reloads
+
+- **Servers.** The proxy diffs the new config against the old one. A backend whose config did not change is not touched: same child process, same usage stats. Added backends are discovered, changed ones are shut down and reconnected with the new config, removed ones are shut down.
+- **`serverAuth`.** Providers, ACL and `adminRoles` are swapped in one step. If the new `serverAuth` fails to build, the reload is rejected and the old auth stays in place.
+- **Tool cache and classifier cache**, for backends that changed or were removed.
+
+If the new config is invalid, the proxy keeps serving the old one.
+
+#### What still needs a restart
+
+Some state is fixed at boot. A reload applies everything else and lists these under `requires_restart` instead of claiming it applied them:
+
+| Reported as | Change | Why |
+|-------------|--------|-----|
+| `serverAuth.providers.oauth_as` | Turning `oauth_as` on or off | Its router is mounted at boot |
+| `audit.output` | A different audit destination | The database pool and the logger are opened at boot |
+
+The bind address is not in that list: it comes from `--http`, not from the config file, so reloading the file can never change it.
+
+#### Filters are kept
+
+A proxy started with `--only` or `--exclude` re-applies the same filter on every reload. A reload never makes it publish a backend it was told to hide.
+
+#### How local proxies are found
+
+Each `mcp serve` writes `<pid>.json` in `~/.config/mcp/instances/` (mode `0700`) and holds an `flock` on it until it exits. The lock proves the proxy is alive, not the pid: the kernel drops the lock when the process dies, however it dies. A leftover file whose lock is free is removed, and a recycled pid never gets a signal. That matters because the default action of `SIGHUP` is to terminate the process.
+
+Signal-based reload is Unix only. On other platforms use `--url`.
+
+#### Output
+
+```
+config     /Users/you/.config/mcp/servers.json (9 servers)
+caches     2 evicted: roam, grafana, 14 classifications dropped
+shell      fish /Users/you/.config/fish/completions/mcp.fish
+instance   http 127.0.0.1:7332 pid 4121 reloaded
+instance   http 127.0.0.1:7333 pid 4188 reloaded
+remote     http://proxy.internal:8080/reload +1 ~2 -0, 148 tools
+```
+
+The `remote` summary reads `+added ~changed -removed`. When the proxy reports `requires_restart`, it appends `, N change(s) need a restart`. The `shell` line appears once per rewritten file. With no proxy running the `instance` line reads `none running`.
+
+With `--json`:
+
+```json
+{
+  "config_path": "/Users/you/.config/mcp/servers.json",
+  "servers": 9,
+  "caches": {
+    "evicted": ["roam", "grafana"],
+    "classifications_forgotten": 14
+  },
+  "completions": [
+    { "shell": "fish", "path": "/Users/you/.config/fish/completions/mcp.fish" }
+  ],
+  "instances": [
+    { "pid": 4121, "target": "http 127.0.0.1:7332", "reloaded": true }
+  ],
+  "remote": {
+    "url": "http://proxy.internal:8080/reload",
+    "authenticated": true,
+    "status": 200,
+    "body": {
+      "reloaded": true,
+      "added": ["novo"],
+      "changed": ["roam", "grafana"],
+      "removed": [],
+      "tools": 148,
+      "requires_restart": []
+    }
+  }
+}
+```
+
+`name_conflicts`, `completions` and `remote` are left out when empty or unused. `reloaded: false` on an instance carries an `error` string. `authenticated` says whether the request carried a token, which is what tells a 401 apart from a rejected token.
+
+`SIGHUP` is asynchronous: `reloaded: true` means the signal was delivered, not that the proxy accepted the new config. A proxy that rejects the config logs it and keeps serving the old one. Check with `mcp reload --url` (which returns the result) or `GET /health`.
+
+#### Exit status
+
+- `0`: config is valid and every targeted proxy was reached. Finding **no** running proxy is a success: caches and completions were still refreshed, and the next `mcp serve` reads the new config.
+- non-zero: the config is invalid, a local proxy could not be signalled, or `--url` failed to connect or answered a non-2xx status. A non-2xx answer is explained in the error: `401` names `MCP_ADMIN_TOKEN`, `403` names `serverAuth.adminRoles`, and `404` says reload is disabled on that proxy.
+
 ## Registry commands
 
 ### `mcp search <query>`
@@ -323,7 +428,7 @@ mcp add filesystem
 Fails if:
 - Server not found in registry
 - Server already exists in config
-- Name is reserved (`search`, `add`, `remove`, `update`, `list`, `help`, `version`, `serve`, `logs`, `acl`, `config`, `completions`, `healthcheck`)
+- Name is reserved (`search`, `add`, `remove`, `update`, `list`, `help`, `version`, `serve`, `logs`, `acl`, `config`, `completions`, `healthcheck`, `reload`)
 
 ### `mcp add --url <url> <name>`
 

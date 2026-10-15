@@ -134,6 +134,7 @@ Tokens are saved in `~/.config/mcp/auth.json` and refreshed automatically.
 | `mcp remove <name>` | Remove a server |
 | `mcp update <name>` | Refresh a server's config from the registry (preserves your customizations) |
 | `mcp serve` | Start proxy — all servers as one MCP endpoint |
+| `mcp reload` | Apply config changes to running proxies without restarting them |
 | `mcp logs` | Show audit log entries |
 | `mcp logs --errors` | Show only failures |
 | `mcp logs -f` | Follow mode — stream new entries live |

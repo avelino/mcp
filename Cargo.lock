@@ -1145,6 +1145,7 @@ dependencies = [
  "dirs 7.0.0",
  "indicatif",
  "jsonwebtoken",
+ "libc",
  "open",
  "opentelemetry",
  "opentelemetry-otlp",

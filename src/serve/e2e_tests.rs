@@ -42,6 +42,7 @@ use crate::server_auth::NoAuth;
 
 use super::http::test_router;
 use super::proxy::{ProxyServer, SharedProxy};
+use super::reload::{AuthSnapshot, ReloadContext};
 
 /// Session id the harness hands out on every response, exactly like every
 /// pre-2026-07-28 peer does. It exists so "the new client sends no
@@ -461,7 +462,8 @@ async fn proxy_with_stateless_backend(backend_url: &str) -> SharedProxy {
 async fn start_with(proxy: SharedProxy, backend_seen: BackendLog) -> Harness {
     let seen: SeenRequests = Arc::new(StdMutex::new(Vec::new()));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let app = test_router(proxy, Arc::new(NoAuth), None, shutdown_rx).layer(
+    let auth = AuthSnapshot::new(Arc::new(NoAuth), None, Vec::new()).shared();
+    let app = test_router(proxy, auth, ReloadContext::default(), shutdown_rx).layer(
         axum::middleware::from_fn_with_state(Arc::clone(&seen), observe),
     );
 

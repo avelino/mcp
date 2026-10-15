@@ -10,17 +10,28 @@ mod e2e_conformance_tests;
 mod e2e_tests;
 mod http;
 pub(crate) mod proxy;
+mod reload;
+#[cfg(test)]
+mod reload_tests;
 mod stdio;
 
 use crate::config::Config;
+use crate::instances::InstanceFilter;
 use anyhow::Result;
 
 pub use http::run_http;
 pub use stdio::run_stdio;
 
-pub async fn run(config: Config, http_addr: Option<&str>, insecure: bool) -> Result<()> {
+/// `config` arrives already narrowed by `filter`; the filter travels alongside
+/// it so a reload can re-apply the same narrowing to the config it re-reads.
+pub async fn run(
+    config: Config,
+    http_addr: Option<&str>,
+    insecure: bool,
+    filter: InstanceFilter,
+) -> Result<()> {
     match http_addr {
-        Some(addr) => run_http(config, addr, insecure).await,
-        None => run_stdio(config).await,
+        Some(addr) => run_http(config, addr, insecure, filter).await,
+        None => run_stdio(config, filter).await,
     }
 }
