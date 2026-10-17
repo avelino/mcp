@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::DbPool;
@@ -17,14 +18,63 @@ pub struct BackendToolCache {
 #[derive(Clone)]
 pub struct ToolCacheStore {
     pool: Arc<DbPool>,
+    /// JSON-file fallback used when ChronDB is unavailable (no prebuilt
+    /// library for the platform, e.g. Windows). One `<backend>.json` per
+    /// backend. `None` keeps the old behaviour: no persistent cache.
+    file_dir: Option<PathBuf>,
 }
 
 impl ToolCacheStore {
     pub fn new(pool: Arc<DbPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            file_dir: None,
+        }
+    }
+
+    /// Persist the cache as JSON files under `<config dir>/tool-cache/` when
+    /// the database is unavailable, so a proxy restart still serves tools
+    /// instantly instead of blocking on full discovery. No-op when the
+    /// database works.
+    pub fn with_file_fallback(mut self) -> Self {
+        if self.pool.acquire().is_err() {
+            match crate::config::config_dir() {
+                Ok(dir) => {
+                    let dir = dir.join("tool-cache");
+                    match std::fs::create_dir_all(&dir) {
+                        Ok(()) => self.file_dir = Some(dir),
+                        Err(e) => eprintln!("[cache] file fallback unavailable: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[cache] file fallback unavailable: {e}"),
+            }
+        }
+        self
+    }
+
+    fn file_path(&self, name: &str) -> Option<PathBuf> {
+        // Backend names come from the user's config; keep them to one path
+        // component so a name can never point outside the cache dir.
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.file_dir
+            .as_ref()
+            .map(|d| d.join(format!("{safe}.json")))
     }
 
     pub fn load_backend(&self, name: &str) -> Option<BackendToolCache> {
+        if let Some(path) = self.file_path(name) {
+            let text = std::fs::read_to_string(path).ok()?;
+            return serde_json::from_str(&text).ok();
+        }
         let db = self.pool.acquire().ok()?;
         let key = format!("{KEY_PREFIX}{name}");
         let val = db.get(&key, None).ok()?;
@@ -32,6 +82,22 @@ impl ToolCacheStore {
     }
 
     pub fn save_backend(&self, name: &str, entry: &BackendToolCache) {
+        if let Some(path) = self.file_path(name) {
+            let text = match serde_json::to_string(entry) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[cache] failed to serialize cache for {name}: {e}");
+                    return;
+                }
+            };
+            // Write-then-rename so a crash mid-write never leaves a torn file
+            // that would be served on the next start.
+            let tmp = path.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
+                eprintln!("[cache] failed to save cache for {name}: {e}");
+            }
+            return;
+        }
         let db = match self.pool.acquire() {
             Ok(db) => db,
             Err(e) => {
@@ -55,6 +121,14 @@ impl ToolCacheStore {
     /// Drops a backend's cached tool list. Failures are logged, not
     /// propagated: a missing key or unavailable db must not fail a reload.
     pub fn delete_backend(&self, name: &str) {
+        if let Some(path) = self.file_path(name) {
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[cache] failed to delete cache for {name}: {e}");
+                }
+            }
+            return;
+        }
         let db = match self.pool.acquire() {
             Ok(db) => db,
             Err(e) => {
@@ -79,6 +153,21 @@ impl ToolCacheStore {
     /// shape belongs to the storage layer, so an unrecognized shape yields an
     /// empty list instead of failing the reload that asked.
     pub fn list_cached_backends(&self) -> Vec<String> {
+        if let Some(dir) = &self.file_dir {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|f| f.strip_suffix(".json"))
+                        .map(str::to_string)
+                })
+                .collect();
+            names.sort();
+            return names;
+        }
         let Ok(db) = self.pool.acquire() else {
             return Vec::new();
         };
@@ -167,6 +256,38 @@ mod tests {
         let store = ToolCacheStore::new(Arc::new(DbPool::disabled()));
         store.delete_backend("grafana");
         assert!(store.load_backend("grafana").is_none());
+    }
+
+    #[test]
+    fn file_fallback_round_trips_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ToolCacheStore::new(Arc::new(DbPool::disabled()));
+        store.file_dir = Some(dir.path().to_path_buf());
+        let entry = BackendToolCache {
+            config_hash: "h1".to_string(),
+            tools: vec![],
+            cached_at: "now".to_string(),
+        };
+        store.save_backend("kicad-yaz", &entry);
+        assert_eq!(store.load_backend("kicad-yaz").unwrap().config_hash, "h1");
+        assert_eq!(store.list_cached_backends(), vec!["kicad-yaz"]);
+        let mut hashes = HashMap::new();
+        hashes.insert("kicad-yaz".to_string(), "h2".to_string());
+        assert!(
+            store.load_valid_backends(&hashes).is_empty(),
+            "stale hash must not load"
+        );
+        store.delete_backend("kicad-yaz");
+        assert!(store.load_backend("kicad-yaz").is_none());
+    }
+
+    #[test]
+    fn file_fallback_keeps_names_inside_the_cache_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ToolCacheStore::new(Arc::new(DbPool::disabled()));
+        store.file_dir = Some(dir.path().to_path_buf());
+        let path = store.file_path("../evil").unwrap();
+        assert_eq!(path.parent().unwrap(), dir.path());
     }
 
     #[test]

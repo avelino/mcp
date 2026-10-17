@@ -71,7 +71,7 @@ pub async fn run_stdio(mut config: Config, filter: InstanceFilter) -> Result<()>
         Arc::new(crate::db::DbPool::disabled())
     };
     let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
-    let cache_store = ToolCacheStore::new(pool);
+    let cache_store = ToolCacheStore::new(pool).with_file_fallback();
     let mut server = ProxyServer::new(
         Arc::new(audit),
         config.servers.clone(),
