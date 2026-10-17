@@ -471,6 +471,7 @@ mod tests {
 
     /// The gate must respect a backend that pins its own PATH, the same way
     /// the spawn would.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_backend_pinned_path_is_honored() {
         use std::os::unix::fs::PermissionsExt;
