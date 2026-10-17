@@ -805,7 +805,7 @@ fn set_private_cache_hints(result: &mut Value, ttl_ms: u64, stateless_peer: bool
 async fn discover_for_list(proxy: &SharedProxy) -> Arc<AuditLogger> {
     let (needs_discovery, audit) = {
         let p = proxy.lock().await;
-        (p.has_undiscovered_backends(), Arc::clone(&p.audit))
+        (p.has_backends_without_tools(), Arc::clone(&p.audit))
     };
     if needs_discovery {
         discover_pending_backends(proxy).await;
@@ -1310,6 +1310,62 @@ mod tests {
         assert!(
             p.discovery_failures.contains_key("outl"),
             "outl was never discovered — a cached backend suppressed discovery"
+        );
+    }
+
+    /// The background refresh marks cache-loaded backends as undiscovered
+    /// again (`reset_cache_loaded_for_refresh`). A `tools/list` arriving in
+    /// that window must answer from the cache, not block on rediscovering
+    /// every backend: that wait is what the persistent cache is there to avoid.
+    #[tokio::test]
+    async fn test_tools_list_serves_cache_during_background_refresh() {
+        use super::super::proxy::{BackendState, UsageStats};
+        use crate::config::{IdleTimeoutPolicy, ServerConfig};
+
+        let mut server = test_server();
+        server.configs.insert(
+            "cached".to_string(),
+            ServerConfig::Stdio {
+                command: "true".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                tool_acl: None,
+                idle_timeout: IdleTimeoutPolicy::default(),
+                min_idle_timeout: None,
+                max_idle_timeout: None,
+            },
+        );
+        let tool = Tool {
+            name: "lookup".to_string(),
+            description: Some("Lookup".to_string()),
+            input_schema: None,
+            annotations: None,
+        };
+        server.register_tools("cached", std::slice::from_ref(&tool));
+        server.backends.insert(
+            "cached".to_string(),
+            BackendState::Disconnected {
+                cached_tools: vec![tool],
+                usage_stats: UsageStats::new(),
+            },
+        );
+        // State right after reset_cache_loaded_for_refresh: not discovered.
+        assert!(!server.discovered_backends.contains("cached"));
+        assert!(server.has_undiscovered_backends());
+        assert!(!server.has_backends_without_tools());
+
+        let proxy: SharedProxy = Arc::new(Mutex::new(server));
+        let identity = AuthIdentity::anonymous();
+        let req = JsonRpcRequest::new(1, "tools/list", None);
+        let resp = dispatch_request(&proxy, req, &identity, &None, "test", true).await;
+        assert!(resp.error.is_none());
+        let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
+        assert_eq!(tools.len(), 1);
+
+        let p = proxy.lock().await;
+        assert!(
+            !p.discovery_failures.contains_key("cached"),
+            "tools/list blocked on rediscovering a backend it could serve from cache"
         );
     }
 

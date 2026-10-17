@@ -719,6 +719,29 @@ impl ProxyServer {
         })
     }
 
+    /// Like `has_undiscovered_backends`, but ignores backends whose tools are
+    /// already registered from the persistent cache. `tools/list` uses this
+    /// to decide whether it must block: the background refresh marks every
+    /// cache-loaded backend as undiscovered again, and blocking on that
+    /// refresh would throw away the instant answer the cache exists for.
+    pub(crate) fn has_backends_without_tools(&self) -> bool {
+        self.configs.keys().any(|name| {
+            if self.discovered_backends.contains(name) {
+                return false;
+            }
+            if matches!(
+                self.backends.get(name),
+                Some(BackendState::Disconnected { cached_tools, .. }) if !cached_tools.is_empty()
+            ) {
+                return false;
+            }
+            match self.discovery_failures.get(name) {
+                Some(failure) => failure.should_retry(),
+                None => true,
+            }
+        })
+    }
+
     /// Returns true if a **specific** backend needs discovery: it exists in
     /// configs, has not been discovered yet, and is eligible for retry
     /// (respects backoff).  Used by `tools/call` / `resources/read` /
