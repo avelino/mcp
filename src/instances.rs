@@ -88,10 +88,15 @@ impl Drop for InstanceHandle {
     }
 }
 
+// Only the unix registry (`imp`) and its tests use these; Windows has no
+// instance registry yet, so without the cfg they are dead code there and
+// `clippy -D warnings` fails.
+#[cfg(unix)]
 pub fn instances_dir() -> Result<PathBuf> {
     Ok(crate::config::config_dir()?.join("instances"))
 }
 
+#[cfg(unix)]
 fn record_path(pid: u32) -> Result<PathBuf> {
     Ok(instances_dir()?.join(format!("{pid}.json")))
 }

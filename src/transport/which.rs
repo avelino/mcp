@@ -208,6 +208,8 @@ mod tests {
         );
     }
 
+    /// Windows has no executable bit: any existing file counts as runnable.
+    #[cfg(unix)]
     #[test]
     fn reports_a_path_that_exists_but_is_not_executable() {
         let dir = tempfile::tempdir().unwrap();

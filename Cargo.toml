@@ -45,11 +45,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 
-# Unix-only: flock(2) for the instance registry's liveness proof and kill(2)
-# for the SIGHUP that `mcp reload` sends. Both are gated behind cfg(unix).
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # OpenTelemetry — default-off, ativado via OTEL_EXPORTER_OTLP_ENDPOINT.
 # Suporta gRPC (tonic) e HTTP/protobuf (reqwest) — operador escolhe via
 # OTEL_EXPORTER_OTLP_PROTOCOL. Reqwest reutiliza nossa stack já existente.
@@ -73,6 +68,12 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
   "hyper-client",
 ] }
 tracing-opentelemetry = "0.34"
+
+# Unix-only: flock(2) for the instance registry's liveness proof and kill(2)
+# for the SIGHUP that `mcp reload` sends. Both are gated behind cfg(unix).
+# Kept after every shared dependency: anything below this header is unix-only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
