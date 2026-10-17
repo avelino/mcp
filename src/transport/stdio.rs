@@ -52,7 +52,8 @@ impl StdioTransport {
             return Err(e.into());
         }
 
-        let mut cmd = Command::new(command);
+        let program = super::which::program_for_spawn(command, env);
+        let mut cmd = Command::new(&program);
         cmd.args(args)
             .envs(env)
             .stdin(std::process::Stdio::piped())
