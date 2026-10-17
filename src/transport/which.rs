@@ -93,6 +93,47 @@ pub fn resolve_command(
     resolve_command_in(command, path_var)
 }
 
+/// The program to hand to `Command::new` for `command`.
+///
+/// On Windows, `CreateProcess` only appends `.exe` to a bare name, so `npx`,
+/// `uvx` shims and npm-installed tools (`npx.cmd`, `foo.cmd`) fail to spawn
+/// with "program not found" even though `resolve_command` found them. Resolve
+/// a bare, extensionless name through `PATH` + `PATHEXT` here and return the
+/// full path; std spawns `.cmd`/`.bat` through `cmd.exe` with safe quoting.
+/// A PATHEXT match wins over an extensionless file in the same directory,
+/// since that is usually a POSIX shell script (nodejs ships `npx` next to
+/// `npx.cmd`). Unchanged on unix, or when nothing matches.
+pub fn program_for_spawn(command: &str, env: &HashMap<String, String>) -> String {
+    if !cfg!(windows)
+        || command.contains(std::path::MAIN_SEPARATOR)
+        || command.contains('/')
+        || Path::new(command).extension().is_some()
+    {
+        return command.to_string();
+    }
+    let path_var = match env
+        .get("PATH")
+        .map(OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+    {
+        Some(p) if !p.is_empty() => p,
+        _ => return command.to_string(),
+    };
+    let extensions = path_extensions();
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for ext in &extensions {
+            let candidate = dir.join(format!("{command}{ext}"));
+            if is_executable_file(&candidate) {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    command.to_string()
+}
+
 /// The lookup itself, with `PATH` passed in rather than read from the
 /// environment. Tests drive this one: mutating `PATH` for real races with
 /// every other test in the binary, since `std::env` is process-wide.
@@ -208,6 +249,8 @@ mod tests {
         );
     }
 
+    /// Windows has no executable bit: any existing file counts as runnable.
+    #[cfg(unix)]
     #[test]
     fn reports_a_path_that_exists_but_is_not_executable() {
         let dir = tempfile::tempdir().unwrap();
@@ -331,5 +374,30 @@ mod tests {
     #[cfg(not(unix))]
     fn write_executable(path: &Path) {
         std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn program_for_spawn_keeps_explicit_paths_and_extensions() {
+        let env = HashMap::new();
+        assert_eq!(program_for_spawn("tool.exe", &env), "tool.exe");
+        assert_eq!(program_for_spawn("dir/tool", &env), "dir/tool");
+        assert_eq!(program_for_spawn(MISSING, &env), MISSING);
+    }
+
+    /// nodejs ships `npx` (a POSIX script) next to `npx.cmd`; the spawn must
+    /// get the `.cmd`, or CreateProcess reports "program not found".
+    #[cfg(windows)]
+    #[test]
+    fn program_for_spawn_resolves_a_cmd_shim_over_a_bare_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shim"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("shim.cmd"), b"@echo off\n").unwrap();
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        let got = program_for_spawn("shim", &env);
+        assert!(got.to_ascii_lowercase().ends_with("shim.cmd"), "got {got}");
     }
 }

@@ -138,7 +138,8 @@ async fn run_help(
 
     // kill_on_drop ensures a help-probe child is reaped if the timeout fires
     // or the discovery task is cancelled — no orphans from this path.
-    let mut cmd = Command::new(command);
+    let program = crate::transport::which::program_for_spawn(command, env);
+    let mut cmd = Command::new(&program);
     cmd.args(args).arg(help_flag).envs(env).kill_on_drop(true);
 
     let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
