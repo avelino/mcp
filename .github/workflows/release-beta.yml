@@ -1,18 +1,32 @@
 name: Release Beta
 
 on:
-  workflow_run:
+  # CI completes on push to main and on pull_request, including from forks.
+  # `branches` compares the triggering run's head branch name, so a fork PR
+  # opened from a branch named main matches it. workflow_run then runs here,
+  # in this repository, with this repository's token. The job `if` is the
+  # gate that rejects that run. zizmor flags the trigger itself.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: ["CI"]
     branches: [main]
     types: [completed]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   build:
-    if: github.event.workflow_run.conclusion == 'success'
+    # Same-repo push to main whose CI succeeded. A fork fails the repository
+    # check even when its branch is named main; a pull_request fails the
+    # event check. Evaluated before the matrix, so a rejected run checks
+    # nothing out and uploads nothing.
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -45,8 +59,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1 commit shared with the other workflows
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -91,11 +106,23 @@ jobs:
 
   publish:
     needs: build
+    # A job-level `if` replaces the implicit success() check. Keep the build
+    # result in the condition so a skipped or failed matrix does not publish,
+    # and repeat the trust check on the job that holds contents: write.
+    if: >-
+      needs.build.result == 'success'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # delete and create the beta prerelease, including its tag
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -103,9 +130,11 @@ jobs:
 
       - name: Prepare release
         id: prep
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+          SHA=$(echo "$HEAD_SHA" | cut -c1-7)
           TAG="v${VERSION}-beta+${SHA}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -123,6 +152,8 @@ jobs:
       - name: Create beta release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.prep.outputs.tag }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           # Collect all binaries
           FILES=()
@@ -132,19 +163,31 @@ jobs:
             done
           done
 
-          gh release create "${{ steps.prep.outputs.tag }}" \
+          gh release create "$RELEASE_TAG" \
             --prerelease \
-            --title "Beta ${{ steps.prep.outputs.tag }}" \
-            --notes "Automated beta build from main branch (commit ${{ github.event.workflow_run.head_sha }})" \
+            --title "Beta $RELEASE_TAG" \
+            --notes "Automated beta build from main branch (commit $HEAD_SHA)" \
             "${FILES[@]}"
 
   docker:
     needs: build
+    # Same replacement of success() as publish. This job is the one that
+    # pushes to GHCR, so it carries the same trust check on its own.
+    if: >-
+      needs.build.result == 'success'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push ghcr.io/avelino/mcp
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -163,9 +206,11 @@ jobs:
 
       - name: Prepare version
         id: prep
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+          SHA=$(echo "$HEAD_SHA" | cut -c1-7)
           echo "tag=${VERSION}-beta.${SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare Docker contexts
@@ -231,22 +276,24 @@ jobs:
           provenance: false
 
       - name: Create multi-arch manifests
+        env:
+          TAG: ${{ steps.prep.outputs.tag }}
         run: |
-          TAG="${{ steps.prep.outputs.tag }}"
           docker buildx imagetools create \
             -t ghcr.io/avelino/mcp:beta \
-            -t ghcr.io/avelino/mcp:${TAG} \
-            ghcr.io/avelino/mcp:${TAG}-amd64 \
-            ghcr.io/avelino/mcp:${TAG}-arm64
+            -t "ghcr.io/avelino/mcp:${TAG}" \
+            "ghcr.io/avelino/mcp:${TAG}-amd64" \
+            "ghcr.io/avelino/mcp:${TAG}-arm64"
           docker buildx imagetools create \
             -t ghcr.io/avelino/mcp:beta-full \
-            -t ghcr.io/avelino/mcp:${TAG}-full \
-            ghcr.io/avelino/mcp:${TAG}-full-amd64 \
-            ghcr.io/avelino/mcp:${TAG}-full-arm64
+            -t "ghcr.io/avelino/mcp:${TAG}-full" \
+            "ghcr.io/avelino/mcp:${TAG}-full-amd64" \
+            "ghcr.io/avelino/mcp:${TAG}-full-arm64"
 
       - name: Smoke test the published images
+        env:
+          TAG: ${{ steps.prep.outputs.tag }}
         run: |
-          TAG="${{ steps.prep.outputs.tag }}"
           for tag in "${TAG}" "${TAG}-full"; do
             echo "--- ghcr.io/avelino/mcp:${tag}"
             docker run --rm "ghcr.io/avelino/mcp:${tag}" --version
