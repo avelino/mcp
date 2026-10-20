@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -263,25 +263,10 @@ impl Transport for HttpTransport {
                 .context("failed to retry HTTP request after auth")?;
 
             self.capture_session_id(&resp);
-            let status = resp.status();
-            let location = header_str(&resp, reqwest::header::LOCATION);
-            let text = resp.text().await.context("failed to read HTTP response")?;
-
-            if !status.is_success() {
-                return Err(http_error(status, location.as_deref(), &text));
-            }
-
-            return parse_response(&text);
+            return response_to_jsonrpc(resp, &msg.id, &msg.method).await;
         }
 
-        let location = header_str(&resp, reqwest::header::LOCATION);
-        let text = resp.text().await.context("failed to read HTTP response")?;
-
-        if !status.is_success() {
-            return Err(http_error(status, location.as_deref(), &text));
-        }
-
-        parse_response(&text)
+        response_to_jsonrpc(resp, &msg.id, &msg.method).await
     }
 
     async fn notify(&self, msg: &JsonRpcNotification) -> Result<()> {
@@ -311,6 +296,73 @@ impl Transport for HttpTransport {
 /// Read a response header as a `String`, when it is present and printable.
 fn header_str(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
     resp.headers().get(name)?.to_str().ok().map(str::to_string)
+}
+
+fn content_type_of(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Read one HTTP response into the JSON-RPC value the caller is waiting on.
+///
+/// Text and JSON (and a missing type) are still decoded as a string and
+/// parsed as JSON-RPC or SSE. That path is what every MCP peer speaks, and
+/// it has to stay byte-for-byte the same, including `Response::text`'s
+/// charset handling.
+///
+/// A non-text body on `tools/call` is the file a generic HTTP tool fetched
+/// (WAHA `GET /api/files/avelino/<id>.jpeg` comes back `image/jpeg`). Decoding
+/// those bytes as a string replaces them with U+FFFD. They are returned as
+/// MCP content instead: image block for `image/*`, embedded resource blob
+/// otherwise.
+async fn response_to_jsonrpc(
+    resp: reqwest::Response,
+    id: &Value,
+    method: &str,
+) -> Result<JsonRpcResponse> {
+    let status = resp.status();
+    let location = header_str(&resp, reqwest::header::LOCATION);
+    let content_type = content_type_of(&resp);
+
+    if status.is_redirection() {
+        return Err(http_error(status, location.as_deref(), ""));
+    }
+
+    if !status.is_success() {
+        if super::body::is_textual_content_type(&content_type) {
+            let text = resp.text().await.context("failed to read HTTP response")?;
+            return Err(http_error(status, location.as_deref(), &text));
+        }
+        let n = resp
+            .bytes()
+            .await
+            .context("failed to read HTTP response")?
+            .len();
+        let mime = super::body::media_type(&content_type);
+        bail!("HTTP error {status}: {mime} body ({n} bytes)");
+    }
+
+    if super::body::is_textual_content_type(&content_type) {
+        let text = resp.text().await.context("failed to read HTTP response")?;
+        return parse_response(&text);
+    }
+
+    let uri = resp.url().to_string();
+    let bytes = resp.bytes().await.context("failed to read HTTP response")?;
+    if method != "tools/call" {
+        let mime = super::body::media_type(&content_type);
+        bail!(
+            "HTTP response is {mime} ({} bytes), not a JSON-RPC message",
+            bytes.len()
+        );
+    }
+    Ok(JsonRpcResponse::success(
+        id.clone(),
+        super::body::binary_tool_result(&content_type, &bytes, &uri),
+    ))
 }
 
 /// Turn a non-success response into an error a person can act on.
@@ -360,6 +412,7 @@ fn parse_response(text: &str) -> Result<JsonRpcResponse> {
 mod tests {
     use super::*;
     use crate::protocol::{MAX_HEADER_VALUE_LEN, PROTOCOL_VERSION, PROTOCOL_VERSION_LEGACY};
+    use base64::Engine as _;
     use serde_json::json;
 
     /// An auth gateway (Cloudflare Access, an SSO proxy) answers a redirect
@@ -776,5 +829,223 @@ mod tests {
         // the legacy behavior rather than latch.
         t.set_protocol_version(PROTOCOL_VERSION_LEGACY);
         assert!(!t.is_stateless());
+    }
+
+    const JPEG: &[u8] = include_bytes!("fixtures/waha-8x8.jpeg");
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Stand-in for a backend whose `api-call` tool returns the upstream
+    /// HTTP body as the POST response. That is how `GET /api/files/avelino/<id>.jpeg`
+    /// arrives: `Content-Type: image/jpeg` and the file, not a JSON-RPC envelope.
+    async fn spawn_backend() -> String {
+        use axum::body::Body;
+        use axum::http::{header, Response, StatusCode};
+        use axum::routing::post;
+
+        let app = axum::Router::new().route(
+            "/",
+            post(|body: String| async move {
+                let msg: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                let method = msg["method"].as_str().unwrap_or("");
+                let name = msg
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let path = msg
+                    .pointer("/params/arguments/path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+
+                if method == "tools/call" && path.ends_with(".jpeg") {
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, "image/jpeg")
+                        .body(Body::from(JPEG.to_vec()))
+                        .unwrap();
+                }
+                if method == "tools/call" && path.ends_with(".pdf") {
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, "application/pdf")
+                        .body(Body::from(vec![0x25, 0x50, 0x44, 0x46, 0xff, 0xfe]))
+                        .unwrap();
+                }
+                if method == "tools/call" && name == "json-call" {
+                    let payload = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"ok\":true}"}]}}"#;
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(payload))
+                        .unwrap();
+                }
+                if method == "tools/call" && name == "text-call" {
+                    let payload = r#"{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"hello"}]}}"#;
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                        .body(Body::from(payload))
+                        .unwrap();
+                }
+                if method == "tools/call" && name == "not-json" {
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, "text/plain")
+                        .body(Body::from("this is not json"))
+                        .unwrap();
+                }
+                if method == "initialize" {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/jpeg")
+                        .body(Body::from(JPEG.to_vec()))
+                        .unwrap();
+                }
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![0xff, 0xfe, 0xfd]))
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn jpeg_tool_response_round_trips() {
+        let url = spawn_backend().await;
+        let transport = HttpTransport::new(&url, &HashMap::new()).unwrap();
+        let req = JsonRpcRequest::new(
+            1,
+            "tools/call",
+            Some(json!({
+                "name": "api-call",
+                "arguments": {"method": "GET", "path": "/api/files/avelino/abc.jpeg"}
+            })),
+        );
+        let resp = transport.request(&req).await.unwrap();
+        let result = resp.result.unwrap();
+        let block = &result["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["mimeType"], "image/jpeg");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(block["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, JPEG);
+        assert_eq!(sha256_hex(&decoded), sha256_hex(JPEG));
+        assert!(!serde_json::to_string(&result).unwrap().contains('\u{FFFD}'));
+    }
+
+    #[tokio::test]
+    async fn pdf_tool_response_is_an_embedded_resource() {
+        let url = spawn_backend().await;
+        let transport = HttpTransport::new(&url, &HashMap::new()).unwrap();
+        let req = JsonRpcRequest::new(
+            2,
+            "tools/call",
+            Some(json!({
+                "name": "api-call",
+                "arguments": {"path": "/api/files/avelino/note.pdf"}
+            })),
+        );
+        let resp = transport.request(&req).await.unwrap();
+        let block = &resp.result.unwrap()["content"][0];
+        assert_eq!(block["type"], "resource");
+        assert_eq!(block["resource"]["mimeType"], "application/pdf");
+        assert_eq!(block["resource"]["uri"], url);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(block["resource"]["blob"].as_str().unwrap())
+            .unwrap();
+        let original = [0x25, 0x50, 0x44, 0x46, 0xff, 0xfe];
+        assert_eq!(decoded, original);
+        assert_eq!(sha256_hex(&decoded), sha256_hex(&original));
+    }
+
+    #[tokio::test]
+    async fn json_and_text_tool_responses_are_unchanged() {
+        let url = spawn_backend().await;
+        let transport = HttpTransport::new(&url, &HashMap::new()).unwrap();
+
+        let json_resp = transport
+            .request(&JsonRpcRequest::new(
+                1,
+                "tools/call",
+                Some(json!({"name": "json-call", "arguments": {}})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            json_resp.result.unwrap()["content"][0]["text"],
+            json!("{\"ok\":true}")
+        );
+
+        let text_resp = transport
+            .request(&JsonRpcRequest::new(
+                7,
+                "tools/call",
+                Some(json!({"name": "text-call", "arguments": {}})),
+            ))
+            .await
+            .unwrap();
+        let text_resp = text_resp.result.unwrap();
+        assert_eq!(text_resp["content"][0]["type"], "text");
+        assert_eq!(text_resp["content"][0]["text"], "hello");
+        assert!(text_resp["content"][0].get("data").is_none());
+    }
+
+    /// A text body that is not JSON-RPC is still a parse error. It must not
+    /// be rewrapped as an image or a resource.
+    #[tokio::test]
+    async fn non_json_text_is_still_a_parse_error() {
+        let url = spawn_backend().await;
+        let transport = HttpTransport::new(&url, &HashMap::new()).unwrap();
+        let err = transport
+            .request(&JsonRpcRequest::new(
+                1,
+                "tools/call",
+                Some(json!({"name": "not-json", "arguments": {}})),
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to parse"), "{err}");
+        assert!(!err.contains('\u{FFFD}'), "{err}");
+    }
+
+    #[tokio::test]
+    async fn binary_outside_tools_call_is_not_a_tool_result() {
+        let url = spawn_backend().await;
+        let transport = HttpTransport::new(&url, &HashMap::new()).unwrap();
+        let err = transport
+            .request(&JsonRpcRequest::new(1, "initialize", None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("image/jpeg"), "{err}");
+        assert!(err.contains("not a JSON-RPC message"), "{err}");
+        assert!(!err.contains('\u{FFFD}'), "{err}");
+    }
+
+    #[tokio::test]
+    async fn binary_error_body_is_not_decoded_as_text() {
+        let url = spawn_backend().await;
+        let transport = HttpTransport::new(&url, &HashMap::new()).unwrap();
+        let err = transport
+            .request(&JsonRpcRequest::new(1, "nope", None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("500"), "{err}");
+        assert!(err.contains("application/octet-stream"), "{err}");
+        assert!(err.contains("3 bytes"), "{err}");
+        assert!(!err.contains('\u{FFFD}'), "{err}");
     }
 }

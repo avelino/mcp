@@ -525,6 +525,11 @@ pub struct Content {
     pub data: Option<String>,
     #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Embedded resource (`type: "resource"`). The blob or text lives here,
+    /// not on the block itself; dropping the object on the way through the
+    /// typed result is how a PDF comes back empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Value>,
 }
 
 // --- MCP Resources ---
@@ -707,6 +712,28 @@ mod tests {
         assert_eq!(content.content_type, "image");
         assert_eq!(content.data.unwrap(), "base64data");
         assert_eq!(content.mime_type.unwrap(), "image/png");
+        assert!(content.resource.is_none());
+    }
+
+    #[test]
+    fn test_content_embedded_resource_blob_round_trips() {
+        let json = json!({
+            "type": "resource",
+            "resource": {
+                "uri": "https://waha.example/api/files/avelino/note.pdf",
+                "mimeType": "application/pdf",
+                "blob": "JVBERg=="
+            }
+        });
+        let content: Content = serde_json::from_value(json).unwrap();
+        assert_eq!(content.content_type, "resource");
+        let back = serde_json::to_value(&content).unwrap();
+        assert_eq!(back["resource"]["blob"], "JVBERg==");
+        assert_eq!(back["resource"]["mimeType"], "application/pdf");
+        assert_eq!(
+            back["resource"]["uri"],
+            "https://waha.example/api/files/avelino/note.pdf"
+        );
     }
 
     #[test]
