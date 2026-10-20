@@ -1,6 +1,6 @@
 use crate::audit::AuditEntry;
 use crate::config::ServerConfig;
-use crate::protocol::{Tool, ToolCallResult};
+use crate::protocol::{Content, Tool, ToolCallResult};
 use crate::registry::RegistryServer;
 use anyhow::Result;
 use comfy_table::{presets, Attribute, Cell, Color, ContentArrangement, Table};
@@ -445,6 +445,22 @@ fn format_validation_error(text: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+fn embedded_text(content: &Content) -> Option<&str> {
+    content
+        .resource
+        .as_ref()
+        .and_then(|r| r.get("text"))
+        .and_then(|t| t.as_str())
+}
+
+fn embedded_mime(content: &Content) -> Option<&str> {
+    content
+        .resource
+        .as_ref()
+        .and_then(|r| r.get("mimeType"))
+        .and_then(|m| m.as_str())
+}
+
 fn print_tool_result_text(result: &ToolCallResult) -> Result<()> {
     let is_error = result.is_error.unwrap_or(false);
 
@@ -486,8 +502,14 @@ fn print_tool_result_text(result: &ToolCallResult) -> Result<()> {
             "resource" => {
                 if let Some(ref text) = content.text {
                     out!(is_error, "{}", text);
+                } else if let Some(text) = embedded_text(content) {
+                    out!(is_error, "{}", text);
                 } else {
-                    let mime = content.mime_type.as_deref().unwrap_or("unknown");
+                    let mime = content
+                        .mime_type
+                        .as_deref()
+                        .or_else(|| embedded_mime(content))
+                        .unwrap_or("unknown");
                     out!(is_error, "{}", style(format!("[resource: {mime}]")).dim());
                 }
             }
@@ -656,6 +678,7 @@ mod tests {
             text: Some(text.to_string()),
             data: None,
             mime_type: None,
+            resource: None,
         }
     }
 
@@ -976,6 +999,7 @@ mod tests {
                 text: None,
                 data: Some("base64data".to_string()),
                 mime_type: Some("image/png".to_string()),
+                resource: None,
             }],
             is_error: None,
         };
@@ -990,6 +1014,7 @@ mod tests {
                 text: None,
                 data: Some("data".to_string()),
                 mime_type: None,
+                resource: None,
             }],
             is_error: None,
         };
@@ -1004,6 +1029,7 @@ mod tests {
                 text: Some("resource content".to_string()),
                 data: None,
                 mime_type: Some("text/plain".to_string()),
+                resource: None,
             }],
             is_error: None,
         };
@@ -1018,6 +1044,7 @@ mod tests {
                 text: None,
                 data: None,
                 mime_type: Some("application/pdf".to_string()),
+                resource: None,
             }],
             is_error: None,
         };
@@ -1032,6 +1059,7 @@ mod tests {
                 text: Some("custom data".to_string()),
                 data: None,
                 mime_type: None,
+                resource: None,
             }],
             is_error: None,
         };
@@ -1046,6 +1074,7 @@ mod tests {
                 text: None,
                 data: Some("raw".to_string()),
                 mime_type: None,
+                resource: None,
             }],
             is_error: None,
         };
@@ -1063,6 +1092,7 @@ mod tests {
                     text: None,
                     data: Some("img".to_string()),
                     mime_type: Some("image/jpeg".to_string()),
+                    resource: None,
                 },
             ],
             is_error: None,
