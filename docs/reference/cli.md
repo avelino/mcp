@@ -649,3 +649,11 @@ mcp ui --read-only                # disable every mutating route
 | `--read-only` | off | Disable editing (also forced when the config is inline in `MCP_SERVERS_CONFIG`) |
 
 The first request must carry the token printed at startup; it is exchanged for a session cookie. Every write is audited with `source: "ui"`. See the [Web UI guide](../guides/web-ui.md).
+
+The UI can also be served by the proxy, for a team:
+
+```bash
+mcp serve --http 127.0.0.1:7332 --management
+```
+
+The pages mount at `/`, authenticate through `serverAuth` (bearer, OAuth-issued JWT or forwarded identity), filter the catalog by the caller's ACL, and allow writes only for roles in `serverAuth.adminRoles`. `--management` requires `--http`.

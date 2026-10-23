@@ -73,6 +73,38 @@ The UI is reachable by every process running as you, so the token is not a defen
 mcp ui --read-only
 ```
 
+## Team mode
+
+The same UI can be served by the proxy, so a team gets one control room for the deployment instead of one per laptop:
+
+```bash
+mcp serve --http 0.0.0.0:7332 --insecure --management
+```
+
+`--management` mounts the UI at `/` of the proxy. It uses the **same** `serverAuth` as `/mcp`: the sign-in form asks for a token, the proxy's provider chain validates it, and the browser keeps it in an HttpOnly, `SameSite=Strict` cookie. The token is re-validated on **every** request, so deleting it from `serverAuth.bearer.tokens` (or letting a JWT expire) signs that browser out on its next click — there is no session table to keep in sync.
+
+What the role decides:
+
+| | Reader (`serverAuth.acl`) | Admin (`serverAuth.adminRoles`) |
+|---|---|---|
+| Overview, servers, catalog | yes, **filtered by the viewer's ACL** | yes, everything |
+| Playground | only tools the ACL allows | yes |
+| Activity | only their own entries | everyone's |
+| Access (policy, simulator) | no | yes |
+| Settings, instances | no | yes |
+| Edit / add / remove servers, reload | no (403) | yes |
+
+The catalog is filtered with the proxy's own evaluator, so the UI cannot show a tool the same request would be denied. A hand-crafted `POST /playground/call` is checked again before it reaches a backend.
+
+Writes are the same plan/apply flow as the local UI — diff, validation, atomic write, backup — and then reload **in process**: the proxy re-reads the file it is already serving from. Nothing is signalled through the instance registry, because that would mean taking a file lock this process already holds.
+
+Two things to know before exposing it:
+
+- **Without `serverAuth.providers` the proxy is `NoAuth`.** Everyone is anonymous, so the UI is read-only for everyone and the login form accepts any token. The proxy logs a warning at boot; add `providers: ["bearer"]` (or `forwarded`/`oauth_as`) and `adminRoles`.
+- **`forwarded` trusts headers.** It is only safe behind a reverse proxy that strips client-supplied `x-forwarded-user`.
+
+Team mode does not add a JSON API yet: the pages are server-rendered and the MCP endpoint stays `/mcp`. A `/api/v1` for automation is the next step, not this one.
+
 ## Limits worth knowing
 
 - **The ACL is not enforced here.** It is policy for `mcp serve --http`. The local UI, like the CLI, runs as you and can call any configured backend; the Access screen says so and is a *simulator*, not a gate.
@@ -80,7 +112,7 @@ mcp ui --read-only
 - **The database is optional.** If the embedded database cannot be opened (no native library for the platform, read-only filesystem, `audit.enabled = false`), `mcp ui` still starts: the Activity trail is empty, the on-disk tool cache is off, and discovery results live in memory for the session. A banner says so. Config editing is unaffected.
 - **Discovery spawns processes.** "Connect now" starts the backend exactly like `mcp <server> --list` does.
 - **Signals are not acknowledgements.** Reload sends `SIGHUP` and reports how many processes were signalled; the proxy applies the new config on its own.
-- **Local mode only, for now.** A team-mode endpoint behind `serverAuth`/`adminRoles` is designed but not implemented.
+- **Team mode is read-heavy.** It exposes the UI and the MCP endpoint; scripting against the UI's data needs the (not yet built) JSON API.
 
 ## Flags
 

@@ -304,6 +304,14 @@ Editing is a diff, not a save. Changing a field renders the patch against the by
 
 The UI binds to loopback, prints a one-time token in the URL, and exchanges it for a `SameSite=Strict` cookie; writes additionally check `Origin`/`Fetch-Site`. Secrets are redacted before rendering — a config value that is not a `${VAR}` reference never reaches the page. See the [Web UI guide](docs/guides/web-ui.md).
 
+Teams get the same UI from the proxy, behind the auth they already have:
+
+```bash
+mcp serve --http 0.0.0.0:7332 --insecure --management
+```
+
+Readers see the catalog their ACL grants and their own audit entries; roles in `serverAuth.adminRoles` can edit, reload and see the whole policy.
+
 ## Audit logging
 
 Every operation is logged — tool calls, searches, config changes, proxy requests. Query the log with filters or stream it in real-time:
