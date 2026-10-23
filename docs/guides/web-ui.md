@@ -105,6 +105,45 @@ Two things to know before exposing it:
 
 Team mode does not add a JSON API yet: the pages are server-rendered and the MCP endpoint stays `/mcp`. A `/api/v1` for automation is the next step, not this one.
 
+## Docker
+
+The UI runs unchanged in the container; it just has to bind inside it and be told which URL to print.
+
+```bash
+# scratch image: HTTP backends only, ~30 MB
+docker build -t mcp:dev .
+
+docker run --rm -d --name mcp-ui \
+  -p 127.0.0.1:7332:7332 \
+  -v "$HOME/.config/mcp:/root/.config/mcp" \
+  mcp:dev ui --addr 0.0.0.0:7332 --no-open
+
+docker logs mcp-ui | grep http://
+# http://localhost:7332/?token=…
+```
+
+`--addr 0.0.0.0:7332` is required: the default is loopback *inside* the container, which no published port can reach. Publish to `127.0.0.1` as above so the UI is not exposed on your LAN — the session token is the only credential it has.
+
+For a team, the proxy serves the same pages:
+
+```bash
+docker run --rm -d --name mcp-proxy \
+  -p 127.0.0.1:7332:7332 \
+  -v "$HOME/.config/mcp:/root/.config/mcp" \
+  mcp:dev serve --http 0.0.0.0:7332 --insecure --management
+```
+
+Sign in at `http://localhost:7332/` with a token from `serverAuth.bearer.tokens`.
+
+Three container-specific things:
+
+| | |
+|---|---|
+| **Audit and cache are off by default** | The image sets `MCP_AUDIT_ENABLED=false` (the database downloads a native library on first open). Activity is empty and discovery lives in memory for the session. Pass `-e MCP_AUDIT_ENABLED=true` with a writable volume if you want persistence — the ChronDB library still has to be fetchable for your platform. |
+| **stdio backends need the `full` image** | `docker build --target full-source -t mcp:full .` adds `npx`, `uvx`, `docker`, `kubectl` and `gh`. In the scratch image a stdio backend is reported as unavailable — `mcp --list` says so instead of failing later. |
+| **Files are written as root on Linux** | The config is edited in place, so backups created from inside the container belong to root. On Docker Desktop this is invisible; on Linux, run with `--user "$(id -u):$(id -g)" -e HOME=/tmp` and mount the config explicitly. |
+| **Mount `:ro` means start with `--read-only`** | Editing needs to write a temp file next to the config. With a read-only mount every apply fails; `mcp ui --read-only` disables the forms up front instead. |
+
 ## Limits worth knowing
 
 - **The ACL is not enforced here.** It is policy for `mcp serve --http`. The local UI, like the CLI, runs as you and can call any configured backend; the Access screen says so and is a *simulator*, not a gate.

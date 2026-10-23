@@ -191,7 +191,11 @@ pub async fn run(opts: Options) -> Result<()> {
             .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 7332)))
     });
 
-    let url = format!("http://{bound}/?token={}", state.token);
+    let url = format!(
+        "http://{}/?token={}",
+        display_authority(&bound),
+        state.token
+    );
     println!("mcp ui listening on http://{bound}");
     println!("open: {url}");
     if state.read_only {
@@ -247,6 +251,20 @@ pub(crate) fn routes() -> Router<Arc<UiState>> {
         .route("/healthz", get(healthz))
         .route("/assets/app.css", get(css))
         .route("/assets/htmx.js", get(htmx))
+}
+
+/// What to print for a bind address.
+///
+/// A container binds `0.0.0.0` and is reached through a published port, so
+/// `http://0.0.0.0:7332/` is not a URL anyone can open. Printing `localhost`
+/// is right for the common `-p 127.0.0.1:7332:7332` case and harmless
+/// elsewhere; the bind address still goes to the logs line above.
+pub(crate) fn display_authority(bound: &SocketAddr) -> String {
+    if bound.ip().is_unspecified() {
+        format!("localhost:{}", bound.port())
+    } else {
+        bound.to_string()
+    }
 }
 
 /// The `mcp ui` router: token-in-URL, session cookie, loopback only.

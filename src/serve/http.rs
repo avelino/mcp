@@ -610,7 +610,10 @@ pub async fn run_http(
                 "management UI is enabled but serverAuth.adminRoles is empty: every write is denied"
             );
         }
-        println!("management ui: http://{bind_addr}/ (auth via serverAuth)");
+        println!(
+            "management ui: http://{}/ (auth via serverAuth)",
+            crate::ui::display_authority(&sock_addr)
+        );
         app.merge(ui_app)
     } else {
         app
