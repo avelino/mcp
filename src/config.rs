@@ -24,6 +24,7 @@ const RESERVED_NAMES: &[&str] = &[
     "completions",
     "healthcheck",
     "reload",
+    "ui",
 ];
 
 #[derive(Debug, Default, Deserialize, Clone, PartialEq)]
@@ -420,7 +421,22 @@ pub fn load_config_from_path(path: &PathBuf) -> Result<Config> {
 
 fn parse_config_content(content: &str, source: PathBuf) -> Result<Config> {
     let content = substitute_env_vars(content);
-    let content = strip_json_comments(&content);
+    parse_config_text(&content, source)
+}
+
+/// Validates a config document exactly as it is written on disk, without
+/// expanding `${VAR}` placeholders.
+///
+/// `${VAR}` expansion happens before parsing (`substitute_env_vars`), so a
+/// document that round-trips through `load_config` can no longer be written
+/// back: the placeholders are gone. This entry point exists for writers that
+/// hold the raw bytes and need to know whether the result is valid.
+pub fn validate_config_text(text: &str, source: PathBuf) -> Result<Config> {
+    parse_config_text(text, source)
+}
+
+fn parse_config_text(content: &str, source: PathBuf) -> Result<Config> {
+    let content = strip_json_comments(content);
 
     let raw: Value = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse config from: {}", source.display()))?;

@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Playground</h1>
+    <p class="sub">A form generated from the tool's <code class="mono">inputSchema</code>. Sends the same JSON-RPC the CLI does.</p>
+  </div>
+</div>
+
+{% if servers | length == 0 %}
+<div class="card"><div class="empty">No tools cached yet. Open a server and use <b>Connect now</b> first.</div></div>
+{% else %}
+<div class="split" style="grid-template-columns:250px minmax(0,1fr) 380px">
+  <div class="card">
+    <div class="card-b" style="padding:10px">
+      <input class="input" placeholder="Filter tools…" oninput="filterTools(this.value)" style="font-family:var(--sans)">
+    </div>
+    <div class="tlist" style="max-height:600px;overflow:auto">
+      {% for s in servers %}
+      <div class="nav-label" style="padding:8px 12px 4px">{{ s.name }}</div>
+      {% for t in s.tools %}
+      <a class="titem {% if selected and selected.key == s.name ~ '__' ~ t.name %}on{% endif %}"
+         data-name="{{ (s.name ~ '__' ~ t.name) | lower }}"
+         href="/playground?server={{ s.name | urlencode }}&tool={{ t.name | urlencode }}"
+         style="display:flex;align-items:center;gap:9px;padding:8px 12px;border-bottom:1px solid rgba(35,49,44,.4)">
+        <span class="mono tiny">{{ t.name }}</span>
+        <span class="spacer"></span>
+        <span class="chip {% if t.kind == 'read' %}read{% elif t.kind == 'write' %}warn{% endif %}">{{ t.kind }}</span>
+      </a>
+      {% endfor %}
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="stack">
+    {% if not selected %}
+    <div class="card"><div class="empty">Pick a tool on the left.</div></div>
+    {% else %}
+    <div class="card">
+      <div class="card-h">
+        <div class="mono" style="font-weight:600;font-size:12.5px">{{ selected.key }}</div>
+        <span class="chip {% if selected.kind == 'read' %}read{% else %}warn{% endif %}">{{ selected.kind }}</span>
+        <span class="spacer"></span>
+        <span class="tiny muted mono">{{ selected.server }}</span>
+      </div>
+      <div class="card-b">
+        {% if selected.description %}<p class="tiny muted" style="margin:0 0 14px">{{ selected.description }}</p>{% endif %}
+        <form hx-post="/playground/call" hx-target="#result" hx-swap="innerHTML">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="server" value="{{ selected.server }}">
+          <input type="hidden" name="tool" value="{{ selected.tool }}">
+
+          {% if fields | length == 0 %}
+          <div class="note" style="margin-bottom:12px">This tool takes no declared arguments.</div>
+          {% endif %}
+
+          {% for f in fields %}
+          <div class="field">
+            <label>
+              {{ f.key }}
+              <span class="chip">{{ f.type }}</span>
+              {% if f.required %}<span class="req">required</span>{% endif %}
+            </label>
+            {% if f.kind == 'select' %}
+            <select name="arg_{{ f.key }}">
+              {% for o in f.options %}<option value="{{ o }}" {% if o == f.value %}selected{% endif %}>{{ o }}</option>{% endfor %}
+            </select>
+            {% elif f.kind == 'bool' %}
+            <select name="arg_{{ f.key }}">
+              <option value="" {% if not f.value %}selected{% endif %}>false</option>
+              <option value="true" {% if f.value %}selected{% endif %}>true</option>
+            </select>
+            {% elif f.kind == 'textarea' %}
+            <textarea name="arg_{{ f.key }}" rows="3" placeholder="{{ f.placeholder }}">{{ f.value }}</textarea>
+            {% elif f.kind == 'number' %}
+            <input class="input" type="number" step="any" name="arg_{{ f.key }}" value="{{ f.value }}" placeholder="{{ f.placeholder }}">
+            {% elif f.kind == 'raw' %}
+            <textarea name="arg_{{ f.key }}" rows="4" placeholder="JSON">{{ f.value }}</textarea>
+            <div class="hint">Object or array — send valid JSON.</div>
+            {% else %}
+            <input class="input" name="arg_{{ f.key }}" value="{{ f.value }}" placeholder="{{ f.placeholder }}">
+            {% endif %}
+            {% if f.description %}<div class="hint">{{ f.description }}</div>{% endif %}
+          </div>
+          {% endfor %}
+
+          <div class="field">
+            <label>Arguments as JSON <span class="chip">optional override</span></label>
+            <textarea name="raw_args" rows="3" placeholder="{}">{{ args_json }}</textarea>
+            <div class="hint">If filled, this wins over the fields above.</div>
+          </div>
+
+          <div class="row" style="margin-top:14px">
+            <button class="btn primary">Run</button>
+            <span class="spacer"></span>
+            <span class="tiny muted mono">identity: local</span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="card" id="result">
+      <div class="card-h"><h2>Result</h2></div>
+      <div class="card-b"><div class="empty" style="padding:20px">Nothing ran yet.</div></div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <div class="card-h"><h2>JSON-RPC preview</h2><span class="spacer"></span><span class="chip">POST /mcp</span></div>
+      <div class="card-b" style="padding:10px">
+        <pre class="code" style="font-size:10px">{{ rpc_preview }}</pre>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>Recent runs</h2></div>
+      <div class="card-b flush">
+        {% if runs | length == 0 %}
+        <div class="empty" style="padding:20px">No runs recorded yet.</div>
+        {% else %}
+        {% for r in runs %}
+        <div class="row" style="padding:9px 14px;border-bottom:1px solid var(--line-soft)">
+          <span class="mono tiny muted">{{ r.at }}</span>
+          <span class="spacer"></span>
+          <span class="mono tiny">{{ r.ms }}</span>
+          <span class="chip {% if r.ok %}ok{% else %}err{% endif %}">{{ r.status }}</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<script>
+function filterTools(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.titem').forEach(function (el) {
+    el.style.display = !q || el.dataset.name.indexOf(q) !== -1 ? '' : 'none';
+  });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title }} · mcp</title>
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/htmx.js" defer></script>
+</head>
+<body hx-headers='{"x-mcp-ui":"1"}'>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">m</div>
+      <div>
+        <div class="brand-name">mcp</div>
+        <div class="brand-sub">control room</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <div class="nav-label">Operate</div>
+      <a href="/overview" class="{% if active == 'overview' %}on{% endif %}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-3H4zM14 7h6V4h-6z"/></svg>
+        Overview
+      </a>
+      <a href="/servers" class="{% if active == 'servers' %}on{% endif %}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        Servers
+        <span class="count">{{ server_count }}</span>
+      </a>
+      <a href="/playground" class="{% if active == 'playground' %}on{% endif %}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/></svg>
+        Playground
+      </a>
+      <a href="/activity" class="{% if active == 'activity' %}on{% endif %}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+        Activity
+      </a>
+      <div class="nav-label">Govern</div>
+      <a href="/access" class="{% if active == 'access' %}on{% endif %}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg>
+        Access
+      </a>
+      <a href="/settings" class="{% if active == 'settings' %}on{% endif %}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>
+        Settings
+      </a>
+    </nav>
+    <div class="side-foot">
+      <div class="instance-chip">
+        <span class="dot ok"></span>
+        <div style="min-width:0">
+          <div><code>{{ addr }}</code></div>
+          <div class="tiny muted" style="font-size:10px">v{{ version }} · up {{ uptime }}</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div class="crumb">mcp / <b>{{ page_title }}</b></div>
+      <div class="spacer"></div>
+      {% if read_only %}
+      <span class="chip warn" title="{{ read_only_reason }}">read-only</span>
+      {% else %}
+      <span class="chip ok">editable</span>
+      {% endif %}
+    </header>
+    <div class="view">
+      {% if flash_ok %}<div class="banner ok"><div><div class="t">{{ flash_ok }}</div></div></div>{% endif %}
+      {% if flash_err %}<div class="banner err"><div><div class="t">{{ flash_err }}</div></div></div>{% endif %}
+      {% block content %}{% endblock %}
+    </div>
+    <div class="foot">mcp {{ version }} · {{ config_path }} · every write is audited</div>
+  </main>
+</div>
+</body>
+</html>

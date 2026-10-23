@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head"><div><h1>Settings</h1><p class="sub">Where things live, what is switched on, what is running.</p></div></div>
+
+<div class="grid g2">
+  <div class="card">
+    <div class="card-h"><h2>Paths</h2></div>
+    <div class="card-b">
+      <dl class="kv">
+        <dt>Config</dt><dd class="mono tiny">{{ config_path }}</dd>
+        <dt>Auth</dt><dd class="mono tiny">{{ auth_path }}</dd>
+        <dt>Database</dt><dd class="mono tiny">{{ db_path }}</dd>
+        <dt>Instances</dt><dd class="mono tiny">{{ instances_dir }}</dd>
+        <dt>Audit output</dt><dd class="mono tiny">{{ audit_output }}</dd>
+        <dt>Telemetry</dt><dd>{{ telemetry }}</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>Instances</h2><span class="spacer"></span><span class="chip">{{ instances | length }}</span></div>
+    <div class="card-b flush">
+      {% if instances | length == 0 %}
+      <div class="empty">No <code class="mono">mcp serve</code> process is running here.</div>
+      {% else %}
+      {% for i in instances %}
+      <div class="row" style="padding:10px 14px;border-bottom:1px solid var(--line-soft)">
+        <span class="dot ok"></span>
+        <div>
+          <div class="tiny mono">{{ i.addr }}</div>
+          <div class="tiny muted">pid {{ i.pid }} · {{ i.transport }} · up {{ i.uptime }} · {{ i.filter }}</div>
+        </div>
+        <span class="spacer"></span>
+        <form class="inline" method="post" action="/reload">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="pid" value="{{ i.pid }}">
+          <button class="btn sm" {% if read_only %}disabled{% endif %}>Reload</button>
+        </form>
+      </div>
+      {% endfor %}
+      {% endif %}
+    </div>
+    <div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+      <span class="tiny muted">Reload sends SIGHUP and re-applies the config each process reads from disk. It is a signal, not an acknowledgement.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>Audit</h2><span class="spacer"></span><span class="chip {% if audit.enabled %}ok{% else %}warn{% endif %}">{% if audit.enabled %}on{% else %}off{% endif %}</span></div>
+    <div class="card-b">
+      <dl class="kv">
+        <dt>Arguments</dt><dd>{{ audit.arguments }}</dd>
+        <dt>Entries</dt><dd>{{ audit.entries }}</dd>
+        <dt>Retention</dt><dd class="deny">none — the database grows until you prune it</dd>
+        <dt>Storage</dt><dd class="mono tiny">{{ db_path }}</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>This page</h2></div>
+    <div class="card-b">
+      <dl class="kv">
+        <dt>Mode</dt><dd>{% if read_only %}read-only{% else %}editable{% endif %}</dd>
+        <dt>Binding</dt><dd class="mono tiny">{{ addr }}</dd>
+        <dt>Version</dt><dd class="mono tiny">{{ version }}</dd>
+        <dt>Uptime</dt><dd>{{ uptime }}</dd>
+        <dt>Session</dt><dd class="mono tiny">cookie · {{ token_prefix }}…</dd>
+      </dl>
+      {% if read_only %}
+      <div class="note" style="margin-top:10px">{{ read_only_reason }}</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

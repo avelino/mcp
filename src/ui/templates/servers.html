@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Servers</h1>
+    <p class="sub">Every entry below lives in <code class="mono">{{ config_path }}</code>. Edits are diffs, not saves.</p>
+  </div>
+</div>
+
+{% if not read_only %}
+<div class="grid g2" style="margin-bottom:14px">
+  <div class="card">
+    <div class="card-h"><h2>From the registry</h2><span class="spacer"></span><span class="chip">registry.modelcontextprotocol.io</span></div>
+    <div class="card-b">
+      <form method="get" action="/servers" class="row" style="gap:8px">
+        <input class="input" name="q" value="{{ query }}" placeholder="search servers, e.g. github" style="font-family:var(--sans)">
+        <button class="btn">Search</button>
+      </form>
+      {% if registry_error %}<div class="note deny" style="margin-top:10px">{{ registry_error }}</div>{% endif %}
+      {% if registry_results is defined and registry_results | length > 0 %}
+      <div style="margin-top:12px">
+        {% for r in registry_results %}
+        <div class="row" style="padding:8px 0;border-top:1px solid var(--line-soft)">
+          <div style="min-width:0">
+            <div class="mono tiny" style="font-weight:600">{{ r.name }}</div>
+            <div class="tiny muted">{{ r.description }}</div>
+          </div>
+          <span class="spacer"></span>
+          <form class="inline" method="post" action="/servers/add">
+            <input type="hidden" name="csrf" value="{{ token }}">
+            <input type="hidden" name="source" value="registry">
+            <input type="hidden" name="name" value="{{ r.name }}">
+            <button class="btn sm primary" {% if r.exists %}disabled title="already configured"{% endif %}>
+              {% if r.exists %}Added{% else %}Add{% endif %}
+            </button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% elif query and not registry_error %}
+      <div class="note" style="margin-top:10px">Nothing found for “{{ query }}”.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <div class="card-h"><h2>Add an HTTP server</h2></div>
+      <div class="card-b">
+        <form method="post" action="/servers/add">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="source" value="url">
+          <div class="field"><label>Name</label><input class="input" name="name" placeholder="sentry" required></div>
+          <div class="field"><label>URL</label><input class="input" name="url" placeholder="https://mcp.sentry.dev/sse" required></div>
+          <button class="btn primary">Add server</button>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>Add a stdio server</h2></div>
+      <div class="card-b">
+        <form method="post" action="/servers/add">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input type="hidden" name="source" value="stdio">
+          <div class="field"><label>Name</label><input class="input" name="name" placeholder="slack" required></div>
+          <div class="field"><label>Command</label><input class="input" name="command" placeholder="npx" required></div>
+          <div class="field"><label>Args</label><input class="input" name="args" placeholder="-y slack-mcp-server@latest --transport stdio"></div>
+          <div class="hint">One string, split on spaces. Paths with spaces need the config file.</div>
+          <button class="btn primary" style="margin-top:10px">Add server</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-h"><h2>Configured</h2><span class="spacer"></span><span class="chip">{{ servers | length }}</span></div>
+  <div class="card-b flush scroll-x">
+    {% if servers | length == 0 %}
+    <div class="empty">No servers yet. {% if read_only %}{{ read_only_reason }}{% endif %}</div>
+    {% else %}
+    <table>
+      <thead><tr><th>Name</th><th>Type</th><th>Endpoint</th><th>Tools</th><th>Idle</th><th></th></tr></thead>
+      <tbody>
+        {% for s in servers %}
+        <tr>
+          <td><a class="mono" style="font-weight:600" href="/servers/{{ s.name | urlencode }}">{{ s.name }}</a></td>
+          <td><span class="chip">{{ s.kind }}</span></td>
+          <td class="tiny muted mono" style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ s.endpoint }}</td>
+          <td class="tiny mono">{{ s.tools }}</td>
+          <td class="tiny muted mono">{{ s.idle }}</td>
+          <td style="text-align:right;white-space:nowrap">
+            <a class="btn sm" href="/servers/{{ s.name | urlencode }}">Open</a>
+            {% if not read_only %}
+            <form class="inline" method="post" action="/servers/{{ s.name | urlencode }}/delete" onsubmit="return confirm('Remove {{ s.name }} from the config?')">
+              <input type="hidden" name="csrf" value="{{ token }}">
+              <button class="btn sm danger">Remove</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
