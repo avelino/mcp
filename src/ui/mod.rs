@@ -22,6 +22,8 @@ mod render;
 mod session;
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
@@ -33,7 +35,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::audit::AuditLogger;
-use crate::cache::ToolCacheStore;
+use crate::cache::{BackendToolCache, ToolCacheStore};
+use crate::db::DbPool;
 
 pub use session::SessionToken;
 
@@ -57,9 +60,30 @@ pub struct UiState {
     pub started: Instant,
     pub audit: Arc<AuditLogger>,
     pub cache: ToolCacheStore,
+    /// Why the audit/tool-cache database could not be opened, when it could not.
+    pub db_error: Option<String>,
+    /// Tool catalogs discovered during this session.
+    ///
+    /// The database is an optimisation, not a requirement: without it (no
+    /// native library, read-only filesystem, `audit.enabled = false`) the UI
+    /// still has to show what discovery just found.
+    memory: Mutex<HashMap<String, BackendToolCache>>,
 }
 
 impl UiState {
+    pub fn cached(&self, name: &str) -> Option<BackendToolCache> {
+        self.cache
+            .load_backend(name)
+            .or_else(|| self.memory.lock().ok()?.get(name).cloned())
+    }
+
+    pub fn remember(&self, name: &str, entry: BackendToolCache) {
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.insert(name.to_string(), entry.clone());
+        }
+        self.cache.save_backend(name, &entry);
+    }
+
     pub fn uptime(&self) -> String {
         let secs = self.started.elapsed().as_secs();
         if secs < 60 {
@@ -75,8 +99,27 @@ impl UiState {
 /// Starts the UI and blocks until the process is stopped.
 pub async fn run(opts: Options) -> Result<()> {
     let cfg = crate::config::load_config().context("failed to load config")?;
-    let pool = crate::db::create_pool(&cfg.audit)?;
-    let audit = Arc::new(AuditLogger::open(&cfg.audit, pool.clone())?);
+
+    // The database carries the audit trail and the tool cache. Neither is
+    // required to render the config or to edit it, so a failure here degrades
+    // instead of aborting: an operator whose platform has no ChronDB native
+    // library still gets a working UI.
+    let (pool, db_error) = match crate::db::create_pool(&cfg.audit) {
+        Ok(pool) => (pool, None),
+        Err(e) => {
+            let message = format!("{e:#}");
+            eprintln!("mcp ui: audit database unavailable ({message})");
+            eprintln!("mcp ui: continuing without the audit trail and the on-disk tool cache");
+            (Arc::new(DbPool::disabled()), Some(message))
+        }
+    };
+    let audit = match AuditLogger::open(&cfg.audit, pool.clone()) {
+        Ok(audit) => Arc::new(audit),
+        Err(e) => {
+            tracing::warn!(error = format!("{e:#}"), "audit logger unavailable");
+            Arc::new(AuditLogger::Disabled)
+        }
+    };
     let cache = ToolCacheStore::new(pool.clone());
 
     let token = SessionToken::generate();
@@ -87,6 +130,8 @@ pub async fn run(opts: Options) -> Result<()> {
         started: Instant::now(),
         audit,
         cache,
+        db_error,
+        memory: Mutex::new(HashMap::new()),
     });
 
     let app = router(state.clone());
@@ -347,4 +392,55 @@ pub fn unauthorized() -> Response {
         "mcp ui: missing or invalid session token. Open the URL printed by `mcp ui`.\n",
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Tool;
+
+    fn state_without_database() -> UiState {
+        UiState {
+            addr: "127.0.0.1:7332".to_string(),
+            token: "test-token".to_string(),
+            read_only: false,
+            started: Instant::now(),
+            audit: Arc::new(AuditLogger::Disabled),
+            cache: ToolCacheStore::new(Arc::new(DbPool::disabled())),
+            db_error: Some("no native library".to_string()),
+            memory: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn discovery_survives_without_the_database() {
+        let state = state_without_database();
+        assert!(state.cached("sentry").is_none());
+
+        state.remember(
+            "sentry",
+            BackendToolCache {
+                config_hash: "abc".to_string(),
+                tools: vec![Tool {
+                    name: "search_issues".to_string(),
+                    description: None,
+                    input_schema: None,
+                    annotations: None,
+                }],
+                cached_at: "now".to_string(),
+            },
+        );
+
+        let cached = state
+            .cached("sentry")
+            .expect("session cache holds the tools");
+        assert_eq!(cached.tools.len(), 1);
+        assert_eq!(cached.tools[0].name, "search_issues");
+    }
+
+    #[test]
+    fn uptime_is_human_readable() {
+        let state = state_without_database();
+        assert_eq!(state.uptime(), "0s");
+    }
 }

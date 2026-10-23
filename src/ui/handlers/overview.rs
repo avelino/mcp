@@ -37,10 +37,12 @@ pub async fn index(
     } else {
         cfg.server_auth.providers.join(" + ")
     };
-    let audit_summary = if cfg.audit.enabled {
-        "on".to_string()
-    } else {
+    let audit_summary = if !cfg.audit.enabled {
         "off".to_string()
+    } else if state.db_error.is_some() {
+        "on · sink unavailable".to_string()
+    } else {
+        "on".to_string()
     };
 
     let label = super::source_label(&source);

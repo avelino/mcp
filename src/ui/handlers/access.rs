@@ -40,8 +40,7 @@ pub async fn index(
         .unwrap_or_default();
     let sample_subject = subject_names.first().cloned().unwrap_or_default();
     let sample_tool = state
-        .cache
-        .load_backend(names.first().map(String::as_str).unwrap_or(""))
+        .cached(names.first().map(String::as_str).unwrap_or(""))
         .and_then(|c| c.tools.first().map(|t| t.name.clone()))
         .unwrap_or_default();
 
@@ -106,8 +105,7 @@ pub async fn check(
     let identity = AuthIdentity::new(subject.clone(), roles.clone());
 
     let classification = state
-        .cache
-        .load_backend(&server)
+        .cached(&server)
         .and_then(|c| c.tools.into_iter().find(|t| t.name == tool))
         .map(|t| {
             crate::classifier::classify(&t, cfg.servers.get(&server).and_then(|c| c.tool_acl()))

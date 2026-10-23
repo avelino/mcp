@@ -69,6 +69,15 @@
     <div class="view">
       {% if flash_ok %}<div class="banner ok"><div><div class="t">{{ flash_ok }}</div></div></div>{% endif %}
       {% if flash_err %}<div class="banner err"><div><div class="t">{{ flash_err }}</div></div></div>{% endif %}
+      {% if db_error %}
+      <div class="banner">
+        <div>
+          <div class="t">Audit database unavailable</div>
+          <div class="d">The activity trail and the on-disk tool cache are off for this session. Nothing else is affected — config editing and discovery still work.</div>
+          <div class="tiny mono muted" style="margin-top:4px">{{ db_error }}</div>
+        </div>
+      </div>
+      {% endif %}
       {% block content %}{% endblock %}
     </div>
     <div class="foot">mcp {{ version }} · {{ config_path }} · every write is audited</div>

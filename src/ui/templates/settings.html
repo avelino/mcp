@@ -12,6 +12,7 @@
         <dt>Database</dt><dd class="mono tiny">{{ db_path }}</dd>
         <dt>Instances</dt><dd class="mono tiny">{{ instances_dir }}</dd>
         <dt>Audit output</dt><dd class="mono tiny">{{ audit_output }}</dd>
+        <dt>Database</dt><dd>{% if db_error %}<span class="deny">unavailable</span>{% else %}<span class="allow">open</span>{% endif %}</dd>
         <dt>Telemetry</dt><dd>{{ telemetry }}</dd>
       </dl>
     </div>

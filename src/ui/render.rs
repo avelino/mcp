@@ -107,6 +107,7 @@ pub fn base_context(
     ctx.put("config_path", json!(config_path));
     ctx.put("flash_ok", json!(flash.ok));
     ctx.put("flash_err", json!(flash.err));
+    ctx.put("db_error", json!(state.db_error));
     ctx
 }
 

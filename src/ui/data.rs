@@ -105,7 +105,7 @@ pub fn server_rows(cfg: &Config, state: &UiState, calls: &HashMap<String, usize>
         .into_iter()
         .map(|name| {
             let config = &cfg.servers[name];
-            let cached = state.cache.load_backend(name);
+            let cached = state.cached(name);
             let (tools, read, write) = classify_cached(config, cached.as_ref());
             let stale = match (&cached, cfg.config_hashes.get(name)) {
                 (Some(c), Some(hash)) => &c.config_hash != hash,

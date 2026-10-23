@@ -77,6 +77,7 @@ mcp ui --read-only
 
 - **The ACL is not enforced here.** It is policy for `mcp serve --http`. The local UI, like the CLI, runs as you and can call any configured backend; the Access screen says so and is a *simulator*, not a gate.
 - **Activity needs audit.** With `audit.enabled = false` the page is empty by design — there is no log to show.
+- **The database is optional.** If the embedded database cannot be opened (no native library for the platform, read-only filesystem, `audit.enabled = false`), `mcp ui` still starts: the Activity trail is empty, the on-disk tool cache is off, and discovery results live in memory for the session. A banner says so. Config editing is unaffected.
 - **Discovery spawns processes.** "Connect now" starts the backend exactly like `mcp <server> --list` does.
 - **Signals are not acknowledgements.** Reload sends `SIGHUP` and reports how many processes were signalled; the proxy applies the new config on its own.
 - **Local mode only, for now.** A team-mode endpoint behind `serverAuth`/`adminRoles` is designed but not implemented.

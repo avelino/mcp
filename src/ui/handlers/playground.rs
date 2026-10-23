@@ -19,7 +19,7 @@ pub async fn index(
     names.sort();
     for name in names {
         let config = &cfg.servers[name];
-        let Some(cached) = state.cache.load_backend(name) else {
+        let Some(cached) = state.cached(name) else {
             continue;
         };
         let (rows, _, _, _) = data::tool_rows(&cached.tools, config.tool_acl());
@@ -41,7 +41,7 @@ pub async fn index(
     let mut selected_tool: Option<crate::protocol::Tool> = None;
 
     if !want_server.is_empty() && !want_tool.is_empty() {
-        if let Some(cached) = state.cache.load_backend(&want_server) {
+        if let Some(cached) = state.cached(&want_server) {
             if let Some(tool) = cached.tools.iter().find(|t| t.name == want_tool) {
                 let class = crate::classifier::classify(
                     tool,
@@ -125,8 +125,7 @@ pub async fn call(
         .ok_or_else(|| UiError::NotFound(format!("server \"{server_name}\" not found")))?;
 
     let tool = state
-        .cache
-        .load_backend(&server_name)
+        .cached(&server_name)
         .and_then(|c| c.tools.into_iter().find(|t| t.name == tool_name))
         .ok_or_else(|| {
             UiError::NotFound(format!(

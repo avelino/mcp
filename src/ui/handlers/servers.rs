@@ -147,7 +147,7 @@ pub async fn detail(
         .server(&name)?
         .ok_or_else(|| UiError::NotFound(format!("server \"{name}\" is not in the file")))?;
 
-    let cached = state.cache.load_backend(&name);
+    let cached = state.cached(&name);
     let overrides = config.tool_acl();
     let tools = cached.as_ref().map(|c| c.tools.as_slice()).unwrap_or(&[]);
     let (tool_rows, read, write, ambiguous) = data::tool_rows(tools, overrides);
@@ -537,9 +537,9 @@ pub async fn discover(
     match result {
         Ok(tools) => {
             let hash = cfg.config_hashes.get(&name).cloned().unwrap_or_default();
-            state.cache.save_backend(
+            state.remember(
                 &name,
-                &crate::cache::BackendToolCache {
+                crate::cache::BackendToolCache {
                     config_hash: hash,
                     tools: tools.clone(),
                     cached_at: chrono::Local::now().to_rfc3339(),
