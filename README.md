@@ -133,6 +133,7 @@ Tokens are saved in `~/.config/mcp/auth.json` and refreshed automatically.
 | `mcp add --url <url> <name>` | Add an HTTP server |
 | `mcp remove <name>` | Remove a server |
 | `mcp update <name>` | Refresh a server's config from the registry (preserves your customizations) |
+| `mcp ui` | Open a local web UI — servers, tools, audit, ACL |
 | `mcp serve` | Start proxy — all servers as one MCP endpoint |
 | `mcp reload` | Apply config changes to running proxies without restarting them |
 | `mcp logs` | Show audit log entries |
@@ -274,6 +275,34 @@ The `mcp` proxy fixes this with **persistent tool cache**, **lazy initialization
 ```
 
 Read the full story: **[MCP servers are draining your hardware](https://mcp.avelino.run/mcp-servers-are-draining-your-hardware)**
+
+## Web UI
+
+`mcp ui` serves a local web UI from the same binary — no Node, no build step, no extra service.
+
+```bash
+mcp ui            # http://127.0.0.1:7332, opens your browser
+mcp ui --read-only
+mcp ui --addr 127.0.0.1:9000 --no-open
+```
+
+It shows what the CLI already knows: configured servers and their cached tools, the audit trail with ACL verdicts, the ACL (with a simulator that runs the same evaluator as the proxy), and the `mcp serve` instances running on this machine.
+
+Editing is a diff, not a save. Changing a field renders the patch against the bytes on disk, validates it, and only then writes — atomically, with a backup, and without touching comments or `${VAR}` placeholders. Existing files stay yours:
+
+```jsonc
+{
+  "mcpServers": {
+    "sentry": {
+      "url": "https://mcp.sentry.dev/sse",
+      "headers": { "Authorization": "Bearer ${SENTRY_TOKEN}" }, // not expanded, not rewritten
+      "idle_timeout": "adaptive"
+    }
+  }
+}
+```
+
+The UI binds to loopback, prints a one-time token in the URL, and exchanges it for a `SameSite=Strict` cookie; writes additionally check `Origin`/`Fetch-Site`. Secrets are redacted before rendering — a config value that is not a `${VAR}` reference never reaches the page. See the [Web UI guide](docs/guides/web-ui.md).
 
 ## Audit logging
 
