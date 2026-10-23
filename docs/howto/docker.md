@@ -29,7 +29,7 @@ The two published flavours exist as build stages. The small one is the default, 
 # what :latest is — scratch, mcp + CA certs, ~27 MB, HTTP backends only
 docker build -t mcp:dev .
 
-# what :full is — alpine plus npx, uvx, docker, kubectl and gh
+# what :full is — alpine plus npx, uvx, docker, kubectl and gh (~300 MB)
 docker build --target full-source -t mcp:full .
 ```
 
