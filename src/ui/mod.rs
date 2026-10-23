@@ -18,8 +18,9 @@
 
 mod data;
 mod handlers;
-mod render;
+pub(crate) mod render;
 mod session;
+mod viewer;
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -39,6 +40,7 @@ use crate::cache::{BackendToolCache, ToolCacheStore};
 use crate::db::DbPool;
 
 pub use session::SessionToken;
+pub use viewer::{CurrentViewer, Viewer};
 
 const HTMX: &str = include_str!("assets/htmx.min.js");
 const APP_CSS: &str = include_str!("assets/app.css");
@@ -62,6 +64,10 @@ pub struct UiState {
     pub cache: ToolCacheStore,
     /// Why the audit/tool-cache database could not be opened, when it could not.
     pub db_error: Option<String>,
+    /// In-process reload, when the UI runs inside the proxy. The instance
+    /// registry is deliberately not used here: signalling yourself through a
+    /// file lock you already hold is a good way to lose your own registration.
+    reload: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<anyhow::Result<String>>>>,
     /// Tool catalogs discovered during this session.
     ///
     /// The database is an optimisation, not a requirement: without it (no
@@ -71,6 +77,46 @@ pub struct UiState {
 }
 
 impl UiState {
+    /// Builds the state for a UI served by another process's components —
+    /// `mcp serve --management` shares the proxy's pool, audit logger and
+    /// tool cache instead of opening a second database.
+    pub fn embedded(
+        addr: String,
+        audit: Arc<AuditLogger>,
+        cache: ToolCacheStore,
+        db_error: Option<String>,
+        reload: Option<
+            tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<anyhow::Result<String>>>,
+        >,
+    ) -> Self {
+        Self {
+            addr,
+            token: SessionToken::generate().as_str().to_string(),
+            read_only: false,
+            started: Instant::now(),
+            audit,
+            cache,
+            db_error,
+            reload,
+            memory: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Re-applies the config in this process (team mode). `None` means the UI
+    /// is a separate process and must signal the proxies instead.
+    pub async fn reload_now(&self) -> Option<anyhow::Result<String>> {
+        let sender = self.reload.as_ref()?;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if sender.send(reply).await.is_err() {
+            return Some(Err(anyhow::anyhow!("reload task is no longer running")));
+        }
+        Some(
+            response
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("reload task dropped the request: {e}"))),
+        )
+    }
+
     pub fn cached(&self, name: &str) -> Option<BackendToolCache> {
         self.cache
             .load_backend(name)
@@ -131,10 +177,11 @@ pub async fn run(opts: Options) -> Result<()> {
         audit,
         cache,
         db_error,
+        reload: None,
         memory: Mutex::new(HashMap::new()),
     });
 
-    let app = router(state.clone());
+    let app = local_router(state.clone());
     let listener = tokio::net::TcpListener::bind(&opts.addr)
         .await
         .with_context(|| format!("failed to bind {}", opts.addr))?;
@@ -163,7 +210,9 @@ pub async fn run(opts: Options) -> Result<()> {
     Ok(())
 }
 
-fn router(state: Arc<UiState>) -> Router {
+/// The route table. The local UI layers a session guard on top of it;
+/// `mcp serve --management` layers its own authentication instead.
+pub(crate) fn routes() -> Router<Arc<UiState>> {
     Router::new()
         .route("/", get(handlers::overview::index))
         .route("/overview", get(handlers::overview::index))
@@ -194,10 +243,15 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/access", get(handlers::access::index))
         .route("/access/check", post(handlers::access::check))
         .route("/settings", get(handlers::settings::index))
-        .route("/reload", post(handlers::settings::reload))
+        .route("/instances/reload", post(handlers::settings::reload))
         .route("/healthz", get(healthz))
         .route("/assets/app.css", get(css))
         .route("/assets/htmx.js", get(htmx))
+}
+
+/// The `mcp ui` router: token-in-URL, session cookie, loopback only.
+pub fn local_router(state: Arc<UiState>) -> Router {
+    routes()
         .layer(middleware::from_fn_with_state(
             state.clone(),
             session::guard,
@@ -232,6 +286,7 @@ async fn htmx() -> impl IntoResponse {
 /// Errors a handler can return, each with the status the browser should see.
 pub enum UiError {
     BadRequest(String),
+    Forbidden(String),
     NotFound(String),
     Conflict(String),
     Internal(anyhow::Error),
@@ -241,6 +296,7 @@ impl std::fmt::Debug for UiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UiError::BadRequest(m) => write!(f, "bad request: {m}"),
+            UiError::Forbidden(m) => write!(f, "forbidden: {m}"),
             UiError::NotFound(m) => write!(f, "not found: {m}"),
             UiError::Conflict(m) => write!(f, "conflict: {m}"),
             UiError::Internal(e) => write!(f, "internal error: {e:#}"),
@@ -252,6 +308,7 @@ impl std::fmt::Display for UiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UiError::BadRequest(m) => write!(f, "{m}"),
+            UiError::Forbidden(m) => write!(f, "{m}"),
             UiError::NotFound(m) => write!(f, "{m}"),
             UiError::Conflict(m) => write!(f, "{m}"),
             UiError::Internal(e) => write!(f, "{e:#}"),
@@ -275,6 +332,7 @@ impl IntoResponse for UiError {
     fn into_response(self) -> Response {
         let (status, title, detail) = match self {
             UiError::BadRequest(m) => (StatusCode::BAD_REQUEST, "Bad request", m),
+            UiError::Forbidden(m) => (StatusCode::FORBIDDEN, "Not allowed", m),
             UiError::NotFound(m) => (StatusCode::NOT_FOUND, "Not found", m),
             UiError::Conflict(m) => (StatusCode::CONFLICT, "Conflict", m),
             UiError::Internal(e) => {
@@ -408,6 +466,7 @@ mod tests {
             audit: Arc::new(AuditLogger::Disabled),
             cache: ToolCacheStore::new(Arc::new(DbPool::disabled())),
             db_error: Some("no native library".to_string()),
+            reload: None,
             memory: Mutex::new(HashMap::new()),
         }
     }

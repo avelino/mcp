@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use crate::ui::data;
 use crate::ui::MapExt;
-use crate::ui::{render, Flash, UiError, UiResult, UiState};
+use crate::ui::{render, CurrentViewer, Flash, UiError, UiResult, UiState};
 
 pub async fn index(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
     let (source, cfg) = data::load_source()?;
@@ -22,7 +23,8 @@ pub async fn index(
         let Some(cached) = state.cached(name) else {
             continue;
         };
-        let (rows, _, _, _) = data::tool_rows(&cached.tools, config.tool_acl());
+        let visible = data::visible_tools(&viewer, &cfg, name, &cached.tools);
+        let (rows, _, _, _) = data::tool_rows(&visible, config.tool_acl());
         let tools: Vec<Value> = rows
             .into_iter()
             .map(|row| json!({ "name": row["name"], "kind": row["kind"] }))
@@ -42,7 +44,8 @@ pub async fn index(
 
     if !want_server.is_empty() && !want_tool.is_empty() {
         if let Some(cached) = state.cached(&want_server) {
-            if let Some(tool) = cached.tools.iter().find(|t| t.name == want_tool) {
+            let visible = data::visible_tools(&viewer, &cfg, &want_server, &cached.tools);
+            if let Some(tool) = visible.iter().find(|t| t.name == want_tool) {
                 let class = crate::classifier::classify(
                     tool,
                     cfg.servers.get(&want_server).and_then(|c| c.tool_acl()),
@@ -97,6 +100,7 @@ pub async fn index(
         "Playground",
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put("servers", json!(servers));
@@ -112,6 +116,7 @@ pub async fn index(
 
 pub async fn call(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
     data::csrf_ok(&state, &form)?;
@@ -132,6 +137,15 @@ pub async fn call(
                 "tool \"{tool_name}\" is not in the cache — open the server and run discovery"
             ))
         })?;
+
+    // The catalog page only lists what the viewer may call; this is the
+    // enforcement for a hand-crafted POST.
+    if data::visible_tools(&viewer, &cfg, &server_name, std::slice::from_ref(&tool)).is_empty() {
+        return Err(UiError::Forbidden(format!(
+            "{} may not call {server_name}__{tool_name}",
+            viewer.subject()
+        )));
+    }
 
     let fields = data::schema_fields(tool.input_schema.as_ref());
     let raw_override = form.get("raw_args").cloned().unwrap_or_default();
@@ -166,12 +180,15 @@ pub async fn call(
 
             data::audit_ui(
                 &state,
-                "tools/call",
-                Some(&tool_name),
-                Some(&server_name),
-                !is_error,
-                elapsed,
-                None,
+                &viewer,
+                data::UiAction {
+                    method: "tools/call",
+                    tool: Some(&tool_name),
+                    server: Some(&server_name),
+                    ok: !is_error,
+                    duration_ms: elapsed,
+                    error: None,
+                },
             );
 
             ctx.put("ok", json!(!is_error));
@@ -191,12 +208,15 @@ pub async fn call(
             let message = format!("{e:#}");
             data::audit_ui(
                 &state,
-                "tools/call",
-                Some(&tool_name),
-                Some(&server_name),
-                false,
-                elapsed,
-                Some(message.clone()),
+                &viewer,
+                data::UiAction {
+                    method: "tools/call",
+                    tool: Some(&tool_name),
+                    server: Some(&server_name),
+                    ok: false,
+                    duration_ms: elapsed,
+                    error: Some(message.clone()),
+                },
             );
             ctx.put("ok", json!(false));
             ctx.put("status", json!("error"));

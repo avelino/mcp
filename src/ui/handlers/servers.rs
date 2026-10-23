@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::config_source::ConfigSource;
 use crate::ui::data::{self, EditForm};
 use crate::ui::MapExt;
-use crate::ui::{redirect_with, render, Flash, UiError, UiResult, UiState};
+use crate::ui::{redirect_with, render, CurrentViewer, Flash, UiError, UiResult, UiState};
 
 // ---------------------------------------------------------------------------
 // List + add
@@ -15,11 +15,12 @@ use crate::ui::{redirect_with, render, Flash, UiError, UiResult, UiState};
 
 pub async fn list(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
     let (source, cfg) = data::load_source()?;
-    let snapshot = data::audit_snapshot(&state, 24, 5_000);
-    let rows = data::server_rows(&cfg, &state, &snapshot.per_server);
+    let snapshot = data::audit_snapshot(&state, 24, 5_000, None);
+    let rows = data::server_rows(&cfg, &state, &viewer, &snapshot.per_server);
 
     let search = query
         .get("q")
@@ -49,6 +50,7 @@ pub async fn list(
         "Servers",
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put("servers", json!(rows));
@@ -61,11 +63,12 @@ pub async fn list(
 
 pub async fn add(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Response> {
     data::csrf_ok(&state, &form)?;
     let source = ConfigSource::load()?;
-    data::ensure_writable(&state, &source)?;
+    data::ensure_writable(&state, &source, &viewer)?;
 
     let name = form.get("name").map(|s| s.trim()).unwrap_or("").to_string();
     if name.is_empty() {
@@ -118,13 +121,23 @@ pub async fn add(
 
     let next = source.set_server(&name, &entry)?;
     source.apply(&next)?;
-    data::audit_ui(&state, "ui/config/add", None, Some(&name), true, 0, None);
-    let (signalled, _, _) = super::reload_instances(None);
-
+    data::audit_ui(
+        &state,
+        &viewer,
+        data::UiAction {
+            method: "ui/config/add",
+            tool: None,
+            server: Some(&name),
+            ok: true,
+            duration_ms: 0,
+            error: None,
+        },
+    );
+    let published = super::publish(&state).await;
     Ok(redirect_with(
         &format!("/servers/{}", crate::ui::urlencode(&name)),
         "ok",
-        &format!("Added {name}; signalled {signalled} instance(s)"),
+        &format!("Added {name}. {published}"),
     )
     .into_response())
 }
@@ -135,6 +148,7 @@ pub async fn add(
 
 pub async fn detail(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Path(name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
@@ -149,8 +163,11 @@ pub async fn detail(
 
     let cached = state.cached(&name);
     let overrides = config.tool_acl();
-    let tools = cached.as_ref().map(|c| c.tools.as_slice()).unwrap_or(&[]);
-    let (tool_rows, read, write, ambiguous) = data::tool_rows(tools, overrides);
+    let tools = cached
+        .as_ref()
+        .map(|c| data::visible_tools(&viewer, &cfg, &name, &c.tools))
+        .unwrap_or_default();
+    let (tool_rows, read, write, ambiguous) = data::tool_rows(&tools, overrides);
 
     let stale = match (&cached, cfg.config_hashes.get(&name)) {
         (Some(c), Some(hash)) => &c.config_hash != hash,
@@ -167,6 +184,7 @@ pub async fn detail(
         &name,
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put(
@@ -202,6 +220,7 @@ pub async fn detail(
 
 pub async fn edit_form(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Path(name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
@@ -212,7 +231,7 @@ pub async fn edit_form(
     let raw = source
         .server(&name)?
         .ok_or_else(|| UiError::NotFound(format!("server \"{name}\" is not in the file")))?;
-    data::ensure_writable(&state, &source)?;
+    data::ensure_writable(&state, &source, &viewer)?;
 
     let label = super::source_label(&source);
     let mut ctx = render::base_context(
@@ -221,6 +240,7 @@ pub async fn edit_form(
         &format!("Edit {name}"),
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put("server", form_view(&name, &raw));
@@ -235,12 +255,13 @@ pub async fn edit_form(
 
 pub async fn plan_edit(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Path(name): Path<String>,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
     data::csrf_ok(&state, &form)?;
     let (source, cfg) = data::load_source()?;
-    data::ensure_writable(&state, &source)?;
+    data::ensure_writable(&state, &source, &viewer)?;
     let raw = source
         .server(&name)?
         .ok_or_else(|| UiError::NotFound(format!("server \"{name}\" not found")))?;
@@ -268,12 +289,13 @@ pub async fn plan_edit(
 
 pub async fn apply_edit(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Path(name): Path<String>,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Response> {
     data::csrf_ok(&state, &form)?;
     let (source, _cfg) = data::load_source()?;
-    data::ensure_writable(&state, &source)?;
+    data::ensure_writable(&state, &source, &viewer)?;
 
     if let Some(expected) = form.get("expected_hash") {
         if expected != &source.hash() {
@@ -298,14 +320,22 @@ pub async fn apply_edit(
 
     match source.apply(&outcome.text) {
         Ok(applied) => {
-            data::audit_ui(&state, "ui/config/update", None, Some(&name), true, 0, None);
-            let (signalled, _, errors) = super::reload_instances(None);
-            let mut message = format!("Saved {name}; signalled {signalled} instance(s)");
+            data::audit_ui(
+                &state,
+                &viewer,
+                data::UiAction {
+                    method: "ui/config/update",
+                    tool: None,
+                    server: Some(&name),
+                    ok: true,
+                    duration_ms: 0,
+                    error: None,
+                },
+            );
+            let published = super::publish(&state).await;
+            let mut message = format!("Saved {name}. {published}");
             if let Some(backup) = applied.backup {
                 message.push_str(&format!(" · backup {}", backup.display()));
-            }
-            if !errors.is_empty() {
-                message.push_str(&format!(" · reload errors: {}", errors.join("; ")));
             }
             Ok(redirect_with(
                 &format!("/servers/{}", crate::ui::urlencode(&name)),
@@ -320,12 +350,15 @@ pub async fn apply_edit(
         Err(e) => {
             data::audit_ui(
                 &state,
-                "ui/config/update",
-                None,
-                Some(&name),
-                false,
-                0,
-                Some(format!("{e:#}")),
+                &viewer,
+                data::UiAction {
+                    method: "ui/config/update",
+                    tool: None,
+                    server: Some(&name),
+                    ok: false,
+                    duration_ms: 0,
+                    error: Some(format!("{e:#}")),
+                },
             );
             Err(UiError::Internal(e))
         }
@@ -492,33 +525,46 @@ fn globs(acl: Option<&Value>, key: &str) -> String {
 
 pub async fn delete(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Path(name): Path<String>,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Response> {
     data::csrf_ok(&state, &form)?;
     let source = ConfigSource::load()?;
-    data::ensure_writable(&state, &source)?;
+    data::ensure_writable(&state, &source, &viewer)?;
     if source.server(&name)?.is_none() {
         return Err(UiError::NotFound(format!("server \"{name}\" not found")));
     }
     let next = source.remove_server(&name)?;
     source.apply(&next)?;
-    data::audit_ui(&state, "ui/config/remove", None, Some(&name), true, 0, None);
-    let (signalled, _, _) = super::reload_instances(None);
-    Ok(redirect_with(
-        "/servers",
-        "ok",
-        &format!("Removed {name}; signalled {signalled} instance(s)"),
-    )
-    .into_response())
+    data::audit_ui(
+        &state,
+        &viewer,
+        data::UiAction {
+            method: "ui/config/remove",
+            tool: None,
+            server: Some(&name),
+            ok: true,
+            duration_ms: 0,
+            error: None,
+        },
+    );
+    let published = super::publish(&state).await;
+    Ok(redirect_with("/servers", "ok", &format!("Removed {name}. {published}")).into_response())
 }
 
 pub async fn discover(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Path(name): Path<String>,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Response> {
     data::csrf_ok(&state, &form)?;
+    if !viewer.can_write() {
+        return Err(UiError::Forbidden(
+            "discovery starts a backend process and needs an admin role".to_string(),
+        ));
+    }
     let (_source, cfg) = data::load_source()?;
     let config = cfg
         .servers
@@ -547,12 +593,15 @@ pub async fn discover(
             );
             data::audit_ui(
                 &state,
-                "tools/list",
-                None,
-                Some(&name),
-                true,
-                started.elapsed().as_millis() as u64,
-                None,
+                &viewer,
+                data::UiAction {
+                    method: "tools/list",
+                    tool: None,
+                    server: Some(&name),
+                    ok: true,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    error: None,
+                },
             );
             Ok(redirect_with(
                 &format!("/servers/{}", crate::ui::urlencode(&name)),
@@ -565,12 +614,15 @@ pub async fn discover(
             let message = format!("{e:#}");
             data::audit_ui(
                 &state,
-                "tools/list",
-                None,
-                Some(&name),
-                false,
-                started.elapsed().as_millis() as u64,
-                Some(message.clone()),
+                &viewer,
+                data::UiAction {
+                    method: "tools/list",
+                    tool: None,
+                    server: Some(&name),
+                    ok: false,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    error: Some(message.clone()),
+                },
             );
             Ok(redirect_with(
                 &format!("/servers/{}", crate::ui::urlencode(&name)),

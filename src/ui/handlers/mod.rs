@@ -18,6 +18,33 @@ pub fn source_label(source: &ConfigSource) -> String {
         .unwrap_or_else(|| crate::config_source::INLINE_SOURCE.to_string())
 }
 
+/// Publishes a config change.
+///
+/// Inside the proxy (team mode) the config is re-applied in process; from
+/// `mcp ui` the only way to reach the proxies is SIGHUP through the instance
+/// registry, and the message says so.
+pub async fn publish(state: &crate::ui::UiState) -> String {
+    match state.reload_now().await {
+        Some(Ok(message)) => message,
+        Some(Err(e)) => format!("config saved, but the reload failed: {e:#}"),
+        None => {
+            let (signalled, tried, errors) = reload_instances(None);
+            if tried == 0 {
+                "config saved; no running mcp serve instance to signal".to_string()
+            } else if errors.is_empty() {
+                format!(
+                    "config saved; signalled {signalled} of {tried} instance(s) — SIGHUP is a request, not an acknowledgement"
+                )
+            } else {
+                format!(
+                    "config saved; signalled {signalled} of {tried} instance(s); errors: {}",
+                    errors.join("; ")
+                )
+            }
+        }
+    }
+}
+
 /// Sends SIGHUP to every live instance (or just `pid`), returning
 /// `(signalled, tried, errors)`.
 ///

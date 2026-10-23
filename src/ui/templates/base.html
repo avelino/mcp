@@ -36,6 +36,7 @@
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
         Activity
       </a>
+      {% if viewer_admin %}
       <div class="nav-label">Govern</div>
       <a href="/access" class="{% if active == 'access' %}on{% endif %}">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg>
@@ -45,6 +46,7 @@
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>
         Settings
       </a>
+      {% endif %}
     </nav>
     <div class="side-foot">
       <div class="instance-chip">
@@ -60,7 +62,11 @@
     <header class="topbar">
       <div class="crumb">mcp / <b>{{ page_title }}</b></div>
       <div class="spacer"></div>
-      {% if read_only %}
+      {% if viewer_team %}
+      <span class="chip" title="authenticated by the proxy">{{ subject }}</span>
+      {% if viewer_admin %}<span class="chip ok">admin</span>{% endif %}
+      <a class="btn sm ghost" href="/logout">Sign out</a>
+      {% elif read_only %}
       <span class="chip warn" title="{{ read_only_reason }}">read-only</span>
       {% else %}
       <span class="chip ok">editable</span>
@@ -80,7 +86,7 @@
       {% endif %}
       {% block content %}{% endblock %}
     </div>
-    <div class="foot">mcp {{ version }} · {{ config_path }} · every write is audited</div>
+    <div class="foot">mcp {{ version }}{% if viewer_admin %} · {{ config_path }} · every write is audited{% endif %}</div>
   </main>
 </div>
 </body>

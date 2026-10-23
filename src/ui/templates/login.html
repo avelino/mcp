@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · mcp</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<main class="login-wrap">
+  <div class="card login-card">
+    <div class="row" style="gap:10px;margin-bottom:18px">
+      <div class="logo">m</div>
+      <div>
+        <div class="brand-name">mcp</div>
+        <div class="brand-sub">control room</div>
+      </div>
+    </div>
+    <h1>Sign in</h1>
+    <p class="sub" style="margin-bottom:16px">This proxy asks for a token before showing its configuration and audit trail.</p>
+
+    {% if error %}
+    <div class="banner err">
+      <div><div class="t">Not signed in</div><div class="d">{{ error }}</div></div>
+    </div>
+    {% endif %}
+
+    <form method="post" action="/login">
+      <input type="hidden" name="next" value="{{ next }}">
+      <div class="field">
+        <label>Bearer token</label>
+        <input class="input" type="password" name="token" autofocus autocomplete="off" required>
+      </div>
+      <button class="btn primary" style="width:100%;justify-content:center">Sign in</button>
+    </form>
+
+    <p class="tiny muted" style="margin-top:16px">
+      The token is validated by the proxy's configured provider on every request and kept in an
+      HttpOnly, SameSite=Strict cookie. No session is stored on the server, so revoking the token
+      signs the browser out on the next click.
+    </p>
+  </div>
+  <p class="tiny muted" style="text-align:center;margin-top:14px">mcp {{ version }}</p>
+</main>
+</body>
+</html>

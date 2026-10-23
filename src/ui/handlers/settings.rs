@@ -6,12 +6,15 @@ use std::sync::Arc;
 
 use crate::ui::data;
 use crate::ui::MapExt;
-use crate::ui::{render, Flash, UiResult, UiState};
+use crate::ui::Viewer;
+use crate::ui::{render, CurrentViewer, Flash, UiError, UiResult, UiState};
 
 pub async fn index(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
+    require_admin(&viewer)?;
     let (source, cfg) = data::load_source()?;
     let instances = data::instances_view();
     let total = state
@@ -30,6 +33,7 @@ pub async fn index(
         "Settings",
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put("instances", json!(instances));
@@ -82,23 +86,38 @@ pub async fn index(
 
 pub async fn reload(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Response> {
+    require_admin(&viewer)?;
     data::csrf_ok(&state, &form)?;
     if state.read_only {
         return Err(crate::ui::UiError::BadRequest("read-only mode".to_string()));
+    }
+    // Inside the proxy, reloading means re-reading this process's config.
+    // `pid` only exists for the local UI, which signals other processes.
+    if state.reload_now().await.is_some() {
+        let message = super::publish(&state).await;
+        return Ok(axum::response::Redirect::to(&format!(
+            "/settings?ok={}",
+            crate::ui::urlencode(&message)
+        ))
+        .into_response());
     }
     let pid = form.get("pid").and_then(|p| p.trim().parse::<u32>().ok());
     let (signalled, tried, errors) = super::reload_instances(pid);
 
     data::audit_ui(
         &state,
-        "config/reload",
-        None,
-        None,
-        signalled == tried && errors.is_empty(),
-        0,
-        (!errors.is_empty()).then(|| errors.join("; ")),
+        &viewer,
+        data::UiAction {
+            method: "config/reload",
+            tool: None,
+            server: None,
+            ok: signalled == tried && errors.is_empty(),
+            duration_ms: 0,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        },
     );
 
     let message = if tried == 0 {
@@ -128,4 +147,14 @@ pub async fn reload(
         crate::ui::urlencode(&message)
     ))
     .into_response())
+}
+
+fn require_admin(viewer: &Viewer) -> UiResult<()> {
+    if viewer.can_write() {
+        Ok(())
+    } else {
+        Err(UiError::Forbidden(
+            "settings are limited to roles listed in serverAuth.adminRoles".to_string(),
+        ))
+    }
 }

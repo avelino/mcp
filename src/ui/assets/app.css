@@ -212,3 +212,9 @@ pre.diff .ctx { color: var(--txt-2); display: block; }
   .nav-label, .side-foot { display: none; }
   .split, .g2, .g3, .g4 { grid-template-columns: 1fr; }
 }
+
+
+/* sign-in (team mode) */
+.login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px; align-content: center; gap: 4px; }
+.login-card { width: 390px; max-width: 94vw; padding: 22px; }
+.login-card h1 { font-size: 19px; }

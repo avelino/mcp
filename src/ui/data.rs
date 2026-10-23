@@ -6,12 +6,12 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
 use crate::audit::{AuditEntry, AuditFilter};
-use crate::cache::BackendToolCache;
 use crate::classifier;
 use crate::config::{Config, IdleTimeoutPolicy, ServerConfig, ToolOverrides};
 use crate::config_source::ConfigSource;
 use crate::protocol::Tool;
 
+use super::viewer::Viewer;
 use super::{UiResult, UiState};
 
 /// Snapshot of the audit log used by the overview and activity pages.
@@ -25,10 +25,16 @@ pub struct AuditSnapshot {
     pub rows: Vec<AuditEntry>,
 }
 
-pub fn audit_snapshot(state: &UiState, since_hours: i64, limit: usize) -> AuditSnapshot {
+pub fn audit_snapshot(
+    state: &UiState,
+    since_hours: i64,
+    limit: usize,
+    identity: Option<&str>,
+) -> AuditSnapshot {
     let filter = AuditFilter {
         limit,
         since: Some(chrono::Duration::hours(since_hours)),
+        identity: identity.map(str::to_string),
         ..Default::default()
     };
     let entries = state.audit.query_filtered(&filter).unwrap_or_default();
@@ -98,7 +104,12 @@ pub fn idle_label(config: &ServerConfig) -> String {
 }
 
 /// One row per configured server, joined with its cache and 24h call count.
-pub fn server_rows(cfg: &Config, state: &UiState, calls: &HashMap<String, usize>) -> Vec<Value> {
+pub fn server_rows(
+    cfg: &Config,
+    state: &UiState,
+    viewer: &Viewer,
+    calls: &HashMap<String, usize>,
+) -> Vec<Value> {
     let mut names: Vec<&String> = cfg.servers.keys().collect();
     names.sort();
     names
@@ -106,7 +117,11 @@ pub fn server_rows(cfg: &Config, state: &UiState, calls: &HashMap<String, usize>
         .map(|name| {
             let config = &cfg.servers[name];
             let cached = state.cached(name);
-            let (tools, read, write) = classify_cached(config, cached.as_ref());
+            let visible = cached
+                .as_ref()
+                .map(|c| visible_tools(viewer, cfg, name, &c.tools))
+                .unwrap_or_default();
+            let (tools, read, write) = classify_tools(config, &visible);
             let stale = match (&cached, cfg.config_hashes.get(name)) {
                 (Some(c), Some(hash)) => &c.config_hash != hash,
                 (None, _) => false,
@@ -132,23 +147,52 @@ pub fn server_rows(cfg: &Config, state: &UiState, calls: &HashMap<String, usize>
         .collect()
 }
 
-pub fn classify_cached(
-    config: &ServerConfig,
-    cached: Option<&BackendToolCache>,
-) -> (usize, usize, usize) {
-    let Some(cache) = cached else {
-        return (0, 0, 0);
-    };
+pub fn classify_tools(config: &ServerConfig, tools: &[Tool]) -> (usize, usize, usize) {
     let overrides: Option<&ToolOverrides> = config.tool_acl();
     let mut read = 0;
     let mut write = 0;
-    for tool in &cache.tools {
+    for tool in tools {
         match classifier::classify(tool, overrides).kind {
             classifier::Kind::Read => read += 1,
             _ => write += 1,
         }
     }
-    (cache.tools.len(), read, write)
+    (tools.len(), read, write)
+}
+
+/// The tools this viewer may call.
+///
+/// In the local UI every tool is visible: the person running it is the person
+/// whose config it is. In team mode the catalog is filtered by the same ACL
+/// the proxy applies to `tools/list`, so the UI cannot show a tool the viewer
+/// would be denied when calling it.
+pub fn visible_tools(viewer: &Viewer, cfg: &Config, server: &str, tools: &[Tool]) -> Vec<Tool> {
+    if viewer.is_local() {
+        return tools.to_vec();
+    }
+    let Some(identity) = &viewer.identity else {
+        return tools.to_vec();
+    };
+    let overrides = cfg.servers.get(server).and_then(|c| c.tool_acl());
+    tools
+        .iter()
+        .filter(|tool| {
+            let classification = classifier::classify(tool, overrides);
+            let ctx = crate::server_auth::ToolContext {
+                server_alias: server,
+                tool_name: &tool.name,
+                classification: Some(&classification),
+            };
+            crate::server_auth::is_tool_allowed(
+                identity,
+                &format!("{server}__{}", tool.name),
+                &cfg.server_auth.acl,
+                Some(&ctx),
+            )
+            .allowed
+        })
+        .cloned()
+        .collect()
 }
 
 /// Tool table rows, classified the same way the proxy does.
@@ -508,7 +552,12 @@ pub fn load_source() -> UiResult<(ConfigSource, Config)> {
 }
 
 /// Validates that the UI may write, returning the read-only reason otherwise.
-pub fn ensure_writable(state: &UiState, source: &ConfigSource) -> UiResult<()> {
+pub fn ensure_writable(state: &UiState, source: &ConfigSource, viewer: &Viewer) -> UiResult<()> {
+    if !viewer.can_write() {
+        return Err(super::UiError::Forbidden(
+            "this action needs an admin role (serverAuth.adminRoles)".to_string(),
+        ));
+    }
     if state.read_only {
         return Err(super::UiError::BadRequest(
             "this UI was started with --read-only".to_string(),
@@ -535,25 +584,17 @@ pub fn csrf_ok(state: &UiState, form: &HashMap<String, String>) -> UiResult<()> 
 }
 
 /// Records a UI action in the same audit trail as everything else.
-pub fn audit_ui(
-    state: &UiState,
-    method: &str,
-    tool: Option<&str>,
-    server: Option<&str>,
-    ok: bool,
-    duration_ms: u64,
-    error: Option<String>,
-) {
+pub fn audit_ui(state: &UiState, viewer: &Viewer, action: UiAction<'_>) {
     state.audit.log(AuditEntry {
         timestamp: chrono::Local::now().to_rfc3339(),
         source: "ui".to_string(),
-        method: method.to_string(),
-        tool_name: tool.map(str::to_string),
-        server_name: server.map(str::to_string),
-        identity: "local".to_string(),
-        duration_ms,
-        success: ok,
-        error_message: error,
+        method: action.method.to_string(),
+        tool_name: action.tool.map(str::to_string),
+        server_name: action.server.map(str::to_string),
+        identity: viewer.subject().to_string(),
+        duration_ms: action.duration_ms,
+        success: action.ok,
+        error_message: action.error,
         arguments: None,
         acl_decision: None,
         acl_matched_rule: None,
@@ -562,6 +603,16 @@ pub fn audit_ui(
         classification_source: None,
         classification_confidence: None,
     });
+}
+
+/// One UI action, as it should appear in the audit trail.
+pub struct UiAction<'a> {
+    pub method: &'a str,
+    pub tool: Option<&'a str>,
+    pub server: Option<&'a str>,
+    pub ok: bool,
+    pub duration_ms: u64,
+    pub error: Option<String>,
 }
 
 pub fn instances_view() -> Vec<Value> {
@@ -601,6 +652,7 @@ pub fn instances_view() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_auth::AuthIdentity;
     use serde_json::json;
 
     fn form(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -740,6 +792,83 @@ mod tests {
         assert_eq!(next["env"]["TOKEN"], "${T}");
         assert_eq!(next["env"]["B"], "2");
         assert!(next["env"].get("# comment").is_none());
+    }
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            description: None,
+            input_schema: None,
+            annotations: None,
+        }
+    }
+
+    /// A tool the classifier is sure about, without depending on how it scores
+    /// descriptions: the proxy honours `readOnlyHint` before heuristics.
+    fn read_tool(name: &str) -> Tool {
+        Tool {
+            annotations: Some(crate::protocol::ToolAnnotations {
+                read_only_hint: Some(true),
+                destructive_hint: None,
+                idempotent_hint: None,
+                open_world_hint: None,
+            }),
+            ..tool(name)
+        }
+    }
+
+    fn team_config() -> Config {
+        crate::config::validate_config_text(
+            r#"{
+              "mcpServers": { "sentry": { "url": "https://example.com/mcp" } },
+              "serverAuth": {
+                "acl": {
+                  "default": "deny",
+                  "roles": {
+                    "admin": [{ "server": "*", "access": "*" }],
+                    "dev": [{ "server": "sentry", "access": "read" }],
+                    "nothing": []
+                  },
+                  "subjects": {}
+                }
+              }
+            }"#,
+            std::path::PathBuf::from("<test>"),
+        )
+        .expect("test config")
+    }
+
+    #[test]
+    fn the_catalog_is_filtered_by_the_viewers_acl() {
+        let cfg = team_config();
+        let tools = vec![read_tool("search_issues"), tool("resolve_issue")];
+
+        let local = Viewer::local();
+        assert_eq!(visible_tools(&local, &cfg, "sentry", &tools).len(), 2);
+
+        let dev = Viewer::team(AuthIdentity::new("bob", vec!["dev".into()]), false);
+        let visible = visible_tools(&dev, &cfg, "sentry", &tools);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(
+            visible[0].name, "search_issues",
+            "write tool is filtered out"
+        );
+
+        let admin = Viewer::team(AuthIdentity::new("alice", vec!["admin".into()]), true);
+        assert_eq!(visible_tools(&admin, &cfg, "sentry", &tools).len(), 2);
+
+        let nobody = Viewer::team(AuthIdentity::new("eve", vec!["nothing".into()]), false);
+        assert!(visible_tools(&nobody, &cfg, "sentry", &tools).is_empty());
+    }
+
+    #[test]
+    fn a_local_viewer_is_never_filtered_even_with_an_acl_configured() {
+        let cfg = team_config();
+        let tools = vec![tool("resolve_issue")];
+        assert_eq!(
+            visible_tools(&Viewer::local(), &cfg, "sentry", &tools).len(),
+            1
+        );
     }
 
     #[test]

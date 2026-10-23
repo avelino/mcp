@@ -20,7 +20,7 @@
 </div>
 {% endif %}
 
-<div class="grid g4" style="margin-bottom:14px">
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr));margin-bottom:14px">
   <div class="card stat">
     <div class="k">Backends</div>
     <div class="v">{{ stats.servers }} <small>configured</small></div>
@@ -36,11 +36,13 @@
     <div class="v">{{ stats.calls }}</div>
     <div class="d">{{ stats.errors }} failed · {{ stats.denied }} denied</div>
   </div>
+  {% if not viewer_team %}
   <div class="card stat">
     <div class="k">Instances</div>
     <div class="v">{{ instances | length }}</div>
     <div class="d">running <code class="mono">mcp serve</code> processes</div>
   </div>
+  {% endif %}
 </div>
 
 <div class="split">
@@ -76,6 +78,7 @@
       </div>
     </div>
 
+    {% if not viewer_team %}
     <div class="card">
       <div class="card-h"><h2>Running instances</h2><span class="spacer"></span><span class="chip">{{ instances | length }}</span></div>
       <div class="card-b flush">
@@ -105,6 +108,7 @@
         {% endif %}
       </div>
     </div>
+    {% endif %}
   </div>
 
   <div class="stack">
@@ -124,6 +128,7 @@
       </div>
     </div>
 
+    {% if viewer_admin %}
     <div class="card">
       <div class="card-h"><h2>Config</h2></div>
       <div class="card-b">
@@ -135,6 +140,7 @@
         </dl>
       </div>
     </div>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

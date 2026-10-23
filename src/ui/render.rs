@@ -8,7 +8,7 @@ use minijinja::Environment;
 use serde_json::{json, Map, Value};
 use std::sync::OnceLock;
 
-use super::{urlencode, Flash, MapExt, UiState};
+use super::{urlencode, Flash, MapExt, UiState, Viewer};
 
 const TEMPLATES: &[(&str, &str)] = &[
     ("base.html", include_str!("templates/base.html")),
@@ -20,6 +20,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("activity.html", include_str!("templates/activity.html")),
     ("access.html", include_str!("templates/access.html")),
     ("settings.html", include_str!("templates/settings.html")),
+    ("login.html", include_str!("templates/login.html")),
     (
         "partials/plan.html",
         include_str!("templates/partials/plan.html"),
@@ -92,6 +93,7 @@ pub fn base_context(
     title: &str,
     server_count: usize,
     config_path: &str,
+    viewer: &Viewer,
     flash: &Flash,
 ) -> Map<String, Value> {
     let mut ctx = Map::new();
@@ -107,6 +109,9 @@ pub fn base_context(
     ctx.put("config_path", json!(config_path));
     ctx.put("flash_ok", json!(flash.ok));
     ctx.put("flash_err", json!(flash.err));
+    ctx.put("viewer_team", json!(!viewer.is_local()));
+    ctx.put("viewer_admin", json!(viewer.admin));
+    ctx.put("subject", json!(viewer.subject()));
     ctx.put("db_error", json!(state.db_error));
     ctx
 }

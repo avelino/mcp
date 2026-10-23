@@ -70,6 +70,8 @@ fn print_usage() {
     eprintln!("  mcp reload --url <url>              Reload a remote proxy over HTTP");
     eprintln!("  mcp serve                           Start proxy server (stdio)");
     eprintln!("  mcp serve --http [addr]             Start proxy server over HTTP");
+    eprintln!("  mcp serve --http [addr] --management");
+    eprintln!("                                      Also serve the web UI, behind serverAuth");
     eprintln!("  mcp logs                            Show recent audit log entries");
     eprintln!("  mcp logs --limit N                  Show last N entries (default: 50)");
     eprintln!("  mcp logs --server <name>            Filter by backend server");
@@ -214,7 +216,8 @@ async fn run() -> Result<()> {
                 "catalog filtered for this instance"
             );
         }
-        return serve::run(cfg, http_addr.as_deref(), insecure, filter).await;
+        let management = rest.iter().any(|a| a == "--management");
+        return serve::run(cfg, http_addr.as_deref(), insecure, filter, management).await;
     }
 
     if args[0] == "ui" {

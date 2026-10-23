@@ -8,14 +8,15 @@ use std::sync::Arc;
 use crate::audit::AuditFilter;
 use crate::ui::data;
 use crate::ui::MapExt;
-use crate::ui::{render, Flash, UiResult, UiState};
+use crate::ui::{render, CurrentViewer, Flash, UiResult, UiState, Viewer};
 
 pub async fn index(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
     let (source, cfg) = data::load_source()?;
-    let filter = filter_from(&query);
+    let filter = filter_from(&query, &viewer);
     let entries = state.audit.query_filtered(&filter).unwrap_or_default();
 
     let mut server_names: Vec<String> = cfg.servers.keys().cloned().collect();
@@ -35,6 +36,7 @@ pub async fn index(
         "Activity",
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put("rows", json!(rows(&entries)));
@@ -59,9 +61,10 @@ pub async fn index(
 
 pub async fn rows_only(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
-    let filter = filter_from(&query);
+    let filter = filter_from(&query, &viewer);
     let entries = state.audit.query_filtered(&filter).unwrap_or_default();
     let mut ctx = serde_json::Map::new();
     ctx.put("rows", json!(rows(&entries)));
@@ -71,9 +74,10 @@ pub async fn rows_only(
 
 pub async fn export(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Response> {
-    let filter = filter_from(&query);
+    let filter = filter_from(&query, &viewer);
     let entries = state.audit.query_filtered(&filter).unwrap_or_default();
     let body = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into());
     Ok((
@@ -89,7 +93,9 @@ pub async fn export(
         .into_response())
 }
 
-fn filter_from(query: &HashMap<String, String>) -> AuditFilter {
+/// A non-admin only ever sees their own entries: the query string cannot
+/// widen that, because the identity is written here, after the user's input.
+fn filter_from(query: &HashMap<String, String>, viewer: &Viewer) -> AuditFilter {
     let mut filter = AuditFilter {
         limit: 200,
         errors_only: query.contains_key("errors"),
@@ -100,6 +106,9 @@ fn filter_from(query: &HashMap<String, String>) -> AuditFilter {
     }
     if let Some(identity) = non_empty(query.get("identity")) {
         filter.identity = Some(identity);
+    }
+    if !viewer.admin {
+        filter.identity = Some(viewer.subject().to_string());
     }
     let since = query.get("since").map(String::as_str).unwrap_or("24h");
     filter.since = crate::audit::parse_duration(since).ok();

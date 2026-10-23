@@ -7,15 +7,18 @@ use std::sync::Arc;
 use crate::ui::data;
 use crate::ui::render;
 use crate::ui::MapExt;
-use crate::ui::{Flash, UiResult, UiState};
+use crate::ui::{CurrentViewer, Flash, UiResult, UiState};
 
 pub async fn index(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
     let (source, cfg) = data::load_source()?;
-    let snapshot = data::audit_snapshot(&state, 24, 5_000);
-    let servers = data::server_rows(&cfg, &state, &snapshot.per_server);
+    // A non-admin sees their own activity, not everybody else's.
+    let own_identity = (!viewer.admin).then(|| viewer.subject().to_string());
+    let snapshot = data::audit_snapshot(&state, 24, 5_000, own_identity.as_deref());
+    let servers = data::server_rows(&cfg, &state, &viewer, &snapshot.per_server);
     let instances = data::instances_view();
 
     let mut http = 0;
@@ -52,6 +55,7 @@ pub async fn index(
         "Overview",
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put(

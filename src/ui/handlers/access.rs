@@ -8,12 +8,14 @@ use crate::server_auth::AclConfig;
 use crate::server_auth::AuthIdentity;
 use crate::ui::data;
 use crate::ui::MapExt;
-use crate::ui::{render, Flash, UiResult, UiState};
+use crate::ui::{render, CurrentViewer, Flash, UiError, UiResult, UiState, Viewer};
 
 pub async fn index(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
+    require_admin(&viewer)?;
     let (source, cfg) = data::load_source()?;
     let auth = &cfg.server_auth;
 
@@ -51,6 +53,7 @@ pub async fn index(
         "Access",
         cfg.servers.len(),
         &label,
+        &viewer,
         &Flash::from_query(&query),
     );
     ctx.put("has_acl", json!(raw_acl.is_some()));
@@ -68,8 +71,10 @@ pub async fn index(
 
 pub async fn check(
     State(state): State<Arc<UiState>>,
+    CurrentViewer(viewer): CurrentViewer,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
+    require_admin(&viewer)?;
     data::csrf_ok(&state, &form)?;
     let (_source, cfg) = data::load_source()?;
 
@@ -300,5 +305,17 @@ fn list_or(value: Option<&Value>, empty: &str) -> String {
             }
         }
         _ => empty.to_string(),
+    }
+}
+
+/// The ACL page describes the whole policy, including who is in which role.
+/// That is operator data, so it belongs to the same roles that may change it.
+fn require_admin(viewer: &Viewer) -> UiResult<()> {
+    if viewer.can_write() {
+        Ok(())
+    } else {
+        Err(UiError::Forbidden(
+            "the access policy is visible to roles listed in serverAuth.adminRoles".to_string(),
+        ))
     }
 }

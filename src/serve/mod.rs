@@ -14,6 +14,7 @@ mod reload;
 #[cfg(test)]
 mod reload_tests;
 mod stdio;
+pub(crate) mod team;
 
 use crate::config::Config;
 use crate::instances::InstanceFilter;
@@ -29,9 +30,17 @@ pub async fn run(
     http_addr: Option<&str>,
     insecure: bool,
     filter: InstanceFilter,
+    management: bool,
 ) -> Result<()> {
     match http_addr {
-        Some(addr) => run_http(config, addr, insecure, filter).await,
-        None => run_stdio(config, filter).await,
+        Some(addr) => run_http(config, addr, insecure, filter, management).await,
+        None => {
+            if management {
+                anyhow::bail!(
+                    "--management needs `--http`: the UI is served over HTTP, not over the MCP stdio pipe"
+                );
+            }
+            run_stdio(config, filter).await
+        }
     }
 }
