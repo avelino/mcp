@@ -44,6 +44,7 @@ pub use viewer::{CurrentViewer, Viewer};
 
 const HTMX: &str = include_str!("assets/htmx.min.js");
 const APP_CSS: &str = include_str!("assets/app.css");
+const THEME_JS: &str = include_str!("assets/theme.js");
 
 /// How the UI was started.
 pub struct Options {
@@ -300,6 +301,7 @@ pub(crate) fn routes() -> Router<Arc<UiState>> {
         .route("/healthz", get(healthz))
         .route("/assets/app.css", get(css))
         .route("/assets/htmx.js", get(htmx))
+        .route("/assets/theme.js", get(theme_js))
 }
 
 /// What to print for a bind address.
@@ -337,6 +339,16 @@ async fn css() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         APP_CSS,
+    )
+}
+
+async fn theme_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        THEME_JS,
     )
 }
 

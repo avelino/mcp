@@ -3,8 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>{{ page_title }} · mcp</title>
 <link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/theme.js"></script>
 <script src="/assets/htmx.js" defer></script>
 </head>
 <body hx-headers='{"x-mcp-ui":"1"}'>
@@ -62,6 +64,10 @@
     <header class="topbar">
       <div class="crumb">mcp / <b>{{ page_title }}</b></div>
       <div class="spacer"></div>
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="Change theme">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>
+  <span data-theme-label>auto</span>
+</button>
       {% if viewer_team %}
       <span class="chip" title="authenticated by the proxy">{{ subject }}</span>
       {% if viewer_admin %}<span class="chip ok">admin</span>{% endif %}

@@ -105,6 +105,20 @@ Two things to know before exposing it:
 
 Team mode does not add a JSON API yet: the pages are server-rendered and the MCP endpoint stays `/mcp`. A `/api/v1` for automation is the next step, not this one.
 
+## Theme
+
+Light and dark are both first-class. Every colour is a CSS custom property; the light palette is not an inversion — the accent darkens to keep contrast on white (`#0b8f68` against `#f6f9f7`), and the semantic colours (warn, error, read-only) get their own light values.
+
+The page follows `prefers-color-scheme` until you choose otherwise. The toggle in the topbar cycles **auto → light → dark**; the choice lives in `localStorage` under `mcp-theme` and is applied by a small script in `<head>`, before first paint, so there is no dark flash on a light-mode reload. Nothing is stored server-side, so it is a per-browser preference.
+
+```
+🌗 auto     ← follows the OS
+☀ light
+☾ dark
+```
+
+The login page and the one-time token page carry the same toggle, since they are the first thing an operator sees.
+
 ## Docker
 
 The UI runs unchanged in the container; it just has to bind inside it and be told which URL to print.
