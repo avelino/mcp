@@ -85,7 +85,10 @@
       <tbody>
         {% for s in servers %}
         <tr>
-          <td><a class="mono" style="font-weight:600" href="/servers/{{ s.name | urlencode }}">{{ s.name }}</a></td>
+          <td>
+            <a class="mono" style="font-weight:600" href="/servers/{{ s.name | urlencode }}">{{ s.name }}</a>
+            {% if not s.available %}<span class="chip err" title="{{ s.unavailable_reason }}">unavailable</span>{% endif %}
+          </td>
           <td><span class="chip">{{ s.kind }}</span></td>
           <td class="tiny muted mono" style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ s.endpoint }}</td>
           <td class="tiny mono">{{ s.tools }}</td>

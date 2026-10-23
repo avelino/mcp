@@ -140,7 +140,7 @@ Three container-specific things:
 | | |
 |---|---|
 | **Audit and cache are off by default** | The image sets `MCP_AUDIT_ENABLED=false` (the database downloads a native library on first open). Activity is empty and discovery lives in memory for the session. Pass `-e MCP_AUDIT_ENABLED=true` with a writable volume if you want persistence — the ChronDB library still has to be fetchable for your platform. |
-| **stdio backends need the `full` image** | `docker build --target full-source -t mcp:full .` adds `npx`, `uvx`, `docker`, `kubectl` and `gh`. In the scratch image a stdio backend is reported as unavailable — `mcp --list` says so instead of failing later. |
+| **stdio backends need the `full` image** | `docker build --target full-source -t mcp:full .` adds `npx`, `uvx`, `docker`, `kubectl` and `gh`. In the scratch image a stdio backend shows up as **unavailable here**, with the reason from the same preflight `mcp --list` runs (`command not found in PATH: npx`), and *Connect now* is disabled instead of failing after the click. |
 | **Files are written as root on Linux** | The config is edited in place, so backups created from inside the container belong to root. On Docker Desktop this is invisible; on Linux, run with `--user "$(id -u):$(id -g)" -e HOME=/tmp` and mount the config explicitly. |
 | **Mount `:ro` means start with `--read-only`** | Editing needs to write a temp file next to the config. With a read-only mount every apply fails; `mcp ui --read-only` disables the forms up front instead. |
 

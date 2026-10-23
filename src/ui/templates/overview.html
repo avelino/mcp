@@ -65,7 +65,8 @@
           <tbody>
             {% for s in servers %}
             <tr class="click" onclick="location.href='/servers/{{ s.name | urlencode }}'">
-              <td><div class="row"><span class="dot {{ s.dot }}"></span><span class="mono" style="font-weight:600">{{ s.name }}</span></div></td>
+              <td><div class="row"><span class="dot {{ s.dot }}"></span><span class="mono" style="font-weight:600">{{ s.name }}</span>
+                {% if not s.available %}<span class="chip err" title="{{ s.unavailable_reason }}">missing</span>{% endif %}</div></td>
               <td><span class="chip">{{ s.kind }}</span></td>
               <td>{{ s.tools }}{% if s.read or s.write %} <span class="tiny muted">({{ s.read }}r/{{ s.write }}w)</span>{% endif %}</td>
               <td class="tiny muted mono">{{ s.cached_at }}</td>

@@ -74,6 +74,13 @@ pub fn short_time(timestamp: &str) -> String {
         .unwrap_or_else(|| timestamp.chars().take(19).collect())
 }
 
+/// The same preflight `mcp --list` runs: can this backend's command start
+/// here at all? HTTP backends always answer `None` — reachability needs a
+/// request, and this is a config view.
+pub fn unavailable_reason(config: &ServerConfig) -> Option<String> {
+    crate::output::server_unavailable_reason(config)
+}
+
 pub fn kind_of(config: &ServerConfig) -> &'static str {
     match config {
         ServerConfig::Http { .. } => "http",
@@ -142,6 +149,8 @@ pub fn server_rows(
                 "stale": stale,
                 "dot": if cached.is_some() && !stale { "ok" } else if cached.is_some() { "warn" } else { "" },
                 "calls": calls.get(name).copied().unwrap_or(0),
+                "available": unavailable_reason(config).is_none(),
+                "unavailable_reason": unavailable_reason(config),
             })
         })
         .collect()
@@ -836,6 +845,30 @@ mod tests {
             std::path::PathBuf::from("<test>"),
         )
         .expect("test config")
+    }
+
+    #[test]
+    fn a_backend_whose_command_is_missing_is_flagged_before_spawning() {
+        let cfg = crate::config::validate_config_text(
+            r#"{
+              "mcpServers": {
+                "ghost": { "command": "mcp-not-a-real-binary-xyz", "args": [] },
+                "remote": { "url": "https://example.com/mcp" }
+              }
+            }"#,
+            std::path::PathBuf::from("<test>"),
+        )
+        .expect("test config");
+
+        let reason = unavailable_reason(&cfg.servers["ghost"]).expect("must be unavailable");
+        assert!(
+            reason.contains("mcp-not-a-real-binary-xyz"),
+            "reason should name the command: {reason}"
+        );
+        assert!(
+            unavailable_reason(&cfg.servers["remote"]).is_none(),
+            "HTTP is never preflighted"
+        );
     }
 
     #[test]

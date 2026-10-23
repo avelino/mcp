@@ -187,6 +187,7 @@ pub async fn detail(
         &viewer,
         &Flash::from_query(&query),
     );
+    let unavailable = data::unavailable_reason(config);
     ctx.put(
         "server",
         json!({
@@ -196,6 +197,8 @@ pub async fn detail(
             "idle": data::idle_label(config),
             "stale": stale,
             "has_cache": cached.is_some(),
+            "available": unavailable.is_none(),
+            "unavailable_reason": unavailable,
         }),
     );
     ctx.put("tools", json!(tool_rows));
@@ -570,6 +573,18 @@ pub async fn discover(
         .servers
         .get(&name)
         .ok_or_else(|| UiError::NotFound(format!("server \"{name}\" not found")))?;
+
+    // Fail with the config-view answer before spawning anything: "command does
+    // not exist: npx" is actionable, and it is the same reason `mcp --list`
+    // already reports.
+    if let Some(reason) = data::unavailable_reason(config) {
+        return Ok(redirect_with(
+            &format!("/servers/{}", crate::ui::urlencode(&name)),
+            "err",
+            &format!("Cannot start {name} here: {reason}"),
+        )
+        .into_response());
+    }
 
     let started = std::time::Instant::now();
     let result = async {

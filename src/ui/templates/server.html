@@ -6,19 +6,35 @@
       <h1>{{ server.name }}</h1>
       <span class="chip">{{ server.kind }}</span>
       {% if not server.has_cache %}<span class="chip">no cache</span>{% elif server.stale %}<span class="chip warn">cache stale</span>{% else %}<span class="chip ok">cache ok</span>{% endif %}
+      {% if not (server.available | default(true)) %}<span class="chip err" title="{{ server.unavailable_reason }}">unavailable here</span>{% endif %}
     </div>
     <p class="sub mono" style="font-size:11.5px">{{ server.endpoint }}</p>
   </div>
   <div class="actions">
     <form class="inline" method="post" action="/servers/{{ server.name | urlencode }}/discover">
       <input type="hidden" name="csrf" value="{{ token }}">
-      <button class="btn" {% if read_only %}disabled{% endif %}>Connect now</button>
+      <button class="btn" {% if read_only or not (server.available | default(true)) %}disabled{% endif %}
+              {% if not server.available %}title="{{ server.unavailable_reason }}"{% endif %}>Connect now</button>
     </form>
     {% if not read_only %}
     <a class="btn primary" href="/servers/{{ server.name | urlencode }}/edit">Edit</a>
     {% endif %}
   </div>
 </div>
+
+{% if not (server.available | default(true)) %}
+<div class="banner">
+  <div>
+    <div class="t">This backend cannot start here</div>
+    <div class="d">{{ server.unavailable_reason }}</div>
+    <div class="tiny muted" style="margin-top:4px">
+      The command is not on this process's PATH. In Docker this usually means the scratch image:
+      rebuild with <code class="mono">--target full-source</code> (adds npx, uvx, docker, kubectl, gh),
+      or declare the backend as HTTP.
+    </div>
+  </div>
+</div>
+{% endif %}
 
 <div class="grid g3" style="margin-bottom:14px">
   <div class="card stat">

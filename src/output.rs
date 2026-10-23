@@ -68,7 +68,7 @@ pub fn print_search_results(servers: &[RegistryServer], fmt: OutputFormat) -> Re
 ///
 /// HTTP backends always report `None`: reachability needs a request, and
 /// `--list` is a config view, not a health check.
-fn server_unavailable_reason(config: &ServerConfig) -> Option<String> {
+pub(crate) fn server_unavailable_reason(config: &ServerConfig) -> Option<String> {
     // `env` is not decoration here: a backend may pin its own PATH, and that
     // is the PATH the spawn would use. Reading only ours would report a
     // working backend as unavailable.
