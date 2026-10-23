@@ -179,6 +179,8 @@ Available tags:
 | `x.y.z` / `x.y.z-full` | Pinned version |
 | `beta` / `beta-full` | Latest build from main branch |
 
+Building from a checkout: `docker build .` produces the small image, `docker build --target full-source .` the one with `npx`/`uvx`. See [building the image yourself](docs/howto/docker.md#building-the-image-yourself).
+
 You can also run the proxy as a container instead of a background service. Your MCP client starts and stops it:
 
 ```json

@@ -21,6 +21,43 @@ docker pull ghcr.io/avelino/mcp
 
 Both images ship the same `mcp` binary; `full` only adds runtimes. See [which image](#which-image) for how to choose.
 
+## Building the image yourself
+
+The two published flavours exist as build stages. The small one is the default, because the last stage in the Dockerfile is `scratch`:
+
+```bash
+# what :latest is — scratch, mcp + CA certs, ~27 MB, HTTP backends only
+docker build -t mcp:dev .
+
+# what :full is — alpine plus npx, uvx, docker, kubectl and gh
+docker build --target full-source -t mcp:full .
+```
+
+| Stage | Base | Binary | Use it for |
+|---|---|---|---|
+| *default* (last) | `scratch` | compiled in this build | HTTP backends, smallest image |
+| `full-source` | `alpine` + runtimes | compiled in this build | stdio/CLI backends, the web UI with discovery |
+| `release` / `full` | `scratch` / `alpine` | **copied in** from the build context | CI, after `cargo build --release` |
+| `builder` | `rust:alpine` | — | not runnable on its own |
+
+`--target` is the part that bites. Without it you get `scratch`, so a backend that spawns a command fails with `command not found in PATH: npx` — the file is fine, the image just has no Node. `mcp ui` shows that up front now, on the server's page, instead of failing after you click *Connect now*.
+
+`release` and `full` do not compile anything: they expect an `mcp` binary sitting next to the Dockerfile. They are what CI builds after cross-compiling; from a checkout, use `full-source`.
+
+### The web UI from a container
+
+```bash
+docker run --rm -d --name mcp-ui \
+  -p 127.0.0.1:7332:7332 \
+  -v "$HOME/.config/mcp:/root/.config/mcp" \
+  -e SLACK_MCP_XOXP_TOKEN \
+  mcp:full ui --addr 0.0.0.0:7332 --no-open
+
+docker logs mcp-ui | grep http://
+```
+
+`--addr 0.0.0.0:7332` is required — the default binds loopback *inside* the container, which no published port reaches. Variables referenced as `${VAR}` in the config are expanded by the process, so they have to be passed with `-e`; mounting your shell environment is not enough. The [web UI guide](../guides/web-ui.md#docker) covers the rest, including team mode.
+
 ## Basic usage
 
 The CLI runs as the container entrypoint. Pass arguments directly:
@@ -310,7 +347,7 @@ Use `-e MCP_SERVERS_CONFIG` instead of the volume when the config is inline and 
 | Any other host binary | no | no |
 | Audit | off by default | off by default |
 
-Pick the small one for a config that is entirely HTTP. Pick `:full` when the registry handed you `npx` or `uvx` backends.
+Pick the small one for a config that is entirely HTTP. Pick `:full` when the registry handed you `npx` or `uvx` backends. To build either one locally, see [building the image yourself](#building-the-image-yourself).
 
 ### What cannot follow you into a container
 

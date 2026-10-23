@@ -124,7 +124,7 @@ The login page and the one-time token page carry the same toggle, since they are
 The UI runs unchanged in the container; it just has to bind inside it and be told which URL to print.
 
 ```bash
-# scratch image: HTTP backends only, ~30 MB
+# scratch image: HTTP backends only, ~27 MB
 docker build -t mcp:dev .
 
 docker run --rm -d --name mcp-ui \
@@ -154,7 +154,7 @@ Three container-specific things:
 | | |
 |---|---|
 | **Audit and cache are off by default** | The image sets `MCP_AUDIT_ENABLED=false` (the database downloads a native library on first open). Activity is empty and discovery lives in memory for the session. Pass `-e MCP_AUDIT_ENABLED=true` with a writable volume if you want persistence — the ChronDB library still has to be fetchable for your platform. |
-| **stdio backends need the `full` image** | `docker build --target full-source -t mcp:full .` adds `npx`, `uvx`, `docker`, `kubectl` and `gh`. In the scratch image a stdio backend shows up as **unavailable here**, with the reason from the same preflight `mcp --list` runs (`command not found in PATH: npx`), and *Connect now* is disabled instead of failing after the click. |
+| **stdio backends need the `full` image** | `docker build --target full-source -t mcp:full .` adds `npx`, `uvx`, `docker`, `kubectl` and `gh` — see [building the image yourself](../howto/docker.md#building-the-image-yourself). In the scratch image a stdio backend shows up as **unavailable here**, with the reason from the same preflight `mcp --list` runs (`command not found in PATH: npx`), and *Connect now* is disabled instead of failing after the click. |
 | **Files are written as root on Linux** | The config is edited in place, so backups created from inside the container belong to root. On Docker Desktop this is invisible; on Linux, run with `--user "$(id -u):$(id -g)" -e HOME=/tmp` and mount the config explicitly. |
 | **Mount `:ro` means start with `--read-only`** | Editing needs to write a temp file next to the config. With a read-only mount every apply fails; `mcp ui --read-only` disables the forms up front instead. |
 
