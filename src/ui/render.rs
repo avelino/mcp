@@ -22,6 +22,10 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("settings.html", include_str!("templates/settings.html")),
     ("login.html", include_str!("templates/login.html")),
     (
+        "access_token.html",
+        include_str!("templates/access_token.html"),
+    ),
+    (
         "partials/plan.html",
         include_str!("templates/partials/plan.html"),
     ),

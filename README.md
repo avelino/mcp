@@ -310,7 +310,7 @@ Teams get the same UI from the proxy, behind the auth they already have:
 mcp serve --http 0.0.0.0:7332 --insecure --management
 ```
 
-Readers see the catalog their ACL grants and their own audit entries; roles in `serverAuth.adminRoles` can edit, reload and see the whole policy.
+Readers see the catalog their ACL grants and their own audit entries; roles in `serverAuth.adminRoles` can edit servers, mint and revoke tokens, assign roles to subjects, reload and see the whole policy.
 
 ## Audit logging
 

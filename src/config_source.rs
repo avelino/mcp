@@ -18,7 +18,7 @@
 use anyhow::{bail, Context, Result};
 use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
 use jsonc_parser::ParseOptions;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -210,6 +210,57 @@ impl ConfigSource {
         Ok(text)
     }
 
+    // Edits below `serverAuth` follow the same rule as server edits: only the
+    // touched property is rewritten, so comments around it survive.
+
+    /// Adds or replaces a bearer token. The token itself is the map key, which
+    /// is why the UI never renders it back.
+    pub fn set_bearer_token(&self, token: &str, subject: &str, roles: &[String]) -> Result<String> {
+        check_name(subject)?;
+        let entry = json!({ "subject": subject, "roles": roles });
+        self.set_path(&["serverAuth", "bearer", "tokens", token], &entry)
+    }
+
+    pub fn remove_bearer_token(&self, token: &str) -> Result<String> {
+        self.remove_path(&["serverAuth", "bearer", "tokens", token])
+    }
+
+    /// Creates or updates a subject's roles, preserving any `extra` grants the
+    /// subject already had.
+    pub fn set_subject_roles(&self, subject: &str, roles: &[String]) -> Result<String> {
+        check_name(subject)?;
+        let mut entry = self
+            .parsed()?
+            .pointer(&format!(
+                "/serverAuth/acl/subjects/{}",
+                escape_pointer(subject)
+            ))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !entry.is_object() {
+            entry = json!({});
+        }
+        entry["roles"] = json!(roles);
+        self.set_path(&["serverAuth", "acl", "subjects", subject], &entry)
+    }
+
+    pub fn remove_subject(&self, subject: &str) -> Result<String> {
+        self.remove_path(&["serverAuth", "acl", "subjects", subject])
+    }
+
+    /// Creates or replaces a role's grant list.
+    pub fn set_role_grants(&self, role: &str, grants: &Value) -> Result<String> {
+        check_name(role)?;
+        if !grants.is_array() {
+            bail!("grants must be a JSON array");
+        }
+        self.set_path(&["serverAuth", "acl", "roles", role], grants)
+    }
+
+    pub fn remove_role(&self, role: &str) -> Result<String> {
+        self.remove_path(&["serverAuth", "acl", "roles", role])
+    }
+
     /// Validates the document against the real config schema.
     pub fn validate(&self, text: &str) -> Result<config::Config> {
         let source = self
@@ -339,6 +390,50 @@ pub fn is_conflict(err: &anyhow::Error) -> bool {
 pub fn sha256_hex(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Walks (creating as needed) to the object at `path`.
+fn ensure_path(root: &CstRootNode, path: &[&str]) -> CstObject {
+    let mut object = root.object_value_or_set();
+    for segment in path {
+        object = object.object_value_or_set(segment);
+    }
+    object
+}
+
+impl ConfigSource {
+    fn set_path(&self, path: &[&str], value: &Value) -> Result<String> {
+        let (last, parents) = path
+            .split_last()
+            .context("a config path needs at least one segment")?;
+        let root = self.parse_cst()?;
+        let object = ensure_path(&root, parents);
+        let value = to_input(value);
+        match object.get(last) {
+            Some(property) => property.set_value(value),
+            None => {
+                object.append(last, value);
+            }
+        }
+        Ok(root.to_string())
+    }
+
+    fn remove_path(&self, path: &[&str]) -> Result<String> {
+        let (last, parents) = path
+            .split_last()
+            .context("a config path needs at least one segment")?;
+        let root = self.parse_cst()?;
+        let object = ensure_path(&root, parents);
+        if let Some(property) = object.get(last) {
+            property.remove();
+        }
+        Ok(root.to_string())
+    }
+}
+
+/// JSON-pointer escaping for a single segment (RFC 6901).
+fn escape_pointer(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 fn parse_jsonc(text: &str) -> Result<Value> {
@@ -651,6 +746,105 @@ mod tests {
 
         let broken = SAMPLE.replace("\"url\": \"https://mcp.sentry.dev/sse\"", "\"nope\": 1");
         assert!(src.validate(&broken).is_err());
+    }
+
+    const AUTH_SAMPLE: &str = r#"{
+  "mcpServers": {},
+  "serverAuth": {
+    // who may reload
+    "adminRoles": ["admin"],
+    "bearer": {
+      "tokens": {
+        "tok-alice": { "subject": "alice", "roles": ["admin"] }
+      }
+    },
+    "acl": {
+      "default": "deny",
+      "roles": {
+        "admin": [{ "server": "*", "access": "*" }]
+      },
+      "subjects": {
+        "alice": { "roles": ["admin"], "extra": [{ "server": "sentry", "access": "read" }] }
+      }
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn tokens_can_be_added_and_removed_without_touching_comments() {
+        let src = source(AUTH_SAMPLE);
+        let out = src
+            .set_bearer_token("tok-bob", "bob", &["dev".to_string()])
+            .unwrap();
+        assert!(out.contains("// who may reload"));
+        let parsed = parse_jsonc(&out).unwrap();
+        assert_eq!(
+            parsed["serverAuth"]["bearer"]["tokens"]["tok-bob"]["subject"],
+            json!("bob")
+        );
+        assert_eq!(
+            parsed["serverAuth"]["bearer"]["tokens"]["tok-alice"]["subject"],
+            json!("alice")
+        );
+
+        let back = src.remove_bearer_token("tok-alice").unwrap();
+        let parsed = parse_jsonc(&back).unwrap();
+        assert!(parsed["serverAuth"]["bearer"]["tokens"]
+            .get("tok-alice")
+            .is_none());
+        assert!(back.contains("// who may reload"));
+    }
+
+    #[test]
+    fn subject_roles_are_replaced_but_extra_grants_survive() {
+        let src = source(AUTH_SAMPLE);
+        let out = src
+            .set_subject_roles("alice", &["admin".to_string(), "dev".to_string()])
+            .unwrap();
+        let parsed = parse_jsonc(&out).unwrap();
+        let alice = &parsed["serverAuth"]["acl"]["subjects"]["alice"];
+        assert_eq!(alice["roles"], json!(["admin", "dev"]));
+        assert_eq!(alice["extra"][0]["server"], json!("sentry"));
+    }
+
+    #[test]
+    fn a_new_subject_is_created_with_its_roles() {
+        let src = source(AUTH_SAMPLE);
+        let out = src
+            .set_subject_roles("carol", &["dev".to_string()])
+            .unwrap();
+        let parsed = parse_jsonc(&out).unwrap();
+        assert_eq!(
+            parsed["serverAuth"]["acl"]["subjects"]["carol"]["roles"],
+            json!(["dev"])
+        );
+    }
+
+    #[test]
+    fn roles_can_be_created_and_removed() {
+        let src = source(AUTH_SAMPLE);
+        let grants = json!([{ "server": "sentry", "access": "read" }]);
+        let out = src.set_role_grants("reader", &grants).unwrap();
+        let parsed = parse_jsonc(&out).unwrap();
+        assert_eq!(
+            parsed["serverAuth"]["acl"]["roles"]["reader"][0]["server"],
+            json!("sentry")
+        );
+
+        let back = src.remove_role("admin").unwrap();
+        let parsed = parse_jsonc(&back).unwrap();
+        assert!(parsed["serverAuth"]["acl"]["roles"].get("admin").is_none());
+    }
+
+    #[test]
+    fn auth_edits_keep_the_document_valid() {
+        let src = source(AUTH_SAMPLE);
+        let out = src
+            .set_bearer_token("tok-bob", "bob", &["dev".to_string()])
+            .unwrap();
+        let cfg = src.validate(&out).expect("valid after token add");
+        assert_eq!(cfg.server_auth.bearer.unwrap().tokens.len(), 2);
     }
 
     #[test]

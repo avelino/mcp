@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token created · mcp</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<main class="login-wrap">
+  <div class="card login-card" style="width:560px">
+    <div class="row" style="gap:10px;margin-bottom:18px">
+      <div class="logo">m</div>
+      <div>
+        <div class="brand-name">mcp</div>
+        <div class="brand-sub">control room</div>
+      </div>
+    </div>
+    <h1>Token created</h1>
+    <p class="sub" style="margin-bottom:16px">
+      For <b>{{ subject }}</b>{% if roles %} with roles {% for r in roles %}<span class="chip">{{ r }}</span>{% endfor %}{% endif %}.
+      Copy it now — this page is the only time it exists in readable form.
+    </p>
+
+    <textarea class="input" rows="3" readonly onclick="this.select()" style="font-size:12px">{{ token }}</textarea>
+
+    <div class="banner ok" style="margin-top:16px">
+      <div>
+        <div class="t">Store it somewhere safe</div>
+        <div class="d">The config now holds only a fingerprint. If you lose the token, revoke it and create another.</div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <a class="btn primary" href="/access">Done</a>
+      <span class="spacer"></span>
+      <span class="tiny muted mono">mcp {{ version }}</span>
+    </div>
+  </div>
+</main>
+</body>
+</html>

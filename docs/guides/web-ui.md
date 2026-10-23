@@ -144,6 +144,29 @@ Three container-specific things:
 | **Files are written as root on Linux** | The config is edited in place, so backups created from inside the container belong to root. On Docker Desktop this is invisible; on Linux, run with `--user "$(id -u):$(id -g)" -e HOME=/tmp` and mount the config explicitly. |
 | **Mount `:ro` means start with `--read-only`** | Editing needs to write a temp file next to the config. With a read-only mount every apply fails; `mcp ui --read-only` disables the forms up front instead. |
 
+## Managing people
+
+Admins can do the two things that actually change who has access: mint or revoke a token, and change which roles a subject holds.
+
+| Action | Where | What it writes |
+|---|---|---|
+| Create a token | Access → Bearer tokens | `serverAuth.bearer.tokens.<token>` as `{subject, roles}` |
+| Revoke a token | Access → row → Revoke | removes that key |
+| Add or change a subject's roles | Access → Subjects | `serverAuth.acl.subjects.<name>.roles`, keeping `extra` grants |
+| Remove a subject | Access → row → Remove | removes the subject entry |
+| Create a role | Access → Roles → "Create role" | copies the grant list from an existing role into `serverAuth.acl.roles.<new>` |
+| Remove a role | Access → row → Remove | removes the role, if nothing uses it |
+
+Rules the page enforces, because getting them wrong locks people out:
+
+- **A new token is shown once.** The page that displays it is reached by an unguessable id, is not a redirect, and is consumed on first view. After that the config holds only the token as a map key, and the UI shows a fingerprint (`sha256[..12]`) — there is no way to read it back, so "I lost the token" means revoke and create another.
+- **You cannot revoke the token you are signed in with.** From another session, yes; from the same browser it is refused, or the next click would sign you out mid-action.
+- **The last admin credential is protected.** Removing a token is refused when no remaining bearer token would hold a role from `serverAuth.adminRoles` — a role on a *subject* does not count, since nobody could authenticate as it. With `forwarded`/`oauth_as` providers the guard steps aside: identities come from elsewhere and cannot be enumerated here.
+- **Roles cannot be deleted while in use**, while listed in `adminRoles`, or when the ACL uses the legacy `rules` schema (in that case the page also disables subject editing).
+- **Role grants are not editable here.** Creating a role copies an existing grant list; changing grants is a file edit. The alternative — a nested editor for `server, access, tools, resources, prompts, deny` — is a form nobody trusts and a diff nobody reads.
+
+Every one of these writes goes through the same plan/apply path as a server edit: atomic write, backup, `409` if the file moved underneath, and an audit entry whose `identity` is the admin's subject.
+
 ## Limits worth knowing
 
 - **The ACL is not enforced here.** It is policy for `mcp serve --http`. The local UI, like the CLI, runs as you and can call any configured backend; the Access screen says so and is a *simulator*, not a gate.
@@ -151,7 +174,7 @@ Three container-specific things:
 - **The database is optional.** If the embedded database cannot be opened (no native library for the platform, read-only filesystem, `audit.enabled = false`), `mcp ui` still starts: the Activity trail is empty, the on-disk tool cache is off, and discovery results live in memory for the session. A banner says so. Config editing is unaffected.
 - **Discovery spawns processes.** "Connect now" starts the backend exactly like `mcp <server> --list` does.
 - **Signals are not acknowledgements.** Reload sends `SIGHUP` and reports how many processes were signalled; the proxy applies the new config on its own.
-- **Team mode is read-heavy.** It exposes the UI and the MCP endpoint; scripting against the UI's data needs the (not yet built) JSON API.
+- **No JSON API yet.** The UI and the MCP endpoint are the surface; scripting against the UI's own data needs `/api/v1`, which is not built.
 
 ## Flags
 

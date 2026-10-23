@@ -54,6 +54,13 @@ pub struct Options {
 }
 
 /// Shared server state. Handlers get an `Arc<UiState>`.
+/// A bearer token created through the UI, waiting to be displayed once.
+pub struct PendingToken {
+    pub subject: String,
+    pub roles: Vec<String>,
+    pub token: String,
+}
+
 pub struct UiState {
     pub addr: String,
     pub token: String,
@@ -68,6 +75,9 @@ pub struct UiState {
     /// registry is deliberately not used here: signalling yourself through a
     /// file lock you already hold is a good way to lose your own registration.
     reload: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<anyhow::Result<String>>>>,
+    /// Tokens minted by the UI, held only until the page that shows them is
+    /// read once. A secret that goes back into a URL or a log stops being one.
+    pending_tokens: Mutex<HashMap<String, PendingToken>>,
     /// Tool catalogs discovered during this session.
     ///
     /// The database is an optimisation, not a requirement: without it (no
@@ -98,6 +108,7 @@ impl UiState {
             cache,
             db_error,
             reload,
+            pending_tokens: Mutex::new(HashMap::new()),
             memory: Mutex::new(HashMap::new()),
         }
     }
@@ -115,6 +126,27 @@ impl UiState {
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("reload task dropped the request: {e}"))),
         )
+    }
+
+    /// Stores a freshly minted token and returns the id used to show it once.
+    pub fn stash_token(&self, subject: &str, roles: &[String], token: &str) -> String {
+        let id = SessionToken::generate().as_str().to_string();
+        if let Ok(mut pending) = self.pending_tokens.lock() {
+            pending.insert(
+                id.clone(),
+                PendingToken {
+                    subject: subject.to_string(),
+                    roles: roles.to_vec(),
+                    token: token.to_string(),
+                },
+            );
+        }
+        id
+    }
+
+    /// Reads and forgets a stashed token.
+    pub fn take_token(&self, id: &str) -> Option<PendingToken> {
+        self.pending_tokens.lock().ok()?.remove(id)
     }
 
     pub fn cached(&self, name: &str) -> Option<BackendToolCache> {
@@ -178,6 +210,7 @@ pub async fn run(opts: Options) -> Result<()> {
         cache,
         db_error,
         reload: None,
+        pending_tokens: Mutex::new(HashMap::new()),
         memory: Mutex::new(HashMap::new()),
     });
 
@@ -246,6 +279,22 @@ pub(crate) fn routes() -> Router<Arc<UiState>> {
         .route("/activity.json", get(handlers::activity::export))
         .route("/access", get(handlers::access::index))
         .route("/access/check", post(handlers::access::check))
+        .route("/access/tokens", post(handlers::access::create_token))
+        .route("/access/tokens/{id}", get(handlers::access::token_created))
+        .route(
+            "/access/tokens/{fingerprint}/delete",
+            post(handlers::access::revoke_token),
+        )
+        .route("/access/subjects", post(handlers::access::save_subject))
+        .route(
+            "/access/subjects/{name}/delete",
+            post(handlers::access::delete_subject),
+        )
+        .route("/access/roles", post(handlers::access::duplicate_role))
+        .route(
+            "/access/roles/{name}/delete",
+            post(handlers::access::delete_role),
+        )
         .route("/settings", get(handlers::settings::index))
         .route("/instances/reload", post(handlers::settings::reload))
         .route("/healthz", get(healthz))
@@ -485,6 +534,7 @@ mod tests {
             cache: ToolCacheStore::new(Arc::new(DbPool::disabled())),
             db_error: Some("no native library".to_string()),
             reload: None,
+            pending_tokens: Mutex::new(HashMap::new()),
             memory: Mutex::new(HashMap::new()),
         }
     }
