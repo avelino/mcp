@@ -229,6 +229,62 @@ pub fn tool_rows(
     (rows, read, write, ambiguous)
 }
 
+/// Shown instead of a literal secret. One string, used by the config view, the
+/// edit form and the diff, so a value can round-trip through the form without
+/// the browser ever holding it.
+pub const REDACTED: &str = "•••• (redacted)";
+
+/// Values shorter than this are not treated as secrets when sealing a diff:
+/// replacing "1" or "true" would shred the surrounding context without
+/// protecting anything worth protecting.
+const MIN_SECRET_LEN: usize = 4;
+
+/// A `${VAR}` reference is safe to show; anything else in a header or env value
+/// may be a secret.
+pub fn redact_secret(value: &str) -> String {
+    if value.contains("${") {
+        value.to_string()
+    } else if value.is_empty() {
+        String::new()
+    } else {
+        REDACTED.to_string()
+    }
+}
+
+/// Literal (non-placeholder) values from a server's `headers` and `env`.
+///
+/// Used to seal a diff: the diff is computed on the raw bytes, then these
+/// substrings are replaced before the HTML is rendered.
+pub fn literal_secrets(value: &Value) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for key in ["headers", "env"] {
+        let Some(map) = value.get(key).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for value in map.values() {
+            let Some(text) = value.as_str() else { continue };
+            if !text.contains("${") && text.len() >= MIN_SECRET_LEN {
+                secrets.push(text.to_string());
+            }
+        }
+    }
+    secrets
+}
+
+/// Replaces literal secret values inside a rendered diff.
+///
+/// String matching, not JSON parsing, on purpose: parsing and re-rendering
+/// would drop the comments the diff exists to show.
+pub fn seal_diff(diff: &str, secrets: &[String]) -> String {
+    let mut sealed = diff.to_string();
+    for secret in secrets {
+        if secret.len() >= MIN_SECRET_LEN {
+            sealed = sealed.replace(secret, REDACTED);
+        }
+    }
+    sealed
+}
+
 /// Redacts values that look like credentials while keeping `${VAR}`
 /// placeholders readable — they are references, not secrets.
 pub fn redact(value: &Value) -> Value {
@@ -271,22 +327,92 @@ fn redact_deep(value: &Value, in_secret_map: bool) -> Value {
                 .map(|v| redact_deep(v, in_secret_map))
                 .collect(),
         ),
-        Value::String(s) if in_secret_map => {
-            if s.contains("${") {
-                Value::String(s.clone())
-            } else {
-                Value::String(redacted_value(&Value::String(s.clone())))
-            }
-        }
+        Value::String(s) if in_secret_map => Value::String(redact_secret(s)),
         other => other.clone(),
     }
 }
 
 fn redacted_value(value: &Value) -> String {
     match value {
-        Value::String(s) if s.contains("${") => s.clone(),
-        _ => "•••• (redacted)".to_string(),
+        Value::String(s) => redact_secret(s),
+        _ => REDACTED.to_string(),
     }
+}
+
+/// The edit form's values, built from the **raw** entry and never from the
+/// loaded config.
+///
+/// Two reasons. `load_config` expands `${VAR}` before parsing, so using the
+/// typed value here would show "Bearer " instead of "Bearer ${SENTRY_TOKEN}"
+/// and applying the form would write that empty value back. And a literal
+/// secret must not reach the browser at all: `redact_secret` replaces it with
+/// the sentinel, which `EditForm::apply_to` turns back into the stored value
+/// when the field is submitted untouched.
+pub fn form_view(name: &str, raw: &Value) -> Value {
+    let kind = if raw.get("url").is_some() {
+        "http"
+    } else if raw.get("cli").and_then(Value::as_bool).unwrap_or(false) {
+        "cli"
+    } else {
+        "stdio"
+    };
+
+    let url = raw.get("url").and_then(Value::as_str).unwrap_or("");
+    let command = raw.get("command").and_then(Value::as_str).unwrap_or("");
+    let args: Vec<String> = raw
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let acl = raw.get("tool_acl");
+
+    json!({
+        "name": name,
+        "kind": kind,
+        "url": url,
+        "command": command,
+        // Quoted, so an argument containing spaces survives the round-trip.
+        "args": shell_words::join(&args),
+        "headers_text": pairs_text(raw.get("headers"), ": "),
+        "env_text": pairs_text(raw.get("env"), "="),
+        "idle": raw.get("idle_timeout").and_then(Value::as_str).unwrap_or("adaptive"),
+        "tool_acl_read": globs(acl, "read"),
+        "tool_acl_write": globs(acl, "write"),
+    })
+}
+
+fn pairs_text(value: Option<&Value>, separator: &str) -> String {
+    let Some(map) = value.and_then(Value::as_object) else {
+        return String::new();
+    };
+    let mut lines: Vec<String> = map
+        .iter()
+        .map(|(k, v)| {
+            let value = v.as_str().map(redact_secret).unwrap_or_default();
+            format!("{k}{separator}{value}")
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn globs(acl: Option<&Value>, key: &str) -> String {
+    acl.and_then(|a| a.get(key))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
 }
 
 /// Parses the tool schema into form fields the playground can render without
@@ -463,7 +589,9 @@ impl EditForm<'_> {
     ///
     /// Only the fields present in the form are touched; everything else in the
     /// entry (unknown keys, `forward_identity`, `tools`) survives untouched.
-    pub fn apply_to(&self, current: &Value) -> Value {
+    /// Values submitted as the redaction sentinel are read back from `current`,
+    /// which is the only place the real secret exists.
+    pub fn apply_to(&self, current: &Value) -> Result<Value, String> {
         let mut next = current.as_object().cloned().unwrap_or_default();
         let kind = if next.contains_key("url") {
             "http"
@@ -475,32 +603,45 @@ impl EditForm<'_> {
 
         if kind == "http" {
             next.insert("url".into(), json!(self.get("url").trim()));
-            match parse_pairs(self.get("headers"), ':') {
-                pairs if pairs.is_empty() => {
-                    next.remove("headers");
-                }
-                pairs => {
-                    next.insert("headers".into(), json!(pairs));
-                }
+            let headers = restore_redacted(
+                parse_pairs(self.get("headers"), ':'),
+                current.get("headers"),
+            )?;
+            if headers.is_empty() {
+                next.remove("headers");
+            } else {
+                next.insert("headers".into(), json!(headers));
             }
         } else {
             next.insert("command".into(), json!(self.get("command").trim()));
             let args = self.get("args").trim();
+            let current_args: Vec<String> = current
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             if args.is_empty() {
                 next.remove("args");
+            } else if args == shell_words::join(&current_args) {
+                // Untouched: keep the array byte-for-byte, so quitting the form
+                // cannot reinterpret an argument that was already correct.
+                if !current_args.is_empty() {
+                    next.insert("args".into(), json!(current_args));
+                }
             } else {
-                next.insert(
-                    "args".into(),
-                    json!(args.split_whitespace().collect::<Vec<_>>()),
-                );
+                let parsed = shell_words::split(args).map_err(|e| format!("args: {e}"))?;
+                next.insert("args".into(), json!(parsed));
             }
-            match parse_pairs(self.get("env"), '=') {
-                pairs if pairs.is_empty() => {
-                    next.remove("env");
-                }
-                pairs => {
-                    next.insert("env".into(), json!(pairs));
-                }
+            let env = restore_redacted(parse_pairs(self.get("env"), '='), current.get("env"))?;
+            if env.is_empty() {
+                next.remove("env");
+            } else {
+                next.insert("env".into(), json!(env));
             }
         }
 
@@ -523,8 +664,36 @@ impl EditForm<'_> {
             next.insert("tool_acl".into(), json!({ "read": read, "write": write }));
         }
 
-        Value::Object(next)
+        Ok(Value::Object(next))
     }
+}
+
+/// Puts the stored value back where the form shows the redaction sentinel.
+///
+/// A sentinel for a key the entry does not have is dropped: there is no secret
+/// to restore, and writing the sentinel itself would corrupt the config.
+fn restore_redacted(
+    pairs: std::collections::BTreeMap<String, String>,
+    current: Option<&Value>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value) in pairs {
+        if value == REDACTED {
+            if let Some(existing) = current.and_then(|c| c.get(&key)).and_then(Value::as_str) {
+                out.insert(key, existing.to_string());
+            }
+        } else if value.contains(REDACTED) {
+            // The placeholder mixed with typed text: there is no way to know
+            // which part is the secret, and writing the placeholder into the
+            // config is worse than refusing.
+            return Err(format!(
+                "{key}: the redacted placeholder cannot be edited — clear the field and type the value, or leave it untouched"
+            ));
+        } else {
+            out.insert(key, value);
+        }
+    }
+    Ok(out)
 }
 
 fn split_globs(raw: &str) -> Vec<String> {
@@ -766,7 +935,8 @@ mod tests {
                 ("idle_timeout", "adaptive"),
             ]),
         }
-        .apply_to(&current);
+        .apply_to(&current)
+        .expect("the form is valid");
         assert_eq!(next["idle_timeout"], "adaptive");
         assert_eq!(next["forward_identity"]["header"], "X-MCP-Subject");
         assert_eq!(next["future_key"], 7);
@@ -782,7 +952,8 @@ mod tests {
                 ("idle_timeout", "adaptive"),
             ]),
         }
-        .apply_to(&current);
+        .apply_to(&current)
+        .expect("the form is valid");
         assert!(next.get("idle_timeout").is_none(), "default stays implicit");
     }
 
@@ -796,7 +967,8 @@ mod tests {
                 ("env", "TOKEN=${T}\n# comment\nB=2"),
             ]),
         }
-        .apply_to(&current);
+        .apply_to(&current)
+        .expect("the form is valid");
         assert_eq!(next["args"], json!(["-y", "a", "--flag", "b"]));
         assert_eq!(next["env"]["TOKEN"], "${T}");
         assert_eq!(next["env"]["B"], "2");
@@ -901,6 +1073,155 @@ mod tests {
         assert_eq!(
             visible_tools(&Viewer::local(), &cfg, "sentry", &tools).len(),
             1
+        );
+    }
+
+    #[test]
+    fn the_edit_form_never_contains_a_literal_secret() {
+        let raw = json!({
+            "url": "https://example.com/mcp",
+            "headers": {
+                "Authorization": "Bearer sk-live-123456",
+                "X-Team": "platform"
+            },
+            "env": { "TOKEN": "${GITHUB_TOKEN}", "MODE": "strict" }
+        });
+        let view = form_view("sentry", &raw);
+        let text = view.to_string();
+        assert!(
+            !text.contains("sk-live-123456"),
+            "header secret leaked: {text}"
+        );
+        assert!(!text.contains("platform"), "header value leaked: {text}");
+        assert!(!text.contains("strict"), "env value leaked: {text}");
+        assert!(
+            text.contains("${GITHUB_TOKEN}"),
+            "placeholder must stay readable"
+        );
+        assert_eq!(
+            view["headers_text"],
+            "Authorization: •••• (redacted)\nX-Team: •••• (redacted)"
+        );
+        assert_eq!(
+            view["env_text"],
+            "MODE=•••• (redacted)\nTOKEN=${GITHUB_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn an_untouched_redacted_field_keeps_the_stored_secret() {
+        let current = json!({
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer sk-live-123456" },
+            "env": { "MODE": "strict" }
+        });
+        let mut form = form(&[("url", "https://example.com/mcp")]);
+        form.insert("headers".into(), format!("Authorization: {REDACTED}"));
+        form.insert("env".into(), format!("MODE={REDACTED}"));
+        let next = EditForm { form: &form }
+            .apply_to(&current)
+            .expect("valid form");
+        assert_eq!(next["headers"]["Authorization"], "Bearer sk-live-123456");
+        assert_eq!(next["env"]["MODE"], "strict");
+    }
+
+    #[test]
+    fn text_mixed_with_the_placeholder_is_refused() {
+        let current = json!({
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer sk-live-123456" }
+        });
+        let form = form(&[
+            ("url", "https://example.com/mcp"),
+            ("headers", &format!("Authorization: Bearer {REDACTED}")),
+        ]);
+        let err = EditForm { form: &form }.apply_to(&current).unwrap_err();
+        assert!(err.contains("placeholder"), "{err}");
+    }
+
+    #[test]
+    fn a_sentinel_for_an_unknown_key_is_dropped() {
+        let current = json!({ "url": "https://example.com/mcp" });
+        let form = form(&[
+            ("url", "https://example.com/mcp"),
+            ("headers", &format!("X-New: {REDACTED}")),
+        ]);
+        let next = EditForm { form: &form }
+            .apply_to(&current)
+            .expect("valid form");
+        assert!(
+            next.get("headers").is_none(),
+            "nothing to restore, and the sentinel must not be written"
+        );
+    }
+
+    #[test]
+    fn arguments_with_spaces_survive_the_edit_form() {
+        let current = json!({
+            "command": "npx",
+            "args": ["-y", "pkg", "--header", "Authorization: Bearer abc"]
+        });
+        let view = form_view("tool", &current);
+        let rendered = view["args"].as_str().unwrap().to_string();
+        assert!(rendered.contains("Authorization: Bearer abc"), "{rendered}");
+        assert!(
+            rendered.contains('\''),
+            "the argument must be quoted: {rendered}"
+        );
+
+        // Submitting the same text keeps the array byte-for-byte.
+        let same = form(&[("command", "npx"), ("args", &rendered)]);
+        let next = EditForm { form: &same }
+            .apply_to(&current)
+            .expect("valid form");
+        assert_eq!(next["args"], current["args"]);
+
+        // Changing it splits with shell rules, not on whitespace.
+        let changed = form(&[
+            ("command", "npx"),
+            ("args", "-y pkg --header \"X-A: 1 2 3\""),
+        ]);
+        let next = EditForm { form: &changed }
+            .apply_to(&current)
+            .expect("valid form");
+        assert_eq!(next["args"], json!(["-y", "pkg", "--header", "X-A: 1 2 3"]));
+    }
+
+    #[test]
+    fn an_unbalanced_argument_string_is_rejected_not_guessed() {
+        let current = json!({ "command": "npx", "args": [] });
+        let form = form(&[("command", "npx"), ("args", "pkg \"unterminated")]);
+        let err = EditForm { form: &form }.apply_to(&current).unwrap_err();
+        assert!(err.contains("args"), "{err}");
+    }
+
+    #[test]
+    fn the_plan_diff_does_not_show_a_secret() {
+        let secrets = vec!["sk-live-123456".to_string()];
+        let diff = "@@ -1,2 +1,2 @@\n-  \"Authorization\": \"Bearer sk-live-123456\"\n+  \"Authorization\": \"Bearer sk-live-999\"\n";
+        let sealed = seal_diff(diff, &secrets);
+        assert!(!sealed.contains("sk-live-123456"));
+        assert!(sealed.contains(REDACTED));
+        assert!(
+            sealed.contains("@@ -1,2 +1,2 @@"),
+            "diff structure survives"
+        );
+    }
+
+    #[test]
+    fn literal_secrets_only_collects_real_values() {
+        let raw = json!({
+            "headers": { "A": "${TOKEN}", "B": "literal-value" },
+            "env": { "C": "123", "D": "long-enough" },
+            "url": "https://example.com"
+        });
+        let secrets = literal_secrets(&raw);
+        assert!(secrets.contains(&"literal-value".to_string()));
+        assert!(secrets.contains(&"long-enough".to_string()));
+        assert!(!secrets.contains(&"${TOKEN}".to_string()));
+        assert!(
+            !secrets.contains(&"123".to_string()),
+            "short values are not sealed"
         );
     }
 

@@ -246,7 +246,7 @@ pub async fn edit_form(
         &viewer,
         &Flash::from_query(&query),
     );
-    ctx.put("server", form_view(&name, &raw));
+    ctx.put("server", data::form_view(&name, &raw));
     ctx.put("hash", json!(source.hash()));
     ctx.put(
         "idle_options",
@@ -269,7 +269,9 @@ pub async fn plan_edit(
         .server(&name)?
         .ok_or_else(|| UiError::NotFound(format!("server \"{name}\" not found")))?;
 
-    let next = EditForm { form: &form }.apply_to(&raw);
+    let next = EditForm { form: &form }
+        .apply_to(&raw)
+        .map_err(UiError::BadRequest)?;
     let outcome = propose(&source, &name, &raw, &next);
     let instances = crate::instances::list_live().map(|v| v.len()).unwrap_or(0);
 
@@ -311,7 +313,9 @@ pub async fn apply_edit(
     let raw = source
         .server(&name)?
         .ok_or_else(|| UiError::NotFound(format!("server \"{name}\" not found")))?;
-    let next = EditForm { form: &form }.apply_to(&raw);
+    let next = EditForm { form: &form }
+        .apply_to(&raw)
+        .map_err(UiError::BadRequest)?;
     let outcome = propose(&source, &name, &raw, &next);
     if !outcome.valid {
         return Err(UiError::BadRequest(
@@ -391,13 +395,24 @@ fn propose(source: &ConfigSource, name: &str, raw: &Value, next: &Value) -> Prop
         }
     };
     let diff = crate::config_source::unified_diff(source.text(), &text, 3);
+
+    // The diff is computed on the raw bytes — it has to be, or the comments
+    // would disappear — so literal secrets are sealed afterwards. Both sides
+    // are scanned: a value being introduced is as sensitive as one being
+    // replaced.
+    let mut secrets = data::literal_secrets(raw);
+    secrets.extend(data::literal_secrets(next));
+    secrets.sort();
+    secrets.dedup();
+    let sealed = data::seal_diff(&diff, &secrets);
+
     let (valid, error) = match source.validate(&text) {
         Ok(_) => (true, None),
         Err(e) => (false, Some(format!("{e:#}"))),
     };
     Proposal {
         text,
-        diff_html: diff_html(&diff),
+        diff_html: diff_html(&sealed),
         valid,
         error,
     }
@@ -441,85 +456,6 @@ fn diff_html(diff: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Builds the edit form from the **raw** entry, never from the loaded config.
-///
-/// `load_config` expands `${VAR}` before parsing, so using the typed value here
-/// would show "Bearer " instead of "Bearer ${SENTRY_TOKEN}" — and applying the
-/// form would write that empty value back, destroying the placeholder. The raw
-/// document is the only safe source for anything the user edits.
-fn form_view(name: &str, raw: &Value) -> Value {
-    let kind = if raw.get("url").is_some() {
-        "http"
-    } else if raw.get("cli").and_then(Value::as_bool).unwrap_or(false) {
-        "cli"
-    } else {
-        "stdio"
-    };
-
-    let url = raw.get("url").and_then(Value::as_str).unwrap_or("");
-    let command = raw.get("command").and_then(Value::as_str).unwrap_or("");
-    let args = raw
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-
-    let headers_text = pairs_text(raw.get("headers"), ": ");
-    let env_text = pairs_text(raw.get("env"), "=");
-
-    let idle = raw
-        .get("idle_timeout")
-        .and_then(Value::as_str)
-        .unwrap_or("adaptive");
-
-    let acl = raw.get("tool_acl");
-    let read = globs(acl, "read");
-    let write = globs(acl, "write");
-
-    json!({
-        "name": name,
-        "kind": kind,
-        "url": url,
-        "command": command,
-        "args": args,
-        "headers_text": headers_text,
-        "env_text": env_text,
-        "idle": idle,
-        "tool_acl_read": read,
-        "tool_acl_write": write,
-    })
-}
-
-fn pairs_text(value: Option<&Value>, separator: &str) -> String {
-    let Some(map) = value.and_then(Value::as_object) else {
-        return String::new();
-    };
-    let mut lines: Vec<String> = map
-        .iter()
-        .map(|(k, v)| format!("{k}{separator}{}", v.as_str().unwrap_or_default()))
-        .collect();
-    lines.sort();
-    lines.join("\n")
-}
-
-fn globs(acl: Option<&Value>, key: &str) -> String {
-    acl.and_then(|a| a.get(key))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
