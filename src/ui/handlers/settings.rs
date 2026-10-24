@@ -17,14 +17,7 @@ pub async fn index(
     require_admin(&viewer)?;
     let (source, cfg) = data::load_source()?;
     let instances = data::instances_view();
-    let total = state
-        .audit
-        .query_filtered(&crate::audit::AuditFilter {
-            limit: usize::MAX,
-            ..Default::default()
-        })
-        .map(|e| e.len())
-        .unwrap_or(0);
+    let total = state.audit.count().unwrap_or(0);
 
     let label = super::source_label(&source);
     let mut ctx = render::base_context(

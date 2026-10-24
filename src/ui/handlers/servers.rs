@@ -19,7 +19,10 @@ pub async fn list(
     Query(query): Query<HashMap<String, String>>,
 ) -> UiResult<Html<String>> {
     let (source, cfg) = data::load_source()?;
-    let snapshot = data::audit_snapshot(&state, 24, 5_000, None);
+    // A reader sees their own call counts; the per-server table is not a
+    // window into everyone else's traffic.
+    let own = (!viewer.admin).then(|| viewer.subject().to_string());
+    let snapshot = data::audit_snapshot(&state, 24, 5_000, own.as_deref());
     let rows = data::server_rows(&cfg, &state, &viewer, &snapshot.per_server);
 
     let search = query

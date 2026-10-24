@@ -39,6 +39,8 @@ On apply:
 4. the result is `chmod 0600` (the file may contain header tokens);
 5. every running `mcp serve` instance receives `SIGHUP`.
 
+Literal header and env values never reach the browser: the edit form shows `•••• (redacted)` and the diff is sealed the same way, while `${VAR}` references stay readable. Submitting a field untouched sends the sentinel back, and the stored value is restored from the file — so editing `idle_timeout` cannot rewrite a token it never saw.
+
 The write is **field-level**: only the keys that changed are rewritten. Comments and `${VAR}` placeholders elsewhere in the file — including inside the edited entry — survive. This is why the UI reads the raw bytes instead of the loaded config, which has already expanded every placeholder.
 
 ```jsonc

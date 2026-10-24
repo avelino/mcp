@@ -73,13 +73,17 @@ pub async fn index(
         }
     }
 
+    let mut recent_filter = crate::audit::AuditFilter {
+        limit: 5,
+        method: Some("tools/call".to_string()),
+        ..Default::default()
+    };
+    if !viewer.admin {
+        recent_filter.identity = Some(viewer.subject().to_string());
+    }
     let recent = state
         .audit
-        .query_filtered(&crate::audit::AuditFilter {
-            limit: 5,
-            method: Some("tools/call".to_string()),
-            ..Default::default()
-        })
+        .query_filtered(&recent_filter)
         .unwrap_or_default();
     let runs: Vec<Value> = recent
         .iter()

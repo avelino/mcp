@@ -465,6 +465,28 @@ impl AuditLogger {
         }
     }
 
+    /// Number of stored entries.
+    ///
+    /// ChronDB has no count API, so this still reads the key list — but it does
+    /// not deserialize a single entry, which is what `query_filtered` with
+    /// `usize::MAX` did every time the settings page was opened.
+    pub fn count(&self) -> Result<usize> {
+        match self {
+            AuditLogger::Disabled | AuditLogger::Stream { .. } => Ok(0),
+            AuditLogger::Active { pool, .. } => {
+                let db = pool.acquire()?;
+                let raw = db
+                    .list_by_prefix("audit:", None)
+                    .map_err(|e| anyhow::anyhow!("failed to count audit logs: {e:?}"))?;
+                Ok(match raw {
+                    Value::Array(items) => items.len(),
+                    Value::Object(map) => map.len(),
+                    _ => 0,
+                })
+            }
+        }
+    }
+
     pub fn query_filtered(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
         match self {
             AuditLogger::Disabled | AuditLogger::Stream { .. } => Ok(vec![]),
