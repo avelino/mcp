@@ -647,8 +647,10 @@ mcp ui --read-only                # disable every mutating route
 | `--addr <host:port>` | `127.0.0.1:7332` | Bind address; non-loopback binds are allowed but the token is the only protection |
 | `--no-open` | off | Do not launch a browser |
 | `--read-only` | off | Disable editing (also forced when the config is inline in `MCP_SERVERS_CONFIG`) |
+| `--insecure` | off | Acknowledge a non-loopback bind on plain HTTP |
+| `--cookie-secure` | off | (`serve`) mark the UI session cookie `Secure` when the TLS terminator does not send `X-Forwarded-Proto` |
 
-The first request must carry the token printed at startup; it is exchanged for a session cookie. Every write is audited with `source: "ui"`. See the [Web UI guide](../guides/web-ui.md).
+The first request must carry the token printed at startup; it is single-use, expires after ten minutes, and is exchanged for a session cookie. Every write is audited with `source: "ui"`. See the [Web UI guide](../guides/web-ui.md).
 
 The UI can also be served by the proxy, for a team:
 

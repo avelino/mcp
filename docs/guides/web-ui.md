@@ -13,7 +13,9 @@ mcp ui listening on http://127.0.0.1:7332
 open: http://127.0.0.1:7332/?token=…
 ```
 
-Open the printed URL. The token is exchanged for a cookie and removed from the address bar.
+Open the printed URL. The token is **single-use**: it is exchanged for a session cookie, removed from the address bar, and spent — a URL that leaks through shell history, `docker logs` or the browser's history is worthless after the first visit, and it expires on its own after ten minutes if nobody visits it.
+
+The first visit is also the only time the token appears in a URL, and the responses carry `Referrer-Policy: no-referrer` so it cannot travel in a `Referer` header either.
 
 ## What it shows
 
@@ -39,7 +41,7 @@ On apply:
 4. the result is `chmod 0600` (the file may contain header tokens);
 5. every running `mcp serve` instance receives `SIGHUP`.
 
-Literal header and env values never reach the browser: the edit form shows `•••• (redacted)` and the diff is sealed the same way, while `${VAR}` references stay readable. Submitting a field untouched sends the sentinel back, and the stored value is restored from the file — so editing `idle_timeout` cannot rewrite a token it never saw.
+Literal header and env values never reach the browser: the edit form shows `•••• (redacted)` and the diff is sealed the same way, while `${VAR}` references stay readable. The same applies to credential-looking query parameters in a backend URL and to `args` that follow a `--token`-style flag. Submitting a field untouched sends the sentinel back, and the stored value is restored from the file — so editing `idle_timeout` cannot rewrite a token it never saw.
 
 The write is **field-level**: only the keys that changed are rewritten. Comments and `${VAR}` placeholders elsewhere in the file — including inside the edited entry — survive. This is why the UI reads the raw bytes instead of the loaded config, which has already expanded every placeholder.
 
@@ -75,6 +77,14 @@ The UI is reachable by every process running as you, so the token is not a defen
 mcp ui --read-only
 ```
 
+Binding anywhere other than loopback requires `--insecure`, because this binary serves plain HTTP (same rule as `mcp serve`):
+
+```bash
+mcp ui --addr 0.0.0.0:7332 --insecure   # container, then publish to 127.0.0.1
+```
+
+No page contains an inline script or an inline event handler, and every response carries `Content-Security-Policy: default-src 'self'; script-src 'self'` — a config value that ends up in a page cannot become code.
+
 ## Team mode
 
 The same UI can be served by the proxy, so a team gets one control room for the deployment instead of one per laptop:
@@ -94,6 +104,7 @@ What the role decides:
 | Activity | only their own entries | everyone's |
 | Access (policy, simulator) | no | yes |
 | Settings, instances | no | yes |
+| Sign out | `POST /logout` (a GET would be CSRF-able) | same |
 | Edit / add / remove servers, reload | no (403) | yes |
 
 The catalog is filtered with the proxy's own evaluator, so the UI cannot show a tool the same request would be denied. A hand-crafted `POST /playground/call` is checked again before it reaches a backend.
@@ -132,7 +143,7 @@ docker build -t mcp:dev .
 docker run --rm -d --name mcp-ui \
   -p 127.0.0.1:7332:7332 \
   -v "$HOME/.config/mcp:/root/.config/mcp" \
-  mcp:dev ui --addr 0.0.0.0:7332 --no-open
+  mcp:dev ui --addr 0.0.0.0:7332 --insecure --no-open
 
 docker logs mcp-ui | grep http://
 # http://localhost:7332/?token=…
@@ -149,7 +160,7 @@ docker run --rm -d --name mcp-proxy \
   mcp:dev serve --http 0.0.0.0:7332 --insecure --management
 ```
 
-Sign in at `http://localhost:7332/` with a token from `serverAuth.bearer.tokens`.
+Sign in at `http://localhost:7332/` with a token from `serverAuth.bearer.tokens`. Failed sign-ins are rate-limited per peer and written to the audit trail as `auth/failure`.
 
 Three container-specific things:
 
@@ -159,6 +170,7 @@ Three container-specific things:
 | **stdio backends need the `full` image** | `docker build --target full-source -t mcp:full .` adds `npx`, `uvx`, `docker`, `kubectl` and `gh` — see [building the image yourself](../howto/docker.md#building-the-image-yourself). In the scratch image a stdio backend shows up as **unavailable here**, with the reason from the same preflight `mcp --list` runs (`command not found in PATH: npx`), and *Connect now* is disabled instead of failing after the click. |
 | **Files are written as root on Linux** | The config is edited in place, so backups created from inside the container belong to root. On Docker Desktop this is invisible; on Linux, run with `--user "$(id -u):$(id -g)" -e HOME=/tmp` and mount the config explicitly. |
 | **Mount `:ro` means start with `--read-only`** | Editing needs to write a temp file next to the config. With a read-only mount every apply fails; `mcp ui --read-only` disables the forms up front instead. |
+| **`--addr 0.0.0.0` needs `--insecure`** | The UI refuses a non-loopback bind without it, because it serves plain HTTP. In a container the bind is always non-loopback, so the flag is part of the command. |
 
 ## Managing people
 

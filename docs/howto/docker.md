@@ -51,12 +51,12 @@ docker run --rm -d --name mcp-ui \
   -p 127.0.0.1:7332:7332 \
   -v "$HOME/.config/mcp:/root/.config/mcp" \
   -e SLACK_MCP_XOXP_TOKEN \
-  mcp:full ui --addr 0.0.0.0:7332 --no-open
+  mcp:full ui --addr 0.0.0.0:7332 --insecure --no-open
 
 docker logs mcp-ui | grep http://
 ```
 
-`--addr 0.0.0.0:7332` is required — the default binds loopback *inside* the container, which no published port reaches. Variables referenced as `${VAR}` in the config are expanded by the process, so they have to be passed with `-e`; mounting your shell environment is not enough. The [web UI guide](../guides/web-ui.md#docker) covers the rest, including team mode.
+`--addr 0.0.0.0:7332` is required — the default binds loopback *inside* the container, which no published port reaches — and so is `--insecure`, because the UI refuses a non-loopback bind on plain HTTP without it. Variables referenced as `${VAR}` in the config are expanded by the process, so they have to be passed with `-e`; mounting your shell environment is not enough. The [web UI guide](../guides/web-ui.md#docker) covers the rest, including team mode.
 
 ## Basic usage
 
