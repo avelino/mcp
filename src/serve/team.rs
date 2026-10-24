@@ -99,20 +99,12 @@ pub(crate) async fn login_submit(
         return login_error("paste a bearer token", &next);
     }
 
-    let snapshot = AuthSnapshot::read(&team.auth);
-    let mut creds = Credentials::new();
-    creds.insert("authorization".to_string(), format!("Bearer {token}"));
-    // Forwarded deployments authenticate by header; honour it here too so the
-    // form works the same way in front of a reverse proxy.
-    for (name, value) in headers.iter() {
-        if let Ok(v) = value.to_str() {
-            creds
-                .entry(name.as_str().to_lowercase())
-                .or_insert_with(|| v.to_string());
-        }
-    }
-
-    match snapshot.provider.authenticate(&creds).await {
+    // The form's token is the only credential considered. Forwarded headers are
+    // deliberately *not* read here: otherwise a deployment that trusts
+    // `x-forwarded-user` would mint a session cookie holding whatever string
+    // the form submitted, and that cookie would travel as a bearer token
+    // afterwards.
+    match identity_for_token(&team, token).await {
         Ok(identity) => {
             let secure = wants_secure_cookie(&headers);
             let mut response = Redirect::to(&next).into_response();
@@ -122,11 +114,35 @@ pub(crate) async fn login_submit(
             tracing::info!(subject = %identity.subject, "management ui sign-in");
             response
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "management ui sign-in rejected");
-            login_error(&format!("the proxy rejected that token: {e}"), &next)
+        Err(message) => {
+            tracing::warn!(error = %message, "management ui sign-in rejected");
+            login_error(&message, &next)
         }
     }
+}
+
+/// Validates a pasted token with the proxy's own provider chain.
+///
+/// Returns an error for an anonymous identity as well: with no provider
+/// configured every token "validates" as anonymous, and a session cookie for
+/// nobody is worse than a clear refusal.
+async fn identity_for_token(team: &TeamAuth, token: &str) -> Result<AuthIdentity, String> {
+    let snapshot = AuthSnapshot::read(&team.auth);
+    let mut creds = Credentials::new();
+    creds.insert("authorization".to_string(), format!("Bearer {token}"));
+    let identity = snapshot
+        .provider
+        .authenticate(&creds)
+        .await
+        .map_err(|e| format!("the proxy rejected that token: {e}"))?;
+    if identity.is_anonymous() {
+        return Err(
+            "this proxy has no provider configured, so a token cannot identify anyone — \
+             add `serverAuth.providers` or sign in through your reverse proxy"
+                .to_string(),
+        );
+    }
+    Ok(identity)
 }
 
 pub(crate) async fn logout() -> Response {
@@ -249,6 +265,7 @@ pub(crate) fn wants_secure_cookie(headers: &HeaderMap) -> bool {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use std::sync::Arc;
 
     fn with_cookie(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -257,6 +274,35 @@ mod tests {
             HeaderValue::from_str(&format!("other=1; {COOKIE}={value}")).unwrap(),
         );
         headers
+    }
+
+    fn team_with(provider: Arc<dyn crate::server_auth::AuthProvider>) -> TeamAuth {
+        TeamAuth {
+            auth: AuthSnapshot::new(provider, None, vec![]).shared(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_only_signs_in_when_a_provider_accepts_it() {
+        // NoAuth accepts everything as anonymous; that must not become a cookie.
+        let open = team_with(Arc::new(crate::server_auth::NoAuth));
+        let err = identity_for_token(&open, "anything").await.unwrap_err();
+        assert!(err.contains("no provider"), "{err}");
+
+        let mut tokens = std::collections::HashMap::new();
+        tokens.insert(
+            "tok-alice".to_string(),
+            crate::server_auth::BearerToken::Extended {
+                subject: "alice".to_string(),
+                roles: vec!["admin".to_string()],
+            },
+        );
+        let bearer = team_with(Arc::new(crate::server_auth::BearerTokenAuth::new(tokens)));
+        let identity = identity_for_token(&bearer, "tok-alice")
+            .await
+            .expect("valid token");
+        assert_eq!(identity.subject, "alice");
+        assert!(identity_for_token(&bearer, "wrong").await.is_err());
     }
 
     #[test]
