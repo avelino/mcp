@@ -247,6 +247,10 @@ fn acl_view(acl: Option<&Value>) -> Value {
                 .unwrap_or(0);
             role_rows.push(json!({
                 "name": name,
+                // Numeric for the template's disabled check, string for display:
+                // `r.subjects > 0` must work for RBAC exactly as the legacy rows
+                // once made it look like it did.
+                "subjects": subject_count,
                 "subject_count": if subject_count == 1 {
                     "1 subject".to_string()
                 } else {
@@ -520,16 +524,7 @@ pub async fn delete_role(
     ensure_rbac(&source)?;
 
     let (_, cfg) = data::load_source()?;
-    if cfg.server_auth.admin_roles.iter().any(|r| r == &name) {
-        return Err(UiError::BadRequest(format!(
-            "\"{name}\" is in serverAuth.adminRoles — remove it there first"
-        )));
-    }
-    if subjects_using(&source, &name)?.iter().any(|s| s == &name) {
-        return Err(UiError::BadRequest(format!(
-            "role \"{name}\" is still assigned to {name} — reassign those subjects first"
-        )));
-    }
+    ensure_role_removable(&source, &cfg.server_auth.admin_roles, &name)?;
 
     // Belt and braces: the generic guard below is what actually decides.
     let next = source.remove_role(&name)?;
@@ -671,6 +666,31 @@ fn role_grants(source: &ConfigSource, role: &str) -> UiResult<Option<Value>> {
             role.replace('/', "~1")
         ))
         .cloned())
+}
+
+/// A role can go only when nothing points at it.
+///
+/// The previous version compared each *subject name* against the role name, so
+/// it only ever refused a deletion when a subject happened to be called like
+/// the role — which is to say it never refused one.
+fn ensure_role_removable(
+    source: &ConfigSource,
+    admin_roles: &[String],
+    name: &str,
+) -> UiResult<()> {
+    if admin_roles.iter().any(|r| r == name) {
+        return Err(UiError::BadRequest(format!(
+            "\"{name}\" is in serverAuth.adminRoles — remove it there first"
+        )));
+    }
+    let assigned = subjects_using(source, name)?;
+    if !assigned.is_empty() {
+        return Err(UiError::BadRequest(format!(
+            "role \"{name}\" is still assigned to {} — reassign those subjects first",
+            assigned.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn subjects_using(source: &ConfigSource, role: &str) -> UiResult<Vec<String>> {
@@ -822,6 +842,71 @@ mod tests {
         }
       }
     }"#;
+
+    const RBAC_DOC: &str = r#"{
+      "mcpServers": {},
+      "serverAuth": {
+        "providers": ["bearer"],
+        "adminRoles": ["admin"],
+        "bearer": { "tokens": {} },
+        "acl": {
+          "default": "deny",
+          "roles": {
+            "admin": [{ "server": "*", "access": "*" }],
+            "dev": [{ "server": "sentry", "access": "read" }],
+            "unused": [{ "server": "jira", "access": "read" }]
+          },
+          "subjects": {
+            "alice": { "roles": ["admin"] },
+            "bob": { "roles": ["dev"] }
+          }
+        }
+      }
+    }"#;
+
+    fn source(doc: &str) -> ConfigSource {
+        ConfigSource::from_text(doc, crate::config_source::Origin::File("/tmp/x".into()))
+    }
+
+    #[test]
+    fn a_role_in_use_is_not_removable_and_the_error_names_the_subjects() {
+        let err = ensure_role_removable(&source(RBAC_DOC), &["admin".into()], "dev").unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("bob"),
+            "should name the subject: {message}"
+        );
+        assert!(!message.contains("dev —"), "{message}");
+    }
+
+    #[test]
+    fn an_unused_role_can_be_removed() {
+        assert!(ensure_role_removable(&source(RBAC_DOC), &["admin".into()], "unused").is_ok());
+    }
+
+    #[test]
+    fn a_role_in_admin_roles_cannot_be_removed() {
+        let err = ensure_role_removable(&source(RBAC_DOC), &["admin".into()], "admin").unwrap_err();
+        assert!(format!("{err}").contains("adminRoles"));
+    }
+
+    #[test]
+    fn role_rows_carry_a_numeric_subject_count() {
+        let raw: Value = serde_json::from_str(RBAC_DOC).unwrap();
+        let view = acl_view(raw.get("serverAuth").and_then(|s| s.get("acl")));
+        let roles = view["roles"].as_array().expect("roles");
+        let dev = roles.iter().find(|r| r["name"] == "dev").expect("dev");
+        assert_eq!(
+            dev["subjects"], 1,
+            "the template's disable check reads this"
+        );
+        assert_eq!(dev["subject_count"], "1 subject");
+        let unused = roles
+            .iter()
+            .find(|r| r["name"] == "unused")
+            .expect("unused");
+        assert_eq!(unused["subjects"], 0);
+    }
 
     #[test]
     fn removing_the_last_admin_token_is_refused() {
