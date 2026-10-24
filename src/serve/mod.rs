@@ -31,9 +31,10 @@ pub async fn run(
     insecure: bool,
     filter: InstanceFilter,
     management: bool,
+    cookie_secure: bool,
 ) -> Result<()> {
     match http_addr {
-        Some(addr) => run_http(config, addr, insecure, filter, management).await,
+        Some(addr) => run_http(config, addr, insecure, filter, management, cookie_secure).await,
         None => {
             if management {
                 anyhow::bail!(

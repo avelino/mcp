@@ -105,8 +105,20 @@ pub fn base_context(
     ctx.put("page_title", json!(title));
     ctx.put("server_count", json!(server_count));
     ctx.put("token", json!(state.token));
-    ctx.put("read_only", json!(state.read_only));
-    ctx.put("read_only_reason", json!(read_only_reason(state)));
+    // The process flag is only half of it: a reader in team mode cannot write
+    // either, and the UI must not offer buttons that answer 403.
+    let can_write = viewer.can_write() && !state.read_only;
+    ctx.put("read_only", json!(!can_write));
+    ctx.put(
+        "read_only_reason",
+        json!(if state.read_only {
+            read_only_reason(state)
+        } else if !viewer.can_write() {
+            Some("your role is not in serverAuth.adminRoles, so this page is read-only")
+        } else {
+            None
+        }),
+    );
     ctx.put("addr", json!(state.addr));
     ctx.put("version", json!(env!("CARGO_PKG_VERSION")));
     ctx.put("uptime", json!(state.uptime()));
@@ -116,7 +128,17 @@ pub fn base_context(
     ctx.put("viewer_team", json!(!viewer.is_local()));
     ctx.put("viewer_admin", json!(viewer.admin));
     ctx.put("subject", json!(viewer.subject()));
-    ctx.put("db_error", json!(state.db_error));
+    // The raw error names paths and URLs. Admins (and the local UI) can see it;
+    // a reader only learns that the trail is off.
+    ctx.put(
+        "db_error",
+        json!(if viewer.admin || viewer.is_local() {
+            state.db_error.clone()
+        } else {
+            None
+        }),
+    );
+    ctx.put("db_degraded", json!(state.db_error.is_some()));
     ctx
 }
 

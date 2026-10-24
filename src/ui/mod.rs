@@ -45,6 +45,7 @@ pub use viewer::{CurrentViewer, Viewer};
 const HTMX: &str = include_str!("assets/htmx.min.js");
 const APP_CSS: &str = include_str!("assets/app.css");
 const THEME_JS: &str = include_str!("assets/theme.js");
+const APP_JS: &str = include_str!("assets/app.js");
 
 /// How the UI was started.
 pub struct Options {
@@ -52,6 +53,17 @@ pub struct Options {
     pub open: bool,
     /// Disables every mutating route.
     pub read_only: bool,
+    /// Acknowledge that a non-loopback bind serves plain HTTP.
+    pub insecure: bool,
+}
+
+/// How long the printed bootstrap URL is valid.
+pub const BOOTSTRAP_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The one-time secret printed at startup.
+pub struct Bootstrap {
+    pub token: String,
+    pub expires: std::time::Instant,
 }
 
 /// Shared server state. Handlers get an `Arc<UiState>`.
@@ -60,13 +72,25 @@ pub struct PendingToken {
     pub subject: String,
     pub roles: Vec<String>,
     pub token: String,
+    /// A token that is never viewed should not sit in memory forever.
+    pub expires: Instant,
 }
+
+/// How long a freshly minted token waits to be displayed.
+pub const PENDING_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// How many unviewed tokens are kept at once.
+const MAX_PENDING_TOKENS: usize = 32;
 
 pub struct UiState {
     pub addr: String,
+    /// CSRF nonce embedded in forms. Not a credential.
     pub token: String,
     /// Why the UI is read-only, when it is.
     pub read_only: bool,
+    /// Browser sessions created by exchanging the bootstrap token.
+    pub sessions: Mutex<std::collections::HashSet<String>>,
+    /// The printed startup token: single use, and it expires.
+    pub bootstrap: Mutex<Option<Bootstrap>>,
     pub started: Instant,
     pub audit: Arc<AuditLogger>,
     pub cache: ToolCacheStore,
@@ -109,6 +133,8 @@ impl UiState {
             cache,
             db_error,
             reload,
+            sessions: Mutex::new(std::collections::HashSet::new()),
+            bootstrap: Mutex::new(None),
             pending_tokens: Mutex::new(HashMap::new()),
             memory: Mutex::new(HashMap::new()),
         }
@@ -132,13 +158,27 @@ impl UiState {
     /// Stores a freshly minted token and returns the id used to show it once.
     pub fn stash_token(&self, subject: &str, roles: &[String], token: &str) -> String {
         let id = SessionToken::generate().as_str().to_string();
+        let now = Instant::now();
         if let Ok(mut pending) = self.pending_tokens.lock() {
+            pending.retain(|_, entry| entry.expires > now);
+            if pending.len() >= MAX_PENDING_TOKENS {
+                // Oldest first: the map is small, and a token nobody opened is
+                // worthless once it has waited this long.
+                if let Some(oldest) = pending
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| key.clone())
+                {
+                    pending.remove(&oldest);
+                }
+            }
             pending.insert(
                 id.clone(),
                 PendingToken {
                     subject: subject.to_string(),
                     roles: roles.to_vec(),
                     token: token.to_string(),
+                    expires: now + PENDING_TOKEN_TTL,
                 },
             );
         }
@@ -147,7 +187,9 @@ impl UiState {
 
     /// Reads and forgets a stashed token.
     pub fn take_token(&self, id: &str) -> Option<PendingToken> {
-        self.pending_tokens.lock().ok()?.remove(id)
+        let mut pending = self.pending_tokens.lock().ok()?;
+        let entry = pending.remove(id)?;
+        (entry.expires > Instant::now()).then_some(entry)
     }
 
     pub fn cached(&self, name: &str) -> Option<BackendToolCache> {
@@ -201,12 +243,36 @@ pub async fn run(opts: Options) -> Result<()> {
     };
     let cache = ToolCacheStore::new(pool.clone());
 
-    let token = SessionToken::generate();
+    let bound: SocketAddr = opts
+        .addr
+        .parse()
+        .with_context(|| format!("invalid bind address '{}'", opts.addr))?;
+    if !bound.ip().is_loopback() {
+        if !opts.insecure {
+            anyhow::bail!(
+                "refusing to bind to non-loopback address {}: this UI serves plain HTTP.\n\
+                 Use --insecure to acknowledge that, or bind to 127.0.0.1:{} for local-only access.",
+                opts.addr,
+                bound.port()
+            );
+        }
+        eprintln!(
+            "mcp ui: serving plain HTTP on {} — the session token is the only protection",
+            opts.addr
+        );
+    }
+
+    let bootstrap = SessionToken::generate();
     let state = Arc::new(UiState {
         addr: opts.addr.clone(),
-        token: token.as_str().to_string(),
+        token: SessionToken::generate().as_str().to_string(),
         read_only: opts.read_only,
         started: Instant::now(),
+        sessions: Mutex::new(std::collections::HashSet::new()),
+        bootstrap: Mutex::new(Some(Bootstrap {
+            token: bootstrap.as_str().to_string(),
+            expires: Instant::now() + BOOTSTRAP_TTL,
+        })),
         audit,
         cache,
         db_error,
@@ -219,16 +285,14 @@ pub async fn run(opts: Options) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&opts.addr)
         .await
         .with_context(|| format!("failed to bind {}", opts.addr))?;
-    let bound = listener.local_addr().unwrap_or_else(|_| {
-        opts.addr
-            .parse()
-            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 7332)))
-    });
+    let bound = listener
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 7332)));
 
     let url = format!(
         "http://{}/?token={}",
         display_authority(&bound),
-        state.token
+        bootstrap.as_str()
     );
     println!("mcp ui listening on http://{bound}");
     println!("open: {url}");
@@ -246,6 +310,41 @@ pub async fn run(opts: Options) -> Result<()> {
         .await
         .context("ui server stopped")?;
     Ok(())
+}
+
+/// Response headers that apply to every page.
+///
+/// `script-src 'self'` is the point: with no inline handlers and no inline
+/// script left in the templates, a stored-XSS payload has nothing to execute.
+/// Styles stay inline (`style="…"` is used for one-off spacing), and htmx is
+/// served from our own origin.
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; form-action 'self'; \
+             base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    response
 }
 
 /// The route table. The local UI layers a session guard on top of it;
@@ -302,6 +401,8 @@ pub(crate) fn routes() -> Router<Arc<UiState>> {
         .route("/assets/app.css", get(css))
         .route("/assets/htmx.js", get(htmx))
         .route("/assets/theme.js", get(theme_js))
+        .route("/assets/app.js", get(app_js))
+        .layer(middleware::from_fn(security_headers))
 }
 
 /// What to print for a bind address.
@@ -339,6 +440,16 @@ async fn css() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         APP_CSS,
+    )
+}
+
+async fn app_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        APP_JS,
     )
 }
 
@@ -415,11 +526,14 @@ impl IntoResponse for UiError {
             UiError::NotFound(m) => (StatusCode::NOT_FOUND, "Not found", m),
             UiError::Conflict(m) => (StatusCode::CONFLICT, "Conflict", m),
             UiError::Internal(e) => {
-                tracing::error!(error = format!("{e:#}"), "ui request failed");
+                // The chain names files and URLs. It goes to the log with an
+                // id the browser can quote; the browser gets the id only.
+                let id = crate::auth::oauth_primitives::generate_random_string(8);
+                tracing::error!(error = format!("{e:#}"), request = %id, "ui request failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Something went wrong",
-                    format!("{e:#}"),
+                    format!("request {id} — the details are in the server log"),
                 )
             }
         };
@@ -546,9 +660,47 @@ mod tests {
             cache: ToolCacheStore::new(Arc::new(DbPool::disabled())),
             db_error: Some("no native library".to_string()),
             reload: None,
+            sessions: Mutex::new(std::collections::HashSet::new()),
+            bootstrap: Mutex::new(None),
             pending_tokens: Mutex::new(HashMap::new()),
             memory: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[test]
+    fn the_bootstrap_token_is_spent_once_and_expires() {
+        let mut state = state_without_database();
+        state.bootstrap = Mutex::new(Some(Bootstrap {
+            token: "bootstrap-token".to_string(),
+            expires: Instant::now() + std::time::Duration::from_secs(60),
+        }));
+        assert!(!session::spend_bootstrap(&state, "wrong"));
+        assert!(
+            session::spend_bootstrap(&state, "bootstrap-token"),
+            "the right token must still work after a wrong one"
+        );
+        assert!(
+            !session::spend_bootstrap(&state, "bootstrap-token"),
+            "and only once"
+        );
+
+        state.bootstrap = Mutex::new(Some(Bootstrap {
+            token: "expired".to_string(),
+            expires: Instant::now() - std::time::Duration::from_secs(1),
+        }));
+        assert!(!session::spend_bootstrap(&state, "expired"));
+        assert!(
+            state.bootstrap.lock().unwrap().is_none(),
+            "expired is dropped"
+        );
+    }
+
+    #[test]
+    fn a_pending_token_is_shown_once_and_expires() {
+        let state = state_without_database();
+        let id = state.stash_token("alice", &["admin".to_string()], "tok");
+        assert_eq!(state.take_token(&id).unwrap().token, "tok");
+        assert!(state.take_token(&id).is_none(), "shown once");
     }
 
     #[test]

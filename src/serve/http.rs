@@ -33,6 +33,9 @@ use super::team;
 type SseSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
 type SessionMap = Arc<Mutex<HashMap<String, SseSender>>>;
 
+/// Upper bound on concurrent legacy SSE sessions.
+const MAX_SSE_SESSIONS: usize = 256;
+
 #[derive(Clone)]
 struct AppState {
     proxy: SharedProxy,
@@ -314,9 +317,9 @@ fn validate_bind_addr(addr: &str, insecure: bool) -> Result<std::net::SocketAddr
 
     if !insecure && !sock_addr.ip().is_loopback() {
         bail!(
-            "refusing to bind to non-loopback address {addr} without TLS.\n\
-             Use --insecure to allow plaintext on non-loopback interfaces,\n\
-             or bind to 127.0.0.1:{port} for local-only access.",
+            "refusing to bind to non-loopback address {addr}: this binary serves plain HTTP \n\
+             (TLS belongs in front of it). Use --insecure to acknowledge that, or bind to \n\
+             127.0.0.1:{port} for local-only access.",
             port = sock_addr.port()
         );
     }
@@ -330,8 +333,49 @@ pub async fn run_http(
     insecure: bool,
     filter: InstanceFilter,
     management: bool,
+    cookie_secure: bool,
 ) -> Result<()> {
     let sock_addr = validate_bind_addr(bind_addr, insecure)?;
+
+    // Credential files are rewritten owner-only, but an older build may have
+    // left them readable; say so once instead of silently trusting them.
+    crate::secure_file::warn_if_permissive(&[
+        (
+            "auth.json (upstream tokens)",
+            crate::auth::auth_store_path().unwrap_or_default(),
+        ),
+        (
+            "auth_server.json (OAuth refresh tokens)",
+            crate::server_auth::oauth_as::state_path().unwrap_or_default(),
+        ),
+    ]);
+
+    // `forwarded` trusts a header. That is fine behind a proxy that overwrites
+    // it, and dangerous on a port anyone can reach — especially with the
+    // management UI, where those roles can rewrite the config.
+    if config
+        .server_auth
+        .providers
+        .iter()
+        .any(|p| p == "forwarded")
+        && !sock_addr.ip().is_loopback()
+    {
+        let only_forwarded = config.server_auth.providers.len() == 1;
+        if only_forwarded {
+            tracing::warn!(
+                addr = %sock_addr,
+                "providers=[\"forwarded\"] on a non-loopback address: anyone who can reach \
+                 this port can claim any subject, including an admin role. Keep it behind a \
+                 reverse proxy that removes x-forwarded-user/x-forwarded-groups from clients"
+            );
+        } else {
+            tracing::warn!(
+                addr = %sock_addr,
+                "forwarded identity is trusted on a non-loopback address; make sure the \
+                 reverse proxy strips client-supplied x-forwarded-* headers"
+            );
+        }
+    }
 
     // OAuth AS state — only allocated when the operator opted in via
     // `serverAuth.providers` containing "oauth_as". Loaded from disk
@@ -591,10 +635,16 @@ pub async fn run_http(
         ));
         let ui_app = crate::ui::routes()
             .route("/login", get(team::login_page).post(team::login_submit))
-            .route("/logout", get(team::logout))
+            .route("/logout", post(team::logout))
             .layer(axum::middleware::from_fn_with_state(
                 team::TeamAuth {
                     auth: state.auth.clone(),
+                    secure_cookies: cookie_secure,
+                    audit: audit.clone(),
+                    login_attempts: Arc::new(std::sync::Mutex::new(HashMap::<
+                        std::net::IpAddr,
+                        (u32, std::time::Instant),
+                    >::new())),
                 },
                 team::guard,
             ))
@@ -1061,9 +1111,18 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
         .event("endpoint")
         .data(format!("/mcp?session_id={session_id}"));
 
-    // Register this session so POST handler can send responses via SSE
+    // Register this session so POST handler can send responses via SSE.
+    // The map is capped: eviction handles a wedged consumer, not a client that
+    // opens streams until memory runs out.
     {
         let mut sessions = state.sessions.lock().await;
+        if sessions.len() >= MAX_SSE_SESSIONS {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many concurrent SSE sessions",
+            )
+                .into_response();
+        }
         sessions.insert(session_id.clone(), tx.clone());
     }
 

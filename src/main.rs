@@ -15,6 +15,7 @@ mod manager;
 mod output;
 mod protocol;
 mod registry;
+mod secure_file;
 mod serve;
 mod server_auth;
 mod spinner;
@@ -72,6 +73,10 @@ fn print_usage() {
     eprintln!("  mcp serve --http [addr]             Start proxy server over HTTP");
     eprintln!("  mcp serve --http [addr] --management");
     eprintln!("                                      Also serve the web UI, behind serverAuth");
+    eprintln!("  mcp serve --http [addr] --cookie-secure");
+    eprintln!(
+        "                                      Mark the UI session cookie Secure (TLS terminator)"
+    );
     eprintln!("  mcp logs                            Show recent audit log entries");
     eprintln!("  mcp logs --limit N                  Show last N entries (default: 50)");
     eprintln!("  mcp logs --server <name>            Filter by backend server");
@@ -93,7 +98,7 @@ fn print_usage() {
     eprintln!("  mcp config path                     Show config file path");
     eprintln!("  mcp config edit                     Open config in $EDITOR");
     eprintln!("  mcp completions <shell>             Generate shell completions (bash, zsh, fish)");
-    eprintln!("  mcp ui [--addr HOST:PORT] [--no-open] [--read-only]");
+    eprintln!("  mcp ui [--addr HOST:PORT] [--no-open] [--read-only] [--insecure]");
     eprintln!("                                      Local web UI: servers, tools, audit, ACL");
     eprintln!("  mcp healthcheck [url]               HTTP health probe (for containers)");
     eprintln!();
@@ -217,7 +222,16 @@ async fn run() -> Result<()> {
             );
         }
         let management = rest.iter().any(|a| a == "--management");
-        return serve::run(cfg, http_addr.as_deref(), insecure, filter, management).await;
+        let cookie_secure = rest.iter().any(|a| a == "--cookie-secure");
+        return serve::run(
+            cfg,
+            http_addr.as_deref(),
+            insecure,
+            filter,
+            management,
+            cookie_secure,
+        )
+        .await;
     }
 
     if args[0] == "ui" {
@@ -234,6 +248,7 @@ async fn run() -> Result<()> {
             addr,
             open: !rest.iter().any(|a| a == "--no-open"),
             read_only: rest.iter().any(|a| a == "--read-only"),
+            insecure: rest.iter().any(|a| a == "--insecure"),
         })
         .await;
     }

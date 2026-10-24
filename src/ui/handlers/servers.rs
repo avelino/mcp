@@ -23,7 +23,12 @@ pub async fn list(
     // window into everyone else's traffic.
     let own = (!viewer.admin).then(|| viewer.subject().to_string());
     let snapshot = data::audit_snapshot(&state, 24, 5_000, own.as_deref());
-    let rows = data::server_rows(&cfg, &state, &viewer, &snapshot.per_server);
+    let mut rows = data::server_rows(&cfg, &state, &viewer, &snapshot.per_server);
+    // A backend the viewer has no tool on is not theirs to see — not even its
+    // name or endpoint.
+    if !viewer.admin && !viewer.is_local() {
+        rows.retain(|row| row["visible"].as_bool().unwrap_or(false));
+    }
 
     let search = query
         .get("q")
@@ -170,6 +175,10 @@ pub async fn detail(
         .as_ref()
         .map(|c| data::visible_tools(&viewer, &cfg, &name, &c.tools))
         .unwrap_or_default();
+    if !viewer.admin && !viewer.is_local() && tools.is_empty() {
+        // 404, not 403: the existence of a backend is itself metadata.
+        return Err(UiError::NotFound("no such server".into()));
+    }
     let (tool_rows, read, write, ambiguous) = data::tool_rows(&tools, overrides);
 
     let stale = match (&cached, cfg.config_hashes.get(&name)) {
@@ -403,7 +412,11 @@ fn propose(source: &ConfigSource, name: &str, raw: &Value, next: &Value) -> Prop
     // would disappear — so literal secrets are sealed afterwards. Both sides
     // are scanned: a value being introduced is as sensitive as one being
     // replaced.
-    let mut secrets = data::literal_secrets(raw);
+    let mut secrets = source
+        .parsed()
+        .map(|document| data::literal_secrets_document(&document))
+        .unwrap_or_default();
+    secrets.extend(data::literal_secrets(raw));
     secrets.extend(data::literal_secrets(next));
     secrets.sort();
     secrets.dedup();

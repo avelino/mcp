@@ -47,7 +47,7 @@
             <span class="tiny muted">{{ r.subject_count }}</span>
             {% if not acl.legacy %}
             <form class="inline" method="post" action="/access/roles/{{ r.name | urlencode }}/delete"
-                  onsubmit="return confirm('Remove role {{ r.name }}?')">
+                  data-confirm="Remove role {{ r.name }}?">
               <input type="hidden" name="csrf" value="{{ token }}">
               <button class="btn sm danger"
                 {% if r.name in admin_roles or r.subjects > 0 %}disabled
@@ -108,7 +108,7 @@
               </td>
               <td style="text-align:right">
                 <form class="inline" method="post" action="/access/subjects/{{ s.name | urlencode }}/delete"
-                      onsubmit="return confirm('Remove subject {{ s.name }}?')">
+                      data-confirm="Remove subject {{ s.name }}?">
                   <input type="hidden" name="csrf" value="{{ token }}">
                   <button class="btn sm danger">Remove</button>
                 </form>
@@ -151,7 +151,7 @@
               <td class="tiny muted mono">{{ t.last_used }}</td>
               <td style="text-align:right">
                 <form class="inline" method="post" action="/access/tokens/{{ t.fingerprint }}/delete"
-                      onsubmit="return confirm('Revoke the token for {{ t.subject }}?')">
+                      data-confirm="Revoke the token for {{ t.subject }}?">
                   <input type="hidden" name="csrf" value="{{ token }}">
                   <button class="btn sm danger">Revoke</button>
                 </form>

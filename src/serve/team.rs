@@ -7,15 +7,18 @@
 //! navigation — the token is exchanged for an HttpOnly cookie and re-validated
 //! on every request, so revoking a token takes effect immediately.
 
-use axum::extract::{Extension, Form, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Form, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
+use std::sync::Arc;
 
 use crate::server_auth::{AuthIdentity, Credentials};
 use crate::ui::Viewer;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::Instant;
 
 use super::reload::{AuthSnapshot, SharedAuth};
 
@@ -25,6 +28,36 @@ pub(crate) const COOKIE: &str = "mcp_team_token";
 #[derive(Clone)]
 pub(crate) struct TeamAuth {
     pub(crate) auth: SharedAuth,
+    /// Force `Secure` on the session cookie: set when a TLS terminator in front
+    /// of the proxy does not forward `X-Forwarded-Proto`.
+    pub(crate) secure_cookies: bool,
+    /// The same audit trail `/mcp` writes to, so rejected sign-ins are visible.
+    pub(crate) audit: Arc<crate::audit::AuditLogger>,
+    /// Failed sign-in throttle, per peer address.
+    pub(crate) login_attempts: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>>,
+}
+
+/// Sign-in attempts allowed per peer per window.
+const LOGIN_MAX: u32 = 10;
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Sliding-window rate limit for the sign-in form.
+///
+/// Tokens minted by the UI are 48 random characters; tokens typed by an
+/// operator are whatever they chose. Ten attempts a minute makes the second
+/// case useless to an attacker without turning the proxy into a lockout tool.
+fn throttle_allow(team: &TeamAuth, peer: std::net::IpAddr) -> bool {
+    let Ok(mut attempts) = team.login_attempts.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    attempts.retain(|_, (_, started)| now.duration_since(*started) < LOGIN_WINDOW);
+    let entry = attempts.entry(peer).or_insert((0, now));
+    if entry.0 >= LOGIN_MAX {
+        return false;
+    }
+    entry.0 += 1;
+    true
 }
 
 /// Paths that must stay reachable without a session: the login form itself and
@@ -86,11 +119,19 @@ pub(crate) async fn login_page(Query(query): Query<HashMap<String, String>>) -> 
 /// out on its next click — there is no session table to keep in sync.
 pub(crate) async fn login_submit(
     Extension(team): Extension<TeamAuth>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     if !same_origin(&headers) {
         return (StatusCode::FORBIDDEN, "mcp ui: cross-site login rejected\n").into_response();
+    }
+    if !throttle_allow(&team, peer.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many sign-in attempts — wait a minute and try again\n",
+        )
+            .into_response();
     }
     let next = safe_next(form.get("next").map(String::as_str).unwrap_or("/"));
     let token = form.get("token").map(|t| t.trim()).unwrap_or("");
@@ -106,7 +147,7 @@ pub(crate) async fn login_submit(
     // afterwards.
     match identity_for_token(&team, token).await {
         Ok(identity) => {
-            let secure = wants_secure_cookie(&headers);
+            let secure = team.secure_cookies || wants_secure_cookie(&headers);
             let mut response = Redirect::to(&next).into_response();
             if let Ok(value) = session_cookie(token, secure).parse() {
                 response.headers_mut().insert(header::SET_COOKIE, value);
@@ -116,6 +157,24 @@ pub(crate) async fn login_submit(
         }
         Err(message) => {
             tracing::warn!(error = %message, "management ui sign-in rejected");
+            team.audit.log(crate::audit::AuditEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                source: "ui".to_string(),
+                method: "auth/failure".to_string(),
+                tool_name: None,
+                server_name: None,
+                identity: "anonymous".to_string(),
+                duration_ms: 0,
+                success: false,
+                error_message: Some(message.clone()),
+                arguments: None,
+                acl_decision: None,
+                acl_matched_rule: None,
+                acl_access_kind: None,
+                classification_kind: None,
+                classification_source: None,
+                classification_confidence: None,
+            });
             login_error(&message, &next)
         }
     }
@@ -145,7 +204,12 @@ async fn identity_for_token(team: &TeamAuth, token: &str) -> Result<AuthIdentity
     Ok(identity)
 }
 
-pub(crate) async fn logout() -> Response {
+/// `POST /logout`: a GET here would let any page sign the operator out with an
+/// `<img>` tag.
+pub(crate) async fn logout(headers: HeaderMap) -> Response {
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "mcp ui: cross-site logout rejected").into_response();
+    }
     let mut response = Redirect::to("/login").into_response();
     if let Ok(value) = clear_cookie().parse() {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -279,6 +343,9 @@ mod tests {
     fn team_with(provider: Arc<dyn crate::server_auth::AuthProvider>) -> TeamAuth {
         TeamAuth {
             auth: AuthSnapshot::new(provider, None, vec![]).shared(),
+            secure_cookies: false,
+            audit: Arc::new(crate::audit::AuditLogger::Disabled),
+            login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -303,6 +370,18 @@ mod tests {
             .expect("valid token");
         assert_eq!(identity.subject, "alice");
         assert!(identity_for_token(&bearer, "wrong").await.is_err());
+    }
+
+    #[test]
+    fn sign_in_attempts_are_rate_limited_per_peer() {
+        let team = team_with(Arc::new(crate::server_auth::NoAuth));
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..LOGIN_MAX {
+            assert!(throttle_allow(&team, peer));
+        }
+        assert!(!throttle_allow(&team, peer), "the window is full");
+        let other: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(throttle_allow(&team, other), "other peers are unaffected");
     }
 
     #[test]

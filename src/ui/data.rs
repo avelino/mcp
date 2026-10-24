@@ -151,6 +151,11 @@ pub fn server_rows(
                 "calls": calls.get(name).copied().unwrap_or(0),
                 "available": unavailable_reason(config).is_none(),
                 "unavailable_reason": unavailable_reason(config),
+                // A reader only sees backends whose catalog they can use; the
+                // endpoint itself is metadata they have no claim to.
+                "visible": viewer.is_local()
+                    || viewer.admin
+                    || !visible.is_empty(),
             })
         })
         .collect()
@@ -234,11 +239,6 @@ pub fn tool_rows(
 /// the browser ever holding it.
 pub const REDACTED: &str = "•••• (redacted)";
 
-/// Values shorter than this are not treated as secrets when sealing a diff:
-/// replacing "1" or "true" would shred the surrounding context without
-/// protecting anything worth protecting.
-const MIN_SECRET_LEN: usize = 4;
-
 /// A `${VAR}` reference is safe to show; anything else in a header or env value
 /// may be a secret.
 pub fn redact_secret(value: &str) -> String {
@@ -263,7 +263,7 @@ pub fn literal_secrets(value: &Value) -> Vec<String> {
         };
         for value in map.values() {
             let Some(text) = value.as_str() else { continue };
-            if !text.contains("${") && text.len() >= MIN_SECRET_LEN {
+            if !text.contains("${") {
                 secrets.push(text.to_string());
             }
         }
@@ -273,16 +273,45 @@ pub fn literal_secrets(value: &Value) -> Vec<String> {
 
 /// Replaces literal secret values inside a rendered diff.
 ///
-/// String matching, not JSON parsing, on purpose: parsing and re-rendering
-/// would drop the comments the diff exists to show.
+/// Matching the *quoted* JSON form rather than the bare value: it cannot
+/// mistake a short value for something else in the line, and it handles the
+/// escaping the raw file uses (a secret containing a quote or a backslash).
+/// JSON parsing and re-rendering would be worse: it drops the comments the diff
+/// exists to show.
 pub fn seal_diff(diff: &str, secrets: &[String]) -> String {
     let mut sealed = diff.to_string();
     for secret in secrets {
-        if secret.len() >= MIN_SECRET_LEN {
+        if secret.is_empty() {
+            continue;
+        }
+        // A value embedded in something longer ("Bearer sk-…") only matches as
+        // a bare substring. Short values match the quoted JSON form instead:
+        // replacing "1" everywhere would shred the diff for nothing.
+        if secret.len() >= 4 {
             sealed = sealed.replace(secret, REDACTED);
+        } else {
+            let quoted = serde_json::to_string(secret).unwrap_or_default();
+            if !quoted.is_empty() {
+                sealed = sealed.replace(&quoted, &format!("\"{REDACTED}\""));
+            }
         }
     }
     sealed
+}
+
+/// Literal secrets from every server in the document.
+///
+/// The diff is computed on the whole file and carries context lines, so
+/// sealing only the entry being edited would leave a neighbouring entry's
+/// token visible (SEC-20).
+pub fn literal_secrets_document(document: &Value) -> Vec<String> {
+    let mut secrets = Vec::new();
+    if let Some(servers) = document.get("mcpServers").and_then(|v| v.as_object()) {
+        for server in servers.values() {
+            secrets.extend(literal_secrets(server));
+        }
+    }
+    secrets
 }
 
 /// Redacts values that look like credentials while keeping `${VAR}`
@@ -301,6 +330,13 @@ pub fn redact(value: &Value) -> Value {
                         || lowered.contains("apikey");
                     let value = if secretish {
                         Value::String(redacted_value(val))
+                    } else if lowered.contains("url") {
+                        match val.as_str() {
+                            Some(url) => Value::String(redact_url(url)),
+                            None => redact_deep(val, false),
+                        }
+                    } else if lowered == "args" {
+                        Value::Array(redact_args(val))
                     } else {
                         redact_deep(val, lowered == "env" || lowered == "headers")
                     };
@@ -310,6 +346,82 @@ pub fn redact(value: &Value) -> Value {
         ),
         other => other.clone(),
     }
+}
+
+/// Query parameters whose value is a credential, whatever the header says.
+fn sensitive_param(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "token",
+        "key",
+        "secret",
+        "password",
+        "passwd",
+        "sig",
+        "signature",
+        "auth",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+}
+
+/// Redacts credential-looking query values while keeping the URL usable.
+fn redact_url(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let mut parts = Vec::new();
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some((name, _value)) if sensitive_param(name) => {
+                parts.push(format!("{name}={REDACTED}"))
+            }
+            Some((name, value)) => parts.push(format!("{name}={value}")),
+            None => parts.push(pair.to_string()),
+        }
+    }
+    let mut out = format!("{base}?{}", parts.join("&"));
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
+/// `args` can carry a credential (`--token abc`). Values that follow a
+/// credential-ish flag, and `--flag=value` pairs, are redacted.
+fn redact_args(value: &Value) -> Vec<Value> {
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(items.len());
+    let mut redact_next = false;
+    for item in items {
+        let Some(text) = item.as_str() else {
+            out.push(item.clone());
+            continue;
+        };
+        if redact_next {
+            redact_next = false;
+            out.push(Value::String(REDACTED.to_string()));
+            continue;
+        }
+        if let Some((flag, _)) = text.split_once('=') {
+            if flag.starts_with('-') && sensitive_param(flag) {
+                out.push(Value::String(format!("{flag}={REDACTED}")));
+                continue;
+            }
+        }
+        if text.starts_with('-') && sensitive_param(text) {
+            redact_next = true;
+        }
+        out.push(item.clone());
+    }
+    out
 }
 
 /// Inside `env` and `headers` every literal value may be a secret; only
@@ -754,7 +866,7 @@ pub fn ensure_writable(state: &UiState, source: &ConfigSource, viewer: &Viewer) 
 
 pub fn csrf_ok(state: &UiState, form: &HashMap<String, String>) -> UiResult<()> {
     match form.get("csrf") {
-        Some(token) if token == &state.token => Ok(()),
+        Some(token) if super::session::ct_eq(token, &state.token) => Ok(()),
         _ => Err(super::UiError::BadRequest(
             "invalid or missing form token".to_string(),
         )),
@@ -1220,9 +1332,34 @@ mod tests {
         assert!(secrets.contains(&"long-enough".to_string()));
         assert!(!secrets.contains(&"${TOKEN}".to_string()));
         assert!(
-            !secrets.contains(&"123".to_string()),
-            "short values are not sealed"
+            secrets.contains(&"123".to_string()),
+            "short values are sealed too"
         );
+    }
+
+    #[test]
+    fn query_strings_and_arguments_are_redacted_too() {
+        let raw = json!({
+            "url": "https://example.com/mcp?api_key=secret-value&team=platform",
+            "args": ["--token", "abc123", "--header", "X: y", "--api-key=zzz"]
+        });
+        let redacted = redact(&raw);
+        let url = redacted["url"].as_str().unwrap();
+        assert!(!url.contains("secret-value"), "{url}");
+        assert!(url.contains("api_key=•••• (redacted)"), "{url}");
+        assert!(url.contains("team=platform"), "harmless params stay: {url}");
+
+        let args = redacted["args"].to_string();
+        assert!(!args.contains("abc123"), "{args}");
+        assert!(!args.contains("zzz"), "{args}");
+        assert!(args.contains("X: y"), "unrelated args stay: {args}");
+    }
+
+    #[test]
+    fn a_short_secret_is_sealed_when_it_is_a_whole_value() {
+        let sealed = seal_diff("+  \"MODE\": \"1\"", &["1".to_string()]);
+        assert!(!sealed.contains("\"1\""), "{sealed}");
+        assert!(sealed.contains(REDACTED));
     }
 
     #[test]

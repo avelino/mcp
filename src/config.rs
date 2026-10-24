@@ -549,9 +549,35 @@ pub(crate) fn substitute_env_vars(input: &str) -> String {
     let re = Regex::new(r"\$\{([^}]+)\}").unwrap();
     re.replace_all(input, |caps: &regex::Captures| {
         let var_name = &caps[1];
-        std::env::var(var_name).unwrap_or_default()
+        match std::env::var(var_name) {
+            Ok(value) => value,
+            Err(_) => {
+                // A typo used to become an empty string silently: "Bearer "
+                // instead of "Bearer <token>". Say it once per variable.
+                warn_missing_env_var(var_name);
+                String::new()
+            }
+        }
     })
     .to_string()
+}
+
+/// Warns once per missing `${VAR}` for the life of the process.
+fn warn_missing_env_var(name: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = warned
+        .lock()
+        .map(|mut set| set.insert(name.to_string()))
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(
+            variable = %name,
+            "config references ${{{name}}} but the variable is not set — it expands to an empty string"
+        );
+    }
 }
 
 /// Reject `tool_acl` configs where a single pattern (or one exactly equal

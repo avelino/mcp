@@ -10,13 +10,33 @@ use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::{unauthorized, UiState};
 
 const COOKIE: &str = "mcp_ui";
 
-/// Bearer of the one-time secret printed on startup.
+/// Bearer of the one-time secret printed on startup, or of a session created
+/// by exchanging it. Same shape for both on purpose: 48 random characters from
+/// the crate's opaque-token charset.
 pub struct SessionToken(String);
+
+/// Constant-time comparison for short secrets.
+///
+/// A remote timing attack against 48 random characters is not practical, but
+/// the comparison is also what protects the CSRF nonce, and a loop is cheaper
+/// than the reasoning about whether it matters.
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        difference |= x ^ y;
+    }
+    difference == 0
+}
 
 impl SessionToken {
     pub fn generate() -> Self {
@@ -52,25 +72,37 @@ pub async fn guard(State(state): State<Arc<UiState>>, req: Request, next: Next) 
         return (StatusCode::FORBIDDEN, "mcp ui: cross-site request rejected").into_response();
     }
 
-    if cookie_token(&headers).as_deref() == Some(state.token.as_str()) {
-        return next.run(req).await;
+    if let Some(cookie) = cookie_token(&headers) {
+        if state
+            .sessions
+            .lock()
+            .ok()
+            .is_some_and(|set| set.contains(&cookie))
+        {
+            return next.run(req).await;
+        }
     }
 
-    // First visit: the URL printed by `mcp ui` carries ?token=…  Turn it into a
-    // cookie and redirect so the secret stops appearing in the address bar and
-    // in Referer headers.
-    if let Some(token) = query_param(req.uri().query().unwrap_or(""), "token") {
-        if token == state.token {
+    // First visit: the URL printed by `mcp ui` carries the bootstrap token.
+    // It is spent here and replaced by a fresh session token, so a URL that
+    // leaks through history or a log is worthless after the first visit — and
+    // expires on its own if it is never visited at all.
+    if let Some(candidate) = query_param(req.uri().query().unwrap_or(""), "token") {
+        if spend_bootstrap(&state, &candidate) {
+            let session = SessionToken::generate().as_str().to_string();
+            if let Ok(mut sessions) = state.sessions.lock() {
+                if sessions.len() >= MAX_SESSIONS {
+                    sessions.clear();
+                }
+                sessions.insert(session.clone());
+            }
             let target = strip_token(req.uri().query().unwrap_or(""));
             let location = if target.is_empty() {
                 path
             } else {
                 format!("{path}?{target}")
             };
-            let cookie = format!(
-                "{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
-                state.token
-            );
+            let cookie = format!("{COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict");
             let mut response = Redirect::to(&location).into_response();
             if let Ok(value) = cookie.parse() {
                 response.headers_mut().insert(header::SET_COOKIE, value);
@@ -80,6 +112,44 @@ pub async fn guard(State(state): State<Arc<UiState>>, req: Request, next: Next) 
     }
 
     unauthorized()
+}
+
+/// At most this many live browser sessions per process.
+const MAX_SESSIONS: usize = 64;
+
+/// Consumes the bootstrap token, if it is the right one and still valid.
+///
+/// The check and the take happen under one lock: a wrong token must not spend
+/// it, and two simultaneous uses must not both win.
+pub(crate) fn spend_bootstrap(state: &UiState, candidate: &str) -> bool {
+    let Ok(mut bootstrap) = state.bootstrap.lock() else {
+        return false;
+    };
+    let Some(current) = bootstrap.as_ref() else {
+        return false;
+    };
+    if current.expires <= Instant::now() {
+        *bootstrap = None;
+        return false;
+    }
+    if !ct_eq(&current.token, candidate) {
+        return false;
+    }
+    *bootstrap = None;
+    true
+}
+
+#[cfg(test)]
+fn bootstrap_valid(state: &UiState, candidate: &str) -> bool {
+    state
+        .bootstrap
+        .lock()
+        .ok()
+        .and_then(|b| {
+            b.as_ref()
+                .map(|b| b.expires > Instant::now() && ct_eq(&b.token, candidate))
+        })
+        .unwrap_or(false)
 }
 
 fn host_is_local(headers: &HeaderMap, bound: &str) -> bool {
@@ -196,6 +266,14 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn constant_time_equality_compares_content_and_length() {
+        assert!(ct_eq("same", "same"));
+        assert!(!ct_eq("same", "samf"));
+        assert!(!ct_eq("same", "same "));
+        assert!(!ct_eq("", "x"));
     }
 
     #[test]

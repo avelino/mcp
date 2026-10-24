@@ -13,14 +13,14 @@
 <div class="split" style="grid-template-columns:250px minmax(0,1fr) 380px">
   <div class="card">
     <div class="card-b" style="padding:10px">
-      <input class="input" placeholder="Filter tools…" oninput="filterTools(this.value)" style="font-family:var(--sans)">
+      <input class="input" placeholder="Filter tools…" data-filter-tools style="font-family:var(--sans)">
     </div>
     <div class="tlist" style="max-height:600px;overflow:auto">
       {% for s in servers %}
       <div class="nav-label" style="padding:8px 12px 4px">{{ s.name }}</div>
       {% for t in s.tools %}
       <a class="titem {% if selected and selected.key == s.name ~ '__' ~ t.name %}on{% endif %}"
-         data-name="{{ (s.name ~ '__' ~ t.name) | lower }}"
+         data-tool-name="{{ (s.name ~ '__' ~ t.name) | lower }}"
          href="/playground?server={{ s.name | urlencode }}&tool={{ t.name | urlencode }}"
          style="display:flex;align-items:center;gap:9px;padding:8px 12px;border-bottom:1px solid rgba(35,49,44,.4)">
         <span class="mono tiny">{{ t.name }}</span>
@@ -134,12 +134,5 @@
 </div>
 {% endif %}
 
-<script>
-function filterTools(q) {
-  q = q.toLowerCase();
-  document.querySelectorAll('.titem').forEach(function (el) {
-    el.style.display = !q || el.dataset.name.indexOf(q) !== -1 ? '' : 'none';
-  });
-}
-</script>
+
 {% endblock %}

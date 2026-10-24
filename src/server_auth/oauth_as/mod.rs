@@ -35,7 +35,7 @@ mod test_helpers;
 pub use config::OAuthAsConfig;
 pub use provider::OAuthAsAuth;
 pub use state::AsState;
-pub use store::{load as load_state, save as save_state};
+pub use store::{load as load_state, save as save_state, state_path};
 
 use std::sync::Arc;
 

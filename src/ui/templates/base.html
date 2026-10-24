@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="/assets/app.css">
 <script src="/assets/theme.js"></script>
 <script src="/assets/htmx.js" defer></script>
+<script src="/assets/app.js" defer></script>
 </head>
 <body hx-headers='{"x-mcp-ui":"1"}'>
 <div class="app">
@@ -71,7 +72,10 @@
       {% if viewer_team %}
       <span class="chip" title="authenticated by the proxy">{{ subject }}</span>
       {% if viewer_admin %}<span class="chip ok">admin</span>{% endif %}
-      <a class="btn sm ghost" href="/logout">Sign out</a>
+      <form class="inline" method="post" action="/logout">
+        <input type="hidden" name="csrf" value="{{ token }}">
+        <button class="btn sm ghost">Sign out</button>
+      </form>
       {% elif read_only %}
       <span class="chip warn" title="{{ read_only_reason }}">read-only</span>
       {% else %}
@@ -87,6 +91,13 @@
           <div class="t">Audit database unavailable</div>
           <div class="d">The activity trail and the on-disk tool cache are off for this session. Nothing else is affected — config editing and discovery still work.</div>
           <div class="tiny mono muted" style="margin-top:4px">{{ db_error }}</div>
+        </div>
+      </div>
+      {% elif db_degraded %}
+      <div class="banner">
+        <div>
+          <div class="t">Audit database unavailable</div>
+          <div class="d">The activity trail and the on-disk tool cache are off for this session. Nothing else is affected.</div>
         </div>
       </div>
       {% endif %}

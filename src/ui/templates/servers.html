@@ -96,7 +96,7 @@
           <td style="text-align:right;white-space:nowrap">
             <a class="btn sm" href="/servers/{{ s.name | urlencode }}">Open</a>
             {% if not read_only %}
-            <form class="inline" method="post" action="/servers/{{ s.name | urlencode }}/delete" onsubmit="return confirm('Remove {{ s.name }} from the config?')">
+            <form class="inline" method="post" action="/servers/{{ s.name | urlencode }}/delete" data-confirm="Remove {{ s.name }} from the config?">
               <input type="hidden" name="csrf" value="{{ token }}">
               <button class="btn sm danger">Remove</button>
             </form>

@@ -306,6 +306,12 @@ pub struct Applied {
 pub fn write_atomic(path: &Path, text: &str, expected: Option<&str>) -> Result<Applied> {
     use std::io::Write;
 
+    // Serialise writers that cooperate with us (the UI, and anything else that
+    // uses this function). The optimistic hash check narrows the window between
+    // "the form saw this file" and "we rename over it"; the lock closes the
+    // remaining one between check and rename.
+    let _lock = FileLock::acquire(path)?;
+
     if let Some(expected) = expected {
         let current = std::fs::read_to_string(path).unwrap_or_default();
         let current_hash = sha256_hex(&current);
@@ -481,6 +487,69 @@ fn to_input(value: &Value) -> CstInputValue {
         Value::Array(items) => CstInputValue::Array(items.iter().map(to_input).collect()),
         Value::Object(map) => {
             CstInputValue::Object(map.iter().map(|(k, v)| (k.clone(), to_input(v))).collect())
+        }
+    }
+}
+
+/// An exclusive `flock` on a sibling lock file.
+///
+/// A sidecar rather than the config itself: the file is replaced by `rename`,
+/// and a lock on the old inode would not protect the next writer.
+struct FileLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+
+            let mut lock_path = path.to_path_buf();
+            let extension = match path.extension().and_then(|e| e.to_str()) {
+                Some(ext) => format!("{ext}.lock"),
+                None => "lock".to_string(),
+            };
+            lock_path.set_extension(extension);
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)
+                .with_context(|| format!("failed to open {}", lock_path.display()))?;
+            // SAFETY: flock only needs a valid, open file descriptor.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                bail!(
+                    "failed to lock {}: {}",
+                    lock_path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+            Ok(Self { file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: releasing a lock we hold; the descriptor is still open.
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 }

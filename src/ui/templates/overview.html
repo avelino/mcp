@@ -64,7 +64,7 @@
           <thead><tr><th>Server</th><th>Type</th><th>Tools</th><th>Cache</th><th class="num">Calls 24h</th></tr></thead>
           <tbody>
             {% for s in servers %}
-            <tr class="click" onclick="location.href='/servers/{{ s.name | urlencode }}'">
+            <tr class="click" data-href="/servers/{{ s.name | urlencode }}">
               <td><div class="row"><span class="dot {{ s.dot }}"></span><span class="mono" style="font-weight:600">{{ s.name }}</span>
                 {% if not s.available %}<span class="chip err" title="{{ s.unavailable_reason }}">missing</span>{% endif %}</div></td>
               <td><span class="chip">{{ s.kind }}</span></td>

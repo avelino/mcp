@@ -18,7 +18,9 @@ pub async fn index(
     // A non-admin sees their own activity, not everybody else's.
     let own_identity = (!viewer.admin).then(|| viewer.subject().to_string());
     let snapshot = data::audit_snapshot(&state, 24, 5_000, own_identity.as_deref());
-    let servers = data::server_rows(&cfg, &state, &viewer, &snapshot.per_server);
+    let mut servers = data::server_rows(&cfg, &state, &viewer, &snapshot.per_server);
+    // Team readers only see backends they can actually use.
+    servers.retain(|row| row["visible"].as_bool().unwrap_or(false));
     let instances = data::instances_view();
 
     let mut http = 0;
