@@ -48,7 +48,7 @@ pub async fn guard(State(state): State<Arc<UiState>>, req: Request, next: Next) 
             .into_response();
     }
 
-    if method != Method::GET && method != Method::HEAD && !same_site(&headers, &state.addr) {
+    if method != Method::GET && method != Method::HEAD && !same_site(&headers) {
         return (StatusCode::FORBIDDEN, "mcp ui: cross-site request rejected").into_response();
     }
 
@@ -83,6 +83,9 @@ pub async fn guard(State(state): State<Arc<UiState>>, req: Request, next: Next) 
 }
 
 fn host_is_local(headers: &HeaderMap, bound: &str) -> bool {
+    let Ok(bound) = bound.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -90,40 +93,63 @@ fn host_is_local(headers: &HeaderMap, bound: &str) -> bool {
     else {
         return false;
     };
-
-    let port = bound.rsplit(':').next().unwrap_or("7332");
-    let mut allowed = vec![
-        format!("127.0.0.1:{port}"),
-        format!("localhost:{port}"),
-        format!("[::1]:{port}"),
-        bound.to_ascii_lowercase(),
-    ];
-    // An explicit non-loopback bind is allowed as long as the client reached it
-    // by IP literal: a hostile DNS name cannot resolve to that literal.
-    let host_part = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host);
-    if host_part.parse::<std::net::IpAddr>().is_ok() {
-        allowed.push(host.clone());
-    }
-    allowed.iter().any(|a| a == &host)
+    host_matches(&host, bound)
 }
 
-/// A browser POST must be same-origin. Non-browser clients (curl) send neither
-/// header and are allowed: they already had to read the token from the file
-/// system or the terminal.
-fn same_site(headers: &HeaderMap, bound: &str) -> bool {
+/// Whether `Host` names this server.
+///
+/// Derived from the bound address rather than a hardcoded loopback list: with
+/// `--addr 192.168.1.5:7332` the browser reaches the UI by that IP, and the
+/// check has to accept it. Loopback binds stay loopback-only — an arbitrary IP
+/// literal is not a loopback alias.
+fn host_matches(host: &str, bound: std::net::SocketAddr) -> bool {
+    let port = bound.port();
+    if host == format!("localhost:{port}")
+        || host == format!("127.0.0.1:{port}")
+        || host == format!("[::1]:{port}")
+    {
+        return true;
+    }
+    let Some((host_part, host_port)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if host_port.parse::<u16>().ok() != Some(port) {
+        return false;
+    }
+    let Ok(ip) = host_part
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+    else {
+        return false;
+    };
+    let bound_ip = bound.ip();
+    if bound_ip.is_unspecified() {
+        // `0.0.0.0` / `::` — every local address is a legitimate way in.
+        true
+    } else {
+        ip == bound_ip
+    }
+}
+
+/// A browser POST must be same-origin.
+///
+/// Compared against the `Host` header, which `host_is_local` has already
+/// vouched for: a rebinding request carries its own domain in both headers and
+/// would otherwise look perfectly same-origin. Non-browser clients (curl) send
+/// neither header and are allowed — they already had to read the token from the
+/// terminal.
+fn same_site(headers: &HeaderMap) -> bool {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if site.eq_ignore_ascii_case("cross-site") || site.eq_ignore_ascii_case("same-site") {
             return false;
         }
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        let port = bound.rsplit(':').next().unwrap_or("7332");
-        let ok = ["127.0.0.1", "localhost", "[::1]"]
-            .iter()
-            .any(|h| origin.eq_ignore_ascii_case(&format!("http://{h}:{port}")));
-        if !ok {
+        let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
             return false;
-        }
+        };
+        return origin.eq_ignore_ascii_case(&format!("http://{host}"))
+            || origin.eq_ignore_ascii_case(&format!("https://{host}"));
     }
     true
 }
@@ -151,4 +177,97 @@ fn strip_token(query: &str) -> String {
         .filter(|pair| !pair.is_empty())
         .collect::<Vec<_>>()
         .join("&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(text: &str) -> std::net::SocketAddr {
+        text.parse().expect("addr")
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                name.parse::<axum::http::HeaderName>().unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn a_loopback_bind_only_accepts_loopback_hosts() {
+        let bound = addr("127.0.0.1:7332");
+        assert!(host_matches("127.0.0.1:7332", bound));
+        assert!(host_matches("localhost:7332", bound));
+        assert!(host_matches("[::1]:7332", bound));
+        assert!(
+            !host_matches("192.168.1.5:7332", bound),
+            "an IP literal is not loopback"
+        );
+        assert!(!host_matches("evil.example:7332", bound));
+        assert!(!host_matches("127.0.0.1:7333", bound), "port must match");
+    }
+
+    #[test]
+    fn an_explicit_non_loopback_bind_accepts_that_address() {
+        let bound = addr("192.168.1.5:7332");
+        assert!(host_matches("192.168.1.5:7332", bound));
+        assert!(host_matches("localhost:7332", bound));
+        assert!(!host_matches("192.168.1.6:7332", bound));
+        assert!(!host_matches("evil.example:7332", bound));
+    }
+
+    #[test]
+    fn an_unspecified_bind_accepts_any_ip_literal_but_not_a_domain() {
+        let bound = addr("0.0.0.0:7332");
+        assert!(host_matches("10.0.0.4:7332", bound));
+        assert!(host_matches("127.0.0.1:7332", bound));
+        assert!(!host_matches("evil.example:7332", bound));
+    }
+
+    #[test]
+    fn same_origin_follows_the_host_header() {
+        let same = headers(&[
+            ("host", "192.168.1.5:7332"),
+            ("origin", "http://192.168.1.5:7332"),
+        ]);
+        assert!(
+            same_site(&same),
+            "a non-loopback bind must accept its own origin"
+        );
+
+        let other = headers(&[
+            ("host", "192.168.1.5:7332"),
+            ("origin", "http://evil.example"),
+        ]);
+        assert!(!same_site(&other));
+
+        let rebinding = headers(&[
+            ("host", "evil.example:7332"),
+            ("origin", "http://evil.example:7332"),
+        ]);
+        assert!(
+            same_site(&rebinding),
+            "same_site compares Origin to Host; rejecting the Host is host_is_local's job"
+        );
+        assert!(!host_is_local(&rebinding, "127.0.0.1:7332"));
+    }
+
+    #[test]
+    fn a_cross_site_fetch_is_refused_regardless_of_origin() {
+        let fetch = headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "http://127.0.0.1:7332"),
+        ]);
+        assert!(!same_site(&fetch));
+    }
+
+    #[test]
+    fn a_client_without_origin_is_allowed() {
+        assert!(same_site(&headers(&[("host", "127.0.0.1:7332")])));
+    }
 }
