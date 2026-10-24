@@ -28,9 +28,13 @@ use super::discovery::discover_pending_backends;
 use super::dispatch::dispatch_request;
 use super::proxy::{shutdown_clients_in_parallel, BackendState, ProxyServer, SharedProxy};
 use super::reload::{reload_in_place, AuthSnapshot, BootInvariants, ReloadContext, SharedAuth};
+use super::team;
 
 type SseSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
 type SessionMap = Arc<Mutex<HashMap<String, SseSender>>>;
+
+/// Upper bound on concurrent legacy SSE sessions.
+const MAX_SSE_SESSIONS: usize = 256;
 
 #[derive(Clone)]
 struct AppState {
@@ -313,9 +317,9 @@ fn validate_bind_addr(addr: &str, insecure: bool) -> Result<std::net::SocketAddr
 
     if !insecure && !sock_addr.ip().is_loopback() {
         bail!(
-            "refusing to bind to non-loopback address {addr} without TLS.\n\
-             Use --insecure to allow plaintext on non-loopback interfaces,\n\
-             or bind to 127.0.0.1:{port} for local-only access.",
+            "refusing to bind to non-loopback address {addr}: this binary serves plain HTTP \n\
+             (TLS belongs in front of it). Use --insecure to acknowledge that, or bind to \n\
+             127.0.0.1:{port} for local-only access.",
             port = sock_addr.port()
         );
     }
@@ -328,8 +332,50 @@ pub async fn run_http(
     bind_addr: &str,
     insecure: bool,
     filter: InstanceFilter,
+    management: bool,
+    cookie_secure: bool,
 ) -> Result<()> {
     let sock_addr = validate_bind_addr(bind_addr, insecure)?;
+
+    // Credential files are rewritten owner-only, but an older build may have
+    // left them readable; say so once instead of silently trusting them.
+    crate::secure_file::warn_if_permissive(&[
+        (
+            "auth.json (upstream tokens)",
+            crate::auth::auth_store_path().unwrap_or_default(),
+        ),
+        (
+            "auth_server.json (OAuth refresh tokens)",
+            crate::server_auth::oauth_as::state_path().unwrap_or_default(),
+        ),
+    ]);
+
+    // `forwarded` trusts a header. That is fine behind a proxy that overwrites
+    // it, and dangerous on a port anyone can reach — especially with the
+    // management UI, where those roles can rewrite the config.
+    if config
+        .server_auth
+        .providers
+        .iter()
+        .any(|p| p == "forwarded")
+        && !sock_addr.ip().is_loopback()
+    {
+        let only_forwarded = config.server_auth.providers.len() == 1;
+        if only_forwarded {
+            tracing::warn!(
+                addr = %sock_addr,
+                "providers=[\"forwarded\"] on a non-loopback address: anyone who can reach \
+                 this port can claim any subject, including an admin role. Keep it behind a \
+                 reverse proxy that removes x-forwarded-user/x-forwarded-groups from clients"
+            );
+        } else {
+            tracing::warn!(
+                addr = %sock_addr,
+                "forwarded identity is trusted on a non-loopback address; make sure the \
+                 reverse proxy strips client-supplied x-forwarded-* headers"
+            );
+        }
+    }
 
     // OAuth AS state — only allocated when the operator opted in via
     // `serverAuth.providers` containing "oauth_as". Loaded from disk
@@ -372,21 +418,28 @@ pub async fn run_http(
     );
     config.audit.output = Some(resolved_audit.clone());
 
-    let pool = if resolved_audit.writes_to_file() {
-        crate::db::create_pool(&config.audit).unwrap_or_else(|e| {
-            tracing::warn!(error = format!("{e:#}"), "failed to create db pool");
-            Arc::new(crate::db::DbPool::disabled())
-        })
+    let (pool, db_error) = if resolved_audit.writes_to_file() {
+        match crate::db::create_pool(&config.audit) {
+            Ok(pool) => (pool, None),
+            Err(e) => {
+                let message = format!("{e:#}");
+                tracing::warn!(error = %message, "failed to create db pool");
+                (Arc::new(crate::db::DbPool::disabled()), Some(message))
+            }
+        }
     } else {
-        Arc::new(crate::db::DbPool::disabled())
+        (Arc::new(crate::db::DbPool::disabled()), None)
     };
-    let audit = AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled);
-    let cache_store = ToolCacheStore::new(pool);
+    // Shared with the management UI, which must report on the same audit trail
+    // and the same tool cache the proxy is using.
+    let audit =
+        Arc::new(AuditLogger::open(&config.audit, pool.clone()).unwrap_or(AuditLogger::Disabled));
+    let cache_store = ToolCacheStore::new(pool.clone());
     let mut server = ProxyServer::new(
-        Arc::new(audit),
+        audit.clone(),
         config.servers.clone(),
         config.config_hashes.clone(),
-        cache_store,
+        cache_store.clone(),
     );
     server.load_from_cache();
     let has_cached_tools = !server.tools.is_empty();
@@ -531,6 +584,89 @@ pub async fn run_http(
         core_router.merge(oauth_as::router(cfg, state.clone()))
     } else {
         core_router
+    };
+
+    // The management UI is the same pages `mcp ui` serves, mounted at the root
+    // of this proxy and guarded by `serverAuth` instead of a local session.
+    let app = if management {
+        // A reload triggered from the UI must run *in this process*: going
+        // through the instance registry would try to take the flock this very
+        // process already holds, and the registry prunes what it cannot lock.
+        let (reload_tx, mut reload_rx) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<anyhow::Result<String>>>(4);
+        {
+            let proxy = shared.clone();
+            let auth = state.auth.clone();
+            let ctx = state.reload.clone();
+            tokio::spawn(async move {
+                while let Some(reply) = reload_rx.recv().await {
+                    let outcome = reload_in_place(
+                        &proxy,
+                        &auth,
+                        &ctx.filter,
+                        &ctx.boot,
+                        ctx.as_state.as_ref(),
+                    )
+                    .await;
+                    let message = outcome.map(|o| {
+                        let restart = if o.requires_restart.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · restart required: {}", o.requires_restart.join(", "))
+                        };
+                        format!(
+                            "config reloaded · {} added, {} changed, {} removed · {}{restart}",
+                            o.added.len(),
+                            o.changed.len(),
+                            o.removed.len(),
+                            o.tools
+                        )
+                    });
+                    let _ = reply.send(message);
+                }
+            });
+        }
+        let ui_state = Arc::new(crate::ui::UiState::embedded(
+            bind_addr.to_string(),
+            audit.clone(),
+            cache_store.clone(),
+            db_error.clone(),
+            Some(reload_tx),
+        ));
+        let ui_app = crate::ui::routes()
+            .route("/login", get(team::login_page).post(team::login_submit))
+            .route("/logout", post(team::logout))
+            .layer(axum::middleware::from_fn_with_state(
+                team::TeamAuth {
+                    auth: state.auth.clone(),
+                    secure_cookies: cookie_secure,
+                    audit: audit.clone(),
+                    login_attempts: Arc::new(std::sync::Mutex::new(HashMap::<
+                        std::net::IpAddr,
+                        (u32, std::time::Instant),
+                    >::new())),
+                },
+                team::guard,
+            ))
+            .with_state(ui_state);
+        if state
+            .auth
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .admin_roles
+            .is_empty()
+        {
+            tracing::warn!(
+                "management UI is enabled but serverAuth.adminRoles is empty: every write is denied"
+            );
+        }
+        println!(
+            "management ui: http://{}/ (auth via serverAuth)",
+            crate::ui::display_authority(&sock_addr)
+        );
+        app.merge(ui_app)
+    } else {
+        app
     };
 
     let app = app
@@ -975,9 +1111,18 @@ async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> i
         .event("endpoint")
         .data(format!("/mcp?session_id={session_id}"));
 
-    // Register this session so POST handler can send responses via SSE
+    // Register this session so POST handler can send responses via SSE.
+    // The map is capped: eviction handles a wedged consumer, not a client that
+    // opens streams until memory runs out.
     {
         let mut sessions = state.sessions.lock().await;
+        if sessions.len() >= MAX_SSE_SESSIONS {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many concurrent SSE sessions",
+            )
+                .into_response();
+        }
         sessions.insert(session_id.clone(), tx.clone());
     }
 

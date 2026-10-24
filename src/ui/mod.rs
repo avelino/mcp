@@ -1,0 +1,737 @@
+//! Local web UI (`mcp ui`).
+//!
+//! The UI is a thin, server-rendered view over modules that already exist:
+//! `config_source` for reading and writing `servers.json`, `audit` for the
+//! activity trail, `cache` for the catalog, `client` for tool calls, and
+//! `instances` for the processes running on this machine.
+//!
+//! Design constraints, in order:
+//!
+//! 1. The file is the source of truth. Every page re-reads it; nothing is
+//!    cached in the server except the session token.
+//! 2. Writes are diffs. Editing produces a patch, the patch is rendered as a
+//!    diff and validated, and only then written (atomically, with a backup).
+//! 3. No secret reaches the template. Config values are redacted before
+//!    rendering, and `${VAR}` placeholders are shown literally.
+//! 4. No JavaScript framework and no build step. htmx is vendored; the pages
+//!    work as plain forms without it.
+
+mod data;
+mod handlers;
+pub(crate) mod render;
+mod session;
+mod viewer;
+
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::audit::AuditLogger;
+use crate::cache::{BackendToolCache, ToolCacheStore};
+use crate::db::DbPool;
+
+pub use session::SessionToken;
+pub use viewer::{CurrentViewer, Viewer};
+
+const HTMX: &str = include_str!("assets/htmx.min.js");
+const APP_CSS: &str = include_str!("assets/app.css");
+const THEME_JS: &str = include_str!("assets/theme.js");
+const APP_JS: &str = include_str!("assets/app.js");
+
+/// How the UI was started.
+pub struct Options {
+    pub addr: String,
+    pub open: bool,
+    /// Disables every mutating route.
+    pub read_only: bool,
+    /// Acknowledge that a non-loopback bind serves plain HTTP.
+    pub insecure: bool,
+}
+
+/// How long the printed bootstrap URL is valid.
+pub const BOOTSTRAP_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The one-time secret printed at startup.
+pub struct Bootstrap {
+    pub token: String,
+    pub expires: std::time::Instant,
+}
+
+/// Shared server state. Handlers get an `Arc<UiState>`.
+/// A bearer token created through the UI, waiting to be displayed once.
+pub struct PendingToken {
+    pub subject: String,
+    pub roles: Vec<String>,
+    pub token: String,
+    /// A token that is never viewed should not sit in memory forever.
+    pub expires: Instant,
+}
+
+/// How long a freshly minted token waits to be displayed.
+pub const PENDING_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// How many unviewed tokens are kept at once.
+const MAX_PENDING_TOKENS: usize = 32;
+
+pub struct UiState {
+    pub addr: String,
+    /// CSRF nonce embedded in forms. Not a credential.
+    pub token: String,
+    /// Why the UI is read-only, when it is.
+    pub read_only: bool,
+    /// Browser sessions created by exchanging the bootstrap token.
+    pub sessions: Mutex<std::collections::HashSet<String>>,
+    /// The printed startup token: single use, and it expires.
+    pub bootstrap: Mutex<Option<Bootstrap>>,
+    pub started: Instant,
+    pub audit: Arc<AuditLogger>,
+    pub cache: ToolCacheStore,
+    /// Why the audit/tool-cache database could not be opened, when it could not.
+    pub db_error: Option<String>,
+    /// In-process reload, when the UI runs inside the proxy. The instance
+    /// registry is deliberately not used here: signalling yourself through a
+    /// file lock you already hold is a good way to lose your own registration.
+    reload: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<anyhow::Result<String>>>>,
+    /// Tokens minted by the UI, held only until the page that shows them is
+    /// read once. A secret that goes back into a URL or a log stops being one.
+    pending_tokens: Mutex<HashMap<String, PendingToken>>,
+    /// Tool catalogs discovered during this session.
+    ///
+    /// The database is an optimisation, not a requirement: without it (no
+    /// native library, read-only filesystem, `audit.enabled = false`) the UI
+    /// still has to show what discovery just found.
+    memory: Mutex<HashMap<String, BackendToolCache>>,
+}
+
+impl UiState {
+    /// Builds the state for a UI served by another process's components —
+    /// `mcp serve --management` shares the proxy's pool, audit logger and
+    /// tool cache instead of opening a second database.
+    pub fn embedded(
+        addr: String,
+        audit: Arc<AuditLogger>,
+        cache: ToolCacheStore,
+        db_error: Option<String>,
+        reload: Option<
+            tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<anyhow::Result<String>>>,
+        >,
+    ) -> Self {
+        Self {
+            addr,
+            token: SessionToken::generate().as_str().to_string(),
+            read_only: false,
+            started: Instant::now(),
+            audit,
+            cache,
+            db_error,
+            reload,
+            sessions: Mutex::new(std::collections::HashSet::new()),
+            bootstrap: Mutex::new(None),
+            pending_tokens: Mutex::new(HashMap::new()),
+            memory: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Re-applies the config in this process (team mode). `None` means the UI
+    /// is a separate process and must signal the proxies instead.
+    pub async fn reload_now(&self) -> Option<anyhow::Result<String>> {
+        let sender = self.reload.as_ref()?;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        if sender.send(reply).await.is_err() {
+            return Some(Err(anyhow::anyhow!("reload task is no longer running")));
+        }
+        Some(
+            response
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("reload task dropped the request: {e}"))),
+        )
+    }
+
+    /// Stores a freshly minted token and returns the id used to show it once.
+    pub fn stash_token(&self, subject: &str, roles: &[String], token: &str) -> String {
+        let id = SessionToken::generate().as_str().to_string();
+        let now = Instant::now();
+        if let Ok(mut pending) = self.pending_tokens.lock() {
+            pending.retain(|_, entry| entry.expires > now);
+            if pending.len() >= MAX_PENDING_TOKENS {
+                // Oldest first: the map is small, and a token nobody opened is
+                // worthless once it has waited this long.
+                if let Some(oldest) = pending
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires)
+                    .map(|(key, _)| key.clone())
+                {
+                    pending.remove(&oldest);
+                }
+            }
+            pending.insert(
+                id.clone(),
+                PendingToken {
+                    subject: subject.to_string(),
+                    roles: roles.to_vec(),
+                    token: token.to_string(),
+                    expires: now + PENDING_TOKEN_TTL,
+                },
+            );
+        }
+        id
+    }
+
+    /// Reads and forgets a stashed token.
+    pub fn take_token(&self, id: &str) -> Option<PendingToken> {
+        let mut pending = self.pending_tokens.lock().ok()?;
+        let entry = pending.remove(id)?;
+        (entry.expires > Instant::now()).then_some(entry)
+    }
+
+    pub fn cached(&self, name: &str) -> Option<BackendToolCache> {
+        self.cache
+            .load_backend(name)
+            .or_else(|| self.memory.lock().ok()?.get(name).cloned())
+    }
+
+    pub fn remember(&self, name: &str, entry: BackendToolCache) {
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.insert(name.to_string(), entry.clone());
+        }
+        self.cache.save_backend(name, &entry);
+    }
+
+    pub fn uptime(&self) -> String {
+        let secs = self.started.elapsed().as_secs();
+        if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+        }
+    }
+}
+
+/// Starts the UI and blocks until the process is stopped.
+pub async fn run(opts: Options) -> Result<()> {
+    let cfg = crate::config::load_config().context("failed to load config")?;
+
+    // The database carries the audit trail and the tool cache. Neither is
+    // required to render the config or to edit it, so a failure here degrades
+    // instead of aborting: an operator whose platform has no ChronDB native
+    // library still gets a working UI.
+    let (pool, db_error) = match crate::db::create_pool(&cfg.audit) {
+        Ok(pool) => (pool, None),
+        Err(e) => {
+            let message = format!("{e:#}");
+            eprintln!("mcp ui: audit database unavailable ({message})");
+            eprintln!("mcp ui: continuing without the audit trail and the on-disk tool cache");
+            (Arc::new(DbPool::disabled()), Some(message))
+        }
+    };
+    let audit = match AuditLogger::open(&cfg.audit, pool.clone()) {
+        Ok(audit) => Arc::new(audit),
+        Err(e) => {
+            tracing::warn!(error = format!("{e:#}"), "audit logger unavailable");
+            Arc::new(AuditLogger::Disabled)
+        }
+    };
+    let cache = ToolCacheStore::new(pool.clone());
+
+    let bound: SocketAddr = opts
+        .addr
+        .parse()
+        .with_context(|| format!("invalid bind address '{}'", opts.addr))?;
+    if !bound.ip().is_loopback() {
+        if !opts.insecure {
+            anyhow::bail!(
+                "refusing to bind to non-loopback address {}: this UI serves plain HTTP.\n\
+                 Use --insecure to acknowledge that, or bind to 127.0.0.1:{} for local-only access.",
+                opts.addr,
+                bound.port()
+            );
+        }
+        eprintln!(
+            "mcp ui: serving plain HTTP on {} — the session token is the only protection",
+            opts.addr
+        );
+    }
+
+    let bootstrap = SessionToken::generate();
+    let state = Arc::new(UiState {
+        addr: opts.addr.clone(),
+        token: SessionToken::generate().as_str().to_string(),
+        read_only: opts.read_only,
+        started: Instant::now(),
+        sessions: Mutex::new(std::collections::HashSet::new()),
+        bootstrap: Mutex::new(Some(Bootstrap {
+            token: bootstrap.as_str().to_string(),
+            expires: Instant::now() + BOOTSTRAP_TTL,
+        })),
+        audit,
+        cache,
+        db_error,
+        reload: None,
+        pending_tokens: Mutex::new(HashMap::new()),
+        memory: Mutex::new(HashMap::new()),
+    });
+
+    let app = local_router(state.clone());
+    let listener = tokio::net::TcpListener::bind(&opts.addr)
+        .await
+        .with_context(|| format!("failed to bind {}", opts.addr))?;
+    let bound = listener
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 7332)));
+
+    let url = format!(
+        "http://{}/?token={}",
+        display_authority(&bound),
+        bootstrap.as_str()
+    );
+    println!("mcp ui listening on http://{bound}");
+    println!("open: {url}");
+    if state.read_only {
+        println!("read-only: mutations are disabled");
+    }
+
+    if opts.open {
+        if let Err(e) = open::that(&url) {
+            eprintln!("could not open the browser: {e}");
+        }
+    }
+
+    axum::serve(listener, app)
+        .await
+        .context("ui server stopped")?;
+    Ok(())
+}
+
+/// Response headers that apply to every page.
+///
+/// `script-src 'self'` is the point: with no inline handlers and no inline
+/// script left in the templates, a stored-XSS payload has nothing to execute.
+/// Styles stay inline (`style="…"` is used for one-off spacing), and htmx is
+/// served from our own origin.
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; form-action 'self'; \
+             base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    response
+}
+
+/// The route table. The local UI layers a session guard on top of it;
+/// `mcp serve --management` layers its own authentication instead.
+pub(crate) fn routes() -> Router<Arc<UiState>> {
+    Router::new()
+        .route("/", get(handlers::overview::index))
+        .route("/overview", get(handlers::overview::index))
+        .route(
+            "/servers",
+            get(handlers::servers::list).post(handlers::servers::add),
+        )
+        .route("/servers/add", post(handlers::servers::add))
+        .route(
+            "/servers/{name}",
+            get(handlers::servers::detail).post(handlers::servers::apply_edit),
+        )
+        .route(
+            "/servers/{name}/edit",
+            get(handlers::servers::edit_form).post(handlers::servers::apply_edit),
+        )
+        .route("/servers/{name}/plan", post(handlers::servers::plan_edit))
+        .route("/servers/{name}/delete", post(handlers::servers::delete))
+        .route(
+            "/servers/{name}/discover",
+            post(handlers::servers::discover),
+        )
+        .route("/playground", get(handlers::playground::index))
+        .route("/playground/call", post(handlers::playground::call))
+        .route("/activity", get(handlers::activity::index))
+        .route("/activity/rows", get(handlers::activity::rows_only))
+        .route("/activity.json", get(handlers::activity::export))
+        .route("/access", get(handlers::access::index))
+        .route("/access/check", post(handlers::access::check))
+        .route("/access/tokens", post(handlers::access::create_token))
+        .route("/access/tokens/{id}", get(handlers::access::token_created))
+        .route(
+            "/access/tokens/{fingerprint}/delete",
+            post(handlers::access::revoke_token),
+        )
+        .route("/access/subjects", post(handlers::access::save_subject))
+        .route(
+            "/access/subjects/{name}/delete",
+            post(handlers::access::delete_subject),
+        )
+        .route("/access/roles", post(handlers::access::duplicate_role))
+        .route(
+            "/access/roles/{name}/delete",
+            post(handlers::access::delete_role),
+        )
+        .route("/settings", get(handlers::settings::index))
+        .route("/instances/reload", post(handlers::settings::reload))
+        .route("/healthz", get(healthz))
+        .route("/assets/app.css", get(css))
+        .route("/assets/htmx.js", get(htmx))
+        .route("/assets/theme.js", get(theme_js))
+        .route("/assets/app.js", get(app_js))
+        .layer(middleware::from_fn(security_headers))
+}
+
+/// What to print for a bind address.
+///
+/// A container binds `0.0.0.0` and is reached through a published port, so
+/// `http://0.0.0.0:7332/` is not a URL anyone can open. Printing `localhost`
+/// is right for the common `-p 127.0.0.1:7332:7332` case and harmless
+/// elsewhere; the bind address still goes to the logs line above.
+pub(crate) fn display_authority(bound: &SocketAddr) -> String {
+    if bound.ip().is_unspecified() {
+        format!("localhost:{}", bound.port())
+    } else {
+        bound.to_string()
+    }
+}
+
+/// The `mcp ui` router: token-in-URL, session cookie, loopback only.
+pub fn local_router(state: Arc<UiState>) -> Router {
+    routes()
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            session::guard,
+        ))
+        .with_state(state)
+}
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+async fn css() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        APP_CSS,
+    )
+}
+
+async fn app_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        APP_JS,
+    )
+}
+
+async fn theme_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        THEME_JS,
+    )
+}
+
+async fn htmx() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        HTMX,
+    )
+}
+
+/// Errors a handler can return, each with the status the browser should see.
+pub enum UiError {
+    BadRequest(String),
+    Forbidden(String),
+    NotFound(String),
+    Conflict(String),
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Debug for UiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UiError::BadRequest(m) => write!(f, "bad request: {m}"),
+            UiError::Forbidden(m) => write!(f, "forbidden: {m}"),
+            UiError::NotFound(m) => write!(f, "not found: {m}"),
+            UiError::Conflict(m) => write!(f, "conflict: {m}"),
+            UiError::Internal(e) => write!(f, "internal error: {e:#}"),
+        }
+    }
+}
+
+impl std::fmt::Display for UiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UiError::BadRequest(m) => write!(f, "{m}"),
+            UiError::Forbidden(m) => write!(f, "{m}"),
+            UiError::NotFound(m) => write!(f, "{m}"),
+            UiError::Conflict(m) => write!(f, "{m}"),
+            UiError::Internal(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl From<anyhow::Error> for UiError {
+    fn from(value: anyhow::Error) -> Self {
+        UiError::Internal(value)
+    }
+}
+
+impl From<render::RenderError> for UiError {
+    fn from(value: render::RenderError) -> Self {
+        UiError::Internal(anyhow::anyhow!("template error: {value}"))
+    }
+}
+
+impl IntoResponse for UiError {
+    fn into_response(self) -> Response {
+        let (status, title, detail) = match self {
+            UiError::BadRequest(m) => (StatusCode::BAD_REQUEST, "Bad request", m),
+            UiError::Forbidden(m) => (StatusCode::FORBIDDEN, "Not allowed", m),
+            UiError::NotFound(m) => (StatusCode::NOT_FOUND, "Not found", m),
+            UiError::Conflict(m) => (StatusCode::CONFLICT, "Conflict", m),
+            UiError::Internal(e) => {
+                // The chain names files and URLs. It goes to the log with an
+                // id the browser can quote; the browser gets the id only.
+                let id = crate::auth::oauth_primitives::generate_random_string(8);
+                tracing::error!(error = format!("{e:#}"), request = %id, "ui request failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Something went wrong",
+                    format!("request {id} — the details are in the server log"),
+                )
+            }
+        };
+        let body = format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <title>{title} · mcp</title><link rel=\"stylesheet\" href=\"/assets/app.css\"></head>\
+             <body><div class=\"view\" style=\"max-width:720px\">\
+             <h1>{title}</h1><p class=\"sub\">{detail}</p>\
+             <p style=\"margin-top:20px\"><a class=\"btn\" href=\"/overview\">Back to overview</a></p>\
+             </div></body></html>",
+            title = title,
+            detail = render::escape(&detail),
+        );
+        (status, Html(body)).into_response()
+    }
+}
+
+pub type UiResult<T> = std::result::Result<T, UiError>;
+
+/// `serde_json::Map::insert` wants an owned key; every call site here has a
+/// literal. This keeps the handlers readable.
+pub trait MapExt {
+    fn put(&mut self, key: &str, value: serde_json::Value);
+}
+
+impl MapExt for serde_json::Map<String, serde_json::Value> {
+    fn put(&mut self, key: &str, value: serde_json::Value) {
+        self.insert(key.to_string(), value);
+    }
+}
+
+/// One-shot message carried in the query string after a redirect.
+#[derive(Debug, Default, Clone)]
+pub struct Flash {
+    pub ok: Option<String>,
+    pub err: Option<String>,
+}
+
+impl Flash {
+    pub fn from_query(query: &std::collections::HashMap<String, String>) -> Self {
+        Self {
+            ok: query.get("ok").cloned().filter(|s| !s.is_empty()),
+            err: query.get("err").cloned().filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+/// 303 to `location`, carrying a one-shot message in the query string.
+pub fn redirect_with(location: &str, key: &str, message: &str) -> Redirect {
+    let sep = if location.contains('?') { '&' } else { '?' };
+    let encoded = urlencode(message);
+    Redirect::to(&format!("{location}{sep}{key}={encoded}"))
+}
+
+pub fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+pub fn urldecode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// A small HTML body for script-less clients that hit an authenticated route
+/// without a session.
+pub fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+        "mcp ui: missing or invalid session token. Open the URL printed by `mcp ui`.\n",
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Tool;
+
+    fn state_without_database() -> UiState {
+        UiState {
+            addr: "127.0.0.1:7332".to_string(),
+            token: "test-token".to_string(),
+            read_only: false,
+            started: Instant::now(),
+            audit: Arc::new(AuditLogger::Disabled),
+            cache: ToolCacheStore::new(Arc::new(DbPool::disabled())),
+            db_error: Some("no native library".to_string()),
+            reload: None,
+            sessions: Mutex::new(std::collections::HashSet::new()),
+            bootstrap: Mutex::new(None),
+            pending_tokens: Mutex::new(HashMap::new()),
+            memory: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn the_bootstrap_token_is_spent_once_and_expires() {
+        let mut state = state_without_database();
+        state.bootstrap = Mutex::new(Some(Bootstrap {
+            token: "bootstrap-token".to_string(),
+            expires: Instant::now() + std::time::Duration::from_secs(60),
+        }));
+        assert!(!session::spend_bootstrap(&state, "wrong"));
+        assert!(
+            session::spend_bootstrap(&state, "bootstrap-token"),
+            "the right token must still work after a wrong one"
+        );
+        assert!(
+            !session::spend_bootstrap(&state, "bootstrap-token"),
+            "and only once"
+        );
+
+        state.bootstrap = Mutex::new(Some(Bootstrap {
+            token: "expired".to_string(),
+            expires: Instant::now() - std::time::Duration::from_secs(1),
+        }));
+        assert!(!session::spend_bootstrap(&state, "expired"));
+        assert!(
+            state.bootstrap.lock().unwrap().is_none(),
+            "expired is dropped"
+        );
+    }
+
+    #[test]
+    fn a_pending_token_is_shown_once_and_expires() {
+        let state = state_without_database();
+        let id = state.stash_token("alice", &["admin".to_string()], "tok");
+        assert_eq!(state.take_token(&id).unwrap().token, "tok");
+        assert!(state.take_token(&id).is_none(), "shown once");
+    }
+
+    #[test]
+    fn discovery_survives_without_the_database() {
+        let state = state_without_database();
+        assert!(state.cached("sentry").is_none());
+
+        state.remember(
+            "sentry",
+            BackendToolCache {
+                config_hash: "abc".to_string(),
+                tools: vec![Tool {
+                    name: "search_issues".to_string(),
+                    description: None,
+                    input_schema: None,
+                    annotations: None,
+                }],
+                cached_at: "now".to_string(),
+            },
+        );
+
+        let cached = state
+            .cached("sentry")
+            .expect("session cache holds the tools");
+        assert_eq!(cached.tools.len(), 1);
+        assert_eq!(cached.tools[0].name, "search_issues");
+    }
+
+    #[test]
+    fn uptime_is_human_readable() {
+        let state = state_without_database();
+        assert_eq!(state.uptime(), "0s");
+    }
+}

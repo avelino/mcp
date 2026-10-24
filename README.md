@@ -133,6 +133,7 @@ Tokens are saved in `~/.config/mcp/auth.json` and refreshed automatically.
 | `mcp add --url <url> <name>` | Add an HTTP server |
 | `mcp remove <name>` | Remove a server |
 | `mcp update <name>` | Refresh a server's config from the registry (preserves your customizations) |
+| `mcp ui` | Open a local web UI — servers, tools, audit, ACL |
 | `mcp serve` | Start proxy — all servers as one MCP endpoint |
 | `mcp reload` | Apply config changes to running proxies without restarting them |
 | `mcp logs` | Show audit log entries |
@@ -177,6 +178,8 @@ Available tags:
 | `full` | Same binary plus `npx`, `uvx`, `docker`, `kubectl`, `gh` (~390 MB) |
 | `x.y.z` / `x.y.z-full` | Pinned version |
 | `beta` / `beta-full` | Latest build from main branch |
+
+Building from a checkout: `docker build .` produces the small image, `docker build --target full-source .` the one with `npx`/`uvx`. See [building the image yourself](docs/howto/docker.md#building-the-image-yourself).
 
 You can also run the proxy as a container instead of a background service. Your MCP client starts and stops it:
 
@@ -274,6 +277,42 @@ The `mcp` proxy fixes this with **persistent tool cache**, **lazy initialization
 ```
 
 Read the full story: **[MCP servers are draining your hardware](https://mcp.avelino.run/mcp-servers-are-draining-your-hardware)**
+
+## Web UI
+
+`mcp ui` serves a local web UI from the same binary — no Node, no build step, no extra service.
+
+```bash
+mcp ui            # http://127.0.0.1:7332, opens your browser
+mcp ui --read-only
+mcp ui --addr 127.0.0.1:9000 --no-open
+```
+
+It shows what the CLI already knows: configured servers and their cached tools, the audit trail with ACL verdicts, the ACL (with a simulator that runs the same evaluator as the proxy), and the `mcp serve` instances running on this machine.
+
+Editing is a diff, not a save. Changing a field renders the patch against the bytes on disk, validates it, and only then writes — atomically, with a backup, and without touching comments or `${VAR}` placeholders. Existing files stay yours:
+
+```jsonc
+{
+  "mcpServers": {
+    "sentry": {
+      "url": "https://mcp.sentry.dev/sse",
+      "headers": { "Authorization": "Bearer ${SENTRY_TOKEN}" }, // not expanded, not rewritten
+      "idle_timeout": "adaptive"
+    }
+  }
+}
+```
+
+The UI binds to loopback, prints a one-time token in the URL, and exchanges it for a `SameSite=Strict` cookie; writes additionally check `Origin`/`Fetch-Site`. Secrets are redacted before rendering — a config value that is not a `${VAR}` reference never reaches the page. See the [Web UI guide](docs/guides/web-ui.md).
+
+Teams get the same UI from the proxy, behind the auth they already have:
+
+```bash
+mcp serve --http 0.0.0.0:7332 --insecure --management
+```
+
+Readers see the catalog their ACL grants and their own audit entries; roles in `serverAuth.adminRoles` can edit servers, mint and revoke tokens, assign roles to subjects, reload and see the whole policy.
 
 ## Audit logging
 

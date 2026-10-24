@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="row" style="gap:10px">
+      <h1>{{ server.name }}</h1>
+      <span class="chip">{{ server.kind }}</span>
+      {% if not server.has_cache %}<span class="chip">no cache</span>{% elif server.stale %}<span class="chip warn">cache stale</span>{% else %}<span class="chip ok">cache ok</span>{% endif %}
+      {% if not (server.available | default(true)) %}<span class="chip err" title="{{ server.unavailable_reason }}">unavailable here</span>{% endif %}
+    </div>
+    <p class="sub mono" style="font-size:11.5px">{{ server.endpoint }}</p>
+  </div>
+  <div class="actions">
+    <form class="inline" method="post" action="/servers/{{ server.name | urlencode }}/discover">
+      <input type="hidden" name="csrf" value="{{ token }}">
+      <button class="btn" {% if read_only or not (server.available | default(true)) %}disabled{% endif %}
+              {% if not server.available %}title="{{ server.unavailable_reason }}"{% endif %}>Connect now</button>
+    </form>
+    {% if not read_only %}
+    <a class="btn primary" href="/servers/{{ server.name | urlencode }}/edit">Edit</a>
+    {% endif %}
+  </div>
+</div>
+
+{% if not (server.available | default(true)) %}
+<div class="banner">
+  <div>
+    <div class="t">This backend cannot start here</div>
+    <div class="d">{{ server.unavailable_reason }}</div>
+    <div class="tiny muted" style="margin-top:4px">
+      The command is not on this process's PATH. In Docker this usually means the scratch image:
+      rebuild with <code class="mono">--target full-source</code> (adds npx, uvx, docker, kubectl, gh),
+      or declare the backend as HTTP.
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<div class="grid g3" style="margin-bottom:14px">
+  <div class="card stat">
+    <div class="k">Tools</div>
+    <div class="v">{{ tools | length }}</div>
+    <div class="d">{{ read_count }} read · {{ write_count }} write · {{ ambiguous_count }} ambiguous</div>
+  </div>
+  <div class="card stat">
+    <div class="k">Idle policy</div>
+    <div class="v" style="font-size:15px;font-family:var(--mono);margin-top:10px">{{ server.idle }}</div>
+    <div class="d">reaper ticks every 30s</div>
+  </div>
+  <div class="card stat">
+    <div class="k">Cache</div>
+    <div class="v" style="font-size:15px;font-family:var(--mono);margin-top:10px">{{ cached_at }}</div>
+    <div class="d">invalidated when the config hash changes</div>
+  </div>
+</div>
+
+<div class="tabs">
+  <a class="on" href="#tools">Catalog</a>
+  <a href="#config">Config</a>
+</div>
+
+<div class="card" id="tools" style="margin-bottom:14px">
+  <div class="card-h"><h2>Catalog</h2><span class="spacer"></span><a class="btn sm ghost" href="/playground?server={{ server.name | urlencode }}">Playground →</a></div>
+  <div class="card-b flush scroll-x">
+    {% if tools | length == 0 %}
+    <div class="empty">
+      Nothing cached yet.<br>
+      <span class="tiny">Use <b>Connect now</b> to run discovery against this backend.</span>
+    </div>
+    {% else %}
+    <table>
+      <thead><tr><th>Tool</th><th>Classification</th><th>Source</th><th>Description</th></tr></thead>
+      <tbody>
+        {% for t in tools %}
+        <tr>
+          <td class="mono" style="font-weight:600">{{ t.name }}</td>
+          <td>
+            <span class="chip {% if t.kind == 'read' %}read{% elif t.kind == 'write' %}warn{% endif %}">{{ t.kind }}</span>
+            <span class="tiny muted mono">{{ t.confidence }}</span>
+          </td>
+          <td class="tiny muted mono">{{ t.source }}</td>
+          <td class="tiny muted">{{ t.description }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" id="config">
+  <div class="card-h">
+    <h2>Config as written</h2>
+    <span class="spacer"></span>
+    <span class="chip">secrets redacted</span>
+  </div>
+  <div class="card-b">
+    <pre class="code">{{ config_json }}</pre>
+    <div class="note" style="margin-top:10px">
+      <code class="mono">${VAR}</code> placeholders are shown literally — expansion happens at load time, never here.
+    </div>
+  </div>
+</div>
+{% endblock %}

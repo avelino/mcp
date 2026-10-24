@@ -91,13 +91,17 @@ pub fn save(state: &AsState) -> Result<()> {
 
     let path = state_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::secure_file::create_private_dir(parent)?;
     }
     let mut tmp = path.clone();
     tmp.set_extension("json.tmp");
     let content = serde_json::to_string_pretty(&snap)?;
-    std::fs::write(&tmp, content).context("writing auth_server.json.tmp")?;
+    crate::secure_file::write_private(&tmp, content.as_bytes())
+        .context("writing auth_server.json.tmp")?;
     std::fs::rename(&tmp, &path).context("renaming auth_server.json.tmp into place")?;
+    // The rename carries the tmp file's 0600; this only matters if an older
+    // build left the target with wider permissions and the rename failed.
+    crate::secure_file::harden(&path)?;
     Ok(())
 }
 

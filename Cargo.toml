@@ -44,6 +44,8 @@ socket2 = { version = "0.6", features = ["all"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+jsonc-parser = { version = "0.34", features = ["cst", "serde_json"] }
+minijinja = { version = "3", default-features = false, features = ["builtins", "multi_template", "macros", "std_collections", "json", "serde"] }
 
 # Unix-only: flock(2) for the instance registry's liveness proof and kill(2)
 # for the SIGHUP that `mcp reload` sends. Both are gated behind cfg(unix).
