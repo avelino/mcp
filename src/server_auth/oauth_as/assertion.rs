@@ -543,7 +543,49 @@ mod tests {
         let err = validate(&token, CLIENT_ID, &cfg, &jwks(), &AsState::default())
             .await
             .unwrap_err();
-        assert!(err.contains("ambiguous"), "unexpected error: {err}");
+        assert_eq!(
+            err,
+            "assertion issuer requires a tenant the assertion does not name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assertion_without_aud_tenant_does_not_inherit_a_tenants_roles() {
+        // The privilege half of the tenant finding, end to end on the
+        // signed path. One entry, tenanted, carrying the roles and the
+        // domains of that workspace. An assertion that names no tenant
+        // used to resolve to it and walk out with `tenant-a-admin` and
+        // `tenant-a.example` — a workspace's privileges handed to an
+        // assertion that identified no workspace.
+        //
+        // Signed by the issuer's real key, with every other check
+        // passing, so the refusal can only come from the resolution.
+        let fake = start_fake_issuer(None, vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")]).await;
+        let cfg = config(vec![TrustedIssuer {
+            issuer: fake.base.clone(),
+            tenant_id: Some("tenant-a".to_string()),
+            allowed_email_domains: vec!["tenant-a.example".to_string()],
+            roles: vec!["tenant-a-admin".to_string()],
+        }]);
+        let mut payload = claims(&fake.base);
+        payload["email"] = json!("alice@tenant-a.example");
+        let token = sign(TEST_EC_PKCS8_B64, ID_JAG_TYP, "k1", &payload);
+
+        let err = validate(&token, CLIENT_ID, &cfg, &jwks(), &AsState::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "assertion issuer requires a tenant the assertion does not name"
+        );
+
+        // Naming the tenant is what earns the roles, and still does.
+        payload["aud_tenant"] = json!("tenant-a");
+        let token = sign(TEST_EC_PKCS8_B64, ID_JAG_TYP, "k1", &payload);
+        let out = validate(&token, CLIENT_ID, &cfg, &jwks(), &AsState::default())
+            .await
+            .unwrap();
+        assert_eq!(out.roles, vec!["tenant-a-admin".to_string()]);
     }
 
     #[tokio::test]

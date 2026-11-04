@@ -169,6 +169,29 @@ pub(super) async fn start_fake_issuer_with_discovery(
     start_fake_issuer_inner(discovery, jwks_body, false).await
 }
 
+/// Same key set, named through a path that answers with a redirect to it
+/// rather than serving it.
+///
+/// Both hops are plain HTTP on loopback, which is the shape that matters:
+/// a client willing to follow a hop that is not `https` is a client an
+/// on-path attacker can walk off TLS, and the keys at the end of that walk
+/// are the ones every assertion is verified against.
+pub(super) async fn start_fake_issuer_redirecting_to_jwks(
+    keys: Vec<serde_json::Value>,
+) -> FakeIssuer {
+    start_fake_issuer_with_discovery(
+        |base| {
+            serde_json::json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks-redirect"),
+            })
+            .to_string()
+        },
+        serde_json::json!({ "keys": keys }).to_string(),
+    )
+    .await
+}
+
 /// Serves the key set in pieces with **no `Content-Length`**, which is how
 /// a `Transfer-Encoding: chunked` response arrives.
 ///
@@ -251,9 +274,18 @@ async fn start_fake_issuer_inner(
         jwks_hits: jwks_hits.clone(),
     };
 
+    /// Moves the URL and nothing else. The `Location` is relative, so it
+    /// resolves against whatever origin served it — here, plain HTTP.
+    /// `jwks_hits` stays on `/jwks`, so it counts the hop being followed,
+    /// not the hop being offered.
+    async fn redirect_handler() -> impl IntoResponse {
+        axum::response::Redirect::temporary("/jwks")
+    }
+
     let app = Router::new()
         .route("/.well-known/openid-configuration", get(discovery_handler))
         .route("/jwks", get(jwks_handler))
+        .route("/jwks-redirect", get(redirect_handler))
         .with_state(state);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

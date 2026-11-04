@@ -216,7 +216,11 @@ mod tests {
                 created_at_unix: 0,
             })
             .unwrap();
-        Arc::new(AppCtx { config, state })
+        Arc::new(AppCtx {
+            config,
+            state,
+            jwks: Arc::new(super::super::jwks::JwksCache::new(reqwest::Client::new())),
+        })
     }
 
     fn good_query() -> AuthorizeQuery {
