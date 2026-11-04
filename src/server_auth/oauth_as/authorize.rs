@@ -203,6 +203,8 @@ mod tests {
             scopes_supported: vec!["mcp".to_string()],
             redirect_uri_allowlist: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
             injected_roles: vec!["oauth-user".to_string()],
+            trusted_issuers: vec![],
+            static_clients: vec![],
         });
         let state = Arc::new(super::super::AsState::default());
         state

@@ -5,6 +5,12 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+concurrency:
+  group: publish-crate-${{ github.ref }}
+  # Nunca cancela: `cargo publish` na crates.io e irreversivel, nao existe
+  # unpublish. O group so impede run paralela do mesmo tag.
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

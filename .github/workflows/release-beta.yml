@@ -16,6 +16,13 @@ permissions:
 
 jobs:
   build:
+    # Um push novo em main dispara outra CI e outro workflow_run, o que torna
+    # este beta obsoleto antes de terminar. Mata a build velha na hora. No job
+    # e nao no workflow porque cancel-in-progress no workflow cancelaria a run
+    # inteira, inclusive um `publish` entre o delete e o create do release.
+    concurrency:
+      group: release-beta-build-${{ github.ref }}
+      cancel-in-progress: true
     # Same-repo push to main whose CI succeeded. A fork fails the repository
     # check even when its branch is named main; a pull_request fails the
     # event check. Evaluated before the matrix, so a rejected run checks
@@ -106,6 +113,12 @@ jobs:
 
   publish:
     needs: build
+    # Serializa e NUNCA cancela: este job apaga o prerelease anterior com
+    # `gh release delete --cleanup-tag` e so depois cria o novo. Cancelar
+    # entre os dois nao deixa beta nenhum publicado.
+    concurrency:
+      group: release-beta-publish
+      cancel-in-progress: false
     # A job-level `if` replaces the implicit success() check. Keep the build
     # result in the condition so a skipped or failed matrix does not publish,
     # and repeat the trust check on the job that holds contents: write.
@@ -171,6 +184,11 @@ jobs:
 
   docker:
     needs: build
+    # Serializa e NUNCA cancela: push pra GHCR interrompido deixa tag
+    # apontando pra manifest incompleto.
+    concurrency:
+      group: release-beta-docker
+      cancel-in-progress: false
     # Same replacement of success() as publish. This job is the one that
     # pushes to GHCR, so it carries the same trust check on its own.
     if: >-

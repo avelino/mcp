@@ -6,9 +6,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, Sse};
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use tokio_stream::wrappers::ReceiverStream;
@@ -19,15 +19,15 @@ use crate::config::Config;
 use crate::instances::{self, InstanceFilter};
 use crate::protocol::{error_codes, JsonRpcRequest, JsonRpcResponse};
 use crate::server_auth::oauth_as::{self, AsState};
-use crate::server_auth::{
-    self, AuthIdentity, AuthProvider, Credentials, ReloadGate, ServerAuthConfig,
-};
+use crate::server_auth::{self, AuthIdentity, Credentials, ReloadGate, ServerAuthConfig};
 use crate::telemetry::extract_parent_context;
 
 use super::discovery::discover_pending_backends;
 use super::dispatch::dispatch_request;
 use super::proxy::{shutdown_clients_in_parallel, BackendState, ProxyServer, SharedProxy};
-use super::reload::{reload_in_place, AuthSnapshot, BootInvariants, ReloadContext, SharedAuth};
+use super::reload::{
+    reload_in_place, www_authenticate_for, AuthSnapshot, BootInvariants, ReloadContext, SharedAuth,
+};
 
 type SseSender = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
 type SessionMap = Arc<Mutex<HashMap<String, SseSender>>>;
@@ -58,17 +58,17 @@ fn extract_credentials(headers: &HeaderMap) -> Credentials {
 /// Authenticate an HTTP request. Returns identity on success, or a 401 response.
 /// Logs authentication failures to the audit log.
 ///
-/// The provider is passed in rather than read from `state`: the caller already
-/// holds a snapshot, and taking a second read would reintroduce exactly the
+/// The snapshot is passed in rather than read from `state`: the caller already
+/// holds one, and taking a second read would reintroduce exactly the
 /// split the single-write swap removes.
 async fn authenticate_request(
     state: &AppState,
-    provider: &Arc<dyn AuthProvider>,
+    auth: &AuthSnapshot,
     headers: &HeaderMap,
     source: &str,
-) -> Result<AuthIdentity, (StatusCode, Json<Value>)> {
+) -> Result<AuthIdentity, Box<Response>> {
     let creds = extract_credentials(headers);
-    match provider.authenticate(&creds).await {
+    match auth.provider.authenticate(&creds).await {
         Ok(identity) => Ok(identity),
         Err(e) => {
             // Log auth failure using async lock (safe in async context).
@@ -96,7 +96,14 @@ async fn authenticate_request(
                 error_codes::PROXY_ERROR,
                 &format!("authentication failed: {e}"),
             );
-            Err((StatusCode::UNAUTHORIZED, Json(json!(err))))
+            let mut resp = (StatusCode::UNAUTHORIZED, Json(json!(err))).into_response();
+            // An unrepresentable challenge is dropped rather than turning the
+            // 401 into a 500: the status alone still tells the client to authenticate.
+            if let Ok(challenge) = HeaderValue::from_str(&auth.www_authenticate) {
+                resp.headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, challenge);
+            }
+            Err(Box::new(resp))
         }
     }
 }
@@ -345,11 +352,24 @@ pub async fn run_http(
     };
 
     let auth_provider = server_auth::build_auth_provider(&config.server_auth, as_state.as_ref())?;
+    // After the build, so boot applies the clients in the same place a reload
+    // does: once the whole auth block has been accepted. See
+    // `configured_static_clients`.
+    if let Some(state) = as_state.as_ref() {
+        state.set_static_clients(server_auth::configured_static_clients(
+            &config.server_auth,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ));
+    }
     let shared_auth = AuthSnapshot::new(
         auth_provider,
         config.server_auth.acl.clone(),
         config.server_auth.admin_roles.clone(),
     )
+    .with_www_authenticate(www_authenticate_for(&config.server_auth))
     .shared();
 
     // Captured here because `audit.output` is rewritten a few lines down with
@@ -357,6 +377,11 @@ pub async fn run_http(
     // wrote, so the raw one is what has to be remembered.
     let boot = Arc::new(BootInvariants {
         oauth_as_enabled: as_enabled,
+        oauth_as_issuer_url: config
+            .server_auth
+            .oauth_as
+            .as_ref()
+            .map(|oauth| oauth.issuer_url.clone()),
         audit_output: config.audit.output.clone(),
         bind_addr: Some(bind_addr.to_string()),
     });
@@ -447,7 +472,37 @@ pub async fn run_http(
             loop {
                 interval.tick().await;
                 let removed = gc_state.gc_expired();
-                if removed > 0 {
+                // Both numbers, because the two questions an operator
+                // brings here are "why is this file being rewritten" and
+                // "why is the replay cache growing".
+                tracing::debug!(
+                    persisted = removed.persisted,
+                    in_memory = removed.in_memory,
+                    "OAuth AS garbage collection pass"
+                );
+                // `debug!` sits below the default filter, so the line above
+                // is invisible in production — which is where the cache
+                // fills. This one is not: past a quarter of the cap the
+                // pass says so at a level an operator sees.
+                //
+                // It is sampled once a minute, so whether it lands ahead of
+                // the refusals is a question about the ramp. A rise that
+                // leaves any pass observing the band between a quarter of
+                // the cap and the cap warns first; a flood that crosses
+                // the whole band between two passes has its first warning
+                // arrive alongside the refusals instead.
+                if removed.seen_jti > oauth_as::MAX_SEEN_JTI / 4 {
+                    tracing::warn!(
+                        seen_jti = removed.seen_jti,
+                        cap = oauth_as::MAX_SEEN_JTI,
+                        "OAuth AS assertion replay cache is filling; \
+                         exchanges are refused at the cap"
+                    );
+                }
+                // Only a persisted removal makes the file on disk stale.
+                // The in-memory sweep (codes, seen `jti`) changes nothing
+                // that was ever written.
+                if removed.persisted > 0 {
                     if let Err(e) = oauth_as::save_state(&gc_state) {
                         tracing::warn!(
                             error = format!("{e:#}"),
@@ -719,10 +774,7 @@ async fn audit_reload(
 }
 
 // POST /reload — re-read the config from disk and apply it in place.
-async fn reload_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> (StatusCode, Json<Value>) {
+async fn reload_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let auth = AuthSnapshot::read(&state.auth);
     // `is_reload_allowed` reads nothing but `adminRoles`, and the snapshot
     // carries exactly that. The rest of the `serverAuth` block lives inside
@@ -738,16 +790,25 @@ async fn reload_handler(
     if server_auth::is_reload_allowed(&AuthIdentity::anonymous(), &gate_config)
         == ReloadGate::Disabled
     {
-        return reload_not_found();
+        return reload_not_found().into_response();
     }
 
-    let identity = match authenticate_request(&state, &auth.provider, &headers, "serve:http").await
-    {
+    let identity = match authenticate_request(&state, &auth, &headers, "serve:http").await {
         Ok(id) => id,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
-    match server_auth::is_reload_allowed(&identity, &gate_config) {
+    reload_authenticated(state, identity, &gate_config)
+        .await
+        .into_response()
+}
+
+async fn reload_authenticated(
+    state: AppState,
+    identity: AuthIdentity,
+    gate_config: &ServerAuthConfig,
+) -> (StatusCode, Json<Value>) {
+    match server_auth::is_reload_allowed(&identity, gate_config) {
         ReloadGate::Allowed => {}
         // `Disabled` was already answered above, before credentials.
         ReloadGate::Denied | ReloadGate::Disabled => {
@@ -812,7 +873,7 @@ async fn mcp_handler(
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> impl IntoResponse {
+) -> Response {
     // Validate content type
     let content_type = headers
         .get("content-type")
@@ -824,18 +885,30 @@ async fn mcp_handler(
             error_codes::PARSE_ERROR,
             "content-type must be application/json",
         );
-        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!(err)));
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, Json(json!(err))).into_response();
     }
 
     // Authenticate. One snapshot serves this whole request: the ACL below
     // belongs to the same config as the provider that produced the identity.
     let auth = AuthSnapshot::read(&state.auth);
-    let identity = match authenticate_request(&state, &auth.provider, &headers, "serve:http").await
-    {
+    let identity = match authenticate_request(&state, &auth, &headers, "serve:http").await {
         Ok(id) => id,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
+    mcp_authenticated(state, query, headers, body, auth, identity)
+        .await
+        .into_response()
+}
+
+async fn mcp_authenticated(
+    state: AppState,
+    query: HashMap<String, String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    auth: AuthSnapshot,
+    identity: AuthIdentity,
+) -> (StatusCode, Json<Value>) {
     // Parse JSON-RPC message (request or notification)
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -952,9 +1025,9 @@ async fn mcp_handler(
 // and receives JSON-RPC responses as SSE `message` events.
 async fn mcp_sse_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // Authenticate
-    let provider = AuthSnapshot::read(&state.auth).provider;
-    if let Err(resp) = authenticate_request(&state, &provider, &headers, "serve:http").await {
-        return resp.into_response();
+    let auth = AuthSnapshot::read(&state.auth);
+    if let Err(resp) = authenticate_request(&state, &auth, &headers, "serve:http").await {
+        return *resp;
     }
 
     // Formally deprecated by 2026-07-28 with a 12-month offramp. Clients on

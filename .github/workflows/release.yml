@@ -4,6 +4,13 @@ on:
   push:
     tags: ['v*']
 
+concurrency:
+  group: release-${{ github.ref }}
+  # Nunca cancela: cria o GitHub release, sobe os binarios e faz push pra
+  # GHCR. Interromper no meio deixa release sem asset ou tag apontando pra
+  # manifest incompleto. O group so impede run paralela do mesmo tag.
+  cancel-in-progress: false
+
 permissions:
   contents: write
   packages: write

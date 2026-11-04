@@ -417,7 +417,15 @@ Required when `"oauth_as"` is in `providers`. Turns `mcp serve` into an OAuth 2.
       "https://claude.ai/api/mcp/auth_callback",
       "https://chat.openai.com/aip/*/oauth/callback"
     ],
-    "injectedRoles": ["oauth-user"]
+    "injectedRoles": ["oauth-user"],
+    "trustedIssuers": [
+      {
+        "issuer": "https://identity.anthropic.com/issuers/abc123",
+        "allowedEmailDomains": ["example.com"],
+        "roles": ["business"]
+      }
+    ],
+    "staticClients": [{ "clientId": "mcp-claude-connector" }]
   }
 }
 ```
@@ -435,8 +443,27 @@ Required when `"oauth_as"` is in `providers`. Turns `mcp serve` into an OAuth 2.
 | `scopesSupported` | string[] | no | `[]` | Scopes advertised in metadata. |
 | `redirectUriAllowlist` | string[] | yes | — | Patterns clients may register. Trailing `*` allowed (for ChatGPT-style URIs). |
 | `injectedRoles` | string[] | no | `[]` | Roles always added to issued JWTs — useful as a "came in via OAuth" marker for ACL discrimination. |
+| `trustedIssuers` | object[] | no | `[]` | Identity providers whose signed ID-JAG assertions are exchanged for an access token with no consent screen, on the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant. Empty leaves the grant off. Changing it needs a restart, not a reload. |
+| `staticClients` | object[] | no | `[]` | Clients that exist without Dynamic Client Registration. Needed for the grant above, where the identity provider fixes the `client_id`. Applied by a reload. |
 
-State (registered clients via DCR + refresh tokens) persists to `auth_server.json` in the config directory; override with `MCP_AUTH_SERVER_PATH` or inline via `MCP_AUTH_SERVER_CONFIG`. See the [OAuth AS how-to](../howto/oauth-as.md) for setup, security notes, and troubleshooting.
+Each entry of `trustedIssuers`:
+
+| Field | Type | Required | Default | Description |
+|-------|------|---------|---------|-------------|
+| `issuer` | string | yes | — | Compared byte for byte against the assertion's `iss`. Must be `https://`. A prefix or host match would admit another customer's users. |
+| `tenantId` | string | no | — | Matched against the assertion's `aud_tenant` to pick between entries sharing an `issuer`. Omit it and the entry vouches for every workspace behind that issuer. `""` is rejected at boot — an env var that expanded to nothing is not the same decision as omitting the key. |
+| `allowedEmailDomains` | string[] | yes | — | Domains this issuer may vouch for. **Boot fails on an empty list**, because identity here is the `email` claim and nothing else, so without the list every account the issuer cares to sign for is admitted. Compared whole against the part after the last `@`, case-insensitively, never as a suffix. |
+| `roles` | string[] | no | `[]` | Roles granted to users arriving through this issuer. Read from here, never from the assertion: a group claim minted by someone else's identity provider would make their configuration an escalation path into yours. |
+
+Each entry of `staticClients`:
+
+| Field | Type | Required | Default | Description |
+|-------|------|---------|---------|-------------|
+| `clientId` | string | yes | — | The `client_id` the identity provider stamps into every assertion. Must be byte-identical to the value configured on the connector; it is not issued by Claude, you choose it. Listing the same id twice fails boot, and a DCR registration with the same id takes precedence. |
+
+Two entries that share an `issuer` need a distinct `tenantId` on each. A pair that cannot be told apart fails boot rather than resolving to whichever was listed first.
+
+State (registered clients via DCR + refresh tokens) persists to `auth_server.json` in the config directory; override with `MCP_AUTH_SERVER_PATH` or inline via `MCP_AUTH_SERVER_CONFIG`. See the [OAuth AS how-to](../howto/oauth-as.md) for setup, security notes, and troubleshooting, and [Enterprise Managed Authorization](../howto/oauth-as.md#enterprise-managed-authorization-id-jag) for what the two blocks above do, which refusal means what, and the deploy preconditions the replay cache imposes.
 
 ### Admin roles (`adminRoles`)
 

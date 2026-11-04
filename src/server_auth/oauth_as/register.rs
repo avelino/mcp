@@ -204,6 +204,8 @@ mod tests {
                 scopes_supported: vec![],
                 redirect_uri_allowlist: allowlist,
                 injected_roles: vec![],
+                trusted_issuers: vec![],
+                static_clients: vec![],
             }),
             state: Arc::new(AsState::default()),
         })

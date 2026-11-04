@@ -1,0 +1,621 @@
+//! Public signing keys of the identity providers whose assertions this
+//! AS exchanges for access tokens.
+//!
+//! Keys are only ever taken from the issuer's own OpenID discovery
+//! document and the `jwks_uri` it names. The `jwk`, `jku` and `x5u`
+//! headers an assertion may carry are deliberately never read: a token
+//! that brings its own key is a token that verifies itself.
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, KeyAlgorithm};
+use jsonwebtoken::{get_current_timestamp, Algorithm, DecodingKey};
+use serde::Deserialize;
+
+/// A slow issuer must not hold a `/token` request open: every exchange
+/// that misses the cache waits on these two fetches.
+///
+/// 2s, not 5, because of what is waiting on the other side: Claude's
+/// connector documentation gives the discovery, registration and token
+/// endpoints 10 seconds each before it reports a connection failure, and a
+/// cold-cache exchange spends *both* of these fetches inside one `/token`.
+/// At 5s the two alone are the whole budget, before the TLS handshakes,
+/// the signature verification and the handler itself — so a cold cache or
+/// a merely slow issuer becomes a failure Claude reports and this side
+/// never logs.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Compile-time guard on the number above: the two sequential fetches have
+/// to leave room inside Claude's 10s for everything else `/token` does.
+const _: () = assert!(FETCH_TIMEOUT.as_secs() * 2 < 10);
+
+/// Floor on the cached lifetime, so an issuer advertising `max-age=0`
+/// cannot turn every token exchange into two round-trips.
+const MIN_KEY_TTL_SECONDS: u64 = 60;
+
+/// Ceiling on the cached lifetime: it bounds how long a key stays usable
+/// here after the issuer retires it.
+const MAX_KEY_TTL_SECONDS: u64 = 3600;
+
+/// Used when the key set ships no `Cache-Control: max-age`.
+const DEFAULT_KEY_TTL_SECONDS: u64 = 300;
+
+/// Ceiling on the entries one key set may hold, so a (compromised) issuer
+/// cannot grow this cache without limit. A set above it is refused whole
+/// rather than truncated — see `refresh`.
+const MAX_KEYS_PER_SET: usize = 50;
+
+/// Ceiling on a discovery or key-set body, enforced while it is still
+/// being read. Without it the only bound is `FETCH_TIMEOUT` seconds of
+/// the issuer's bandwidth, per exchange in flight, and the body is held
+/// whole in memory before anything looks at it. A key set of
+/// [`MAX_KEYS_PER_SET`] RSA keys is a few tens of KiB, so a real document
+/// is nowhere near this.
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// The subset of OpenID Discovery this AS reads. `authorization_endpoint`
+/// and `token_endpoint` are absent on purpose — Claude's discovery
+/// document does not carry them, and nothing here needs them.
+#[derive(Deserialize)]
+struct OpenIdDiscovery {
+    issuer: String,
+    jwks_uri: String,
+}
+
+/// A key set read one entry at a time. `jsonwebtoken::jwk::JwkSet` is
+/// all-or-nothing, and its types model a fixed set of curves and field
+/// shapes, so a single entry it cannot represent would otherwise drop
+/// every key alongside it.
+#[derive(Deserialize)]
+struct RawJwkSet {
+    #[serde(default)]
+    keys: Vec<serde_json::Value>,
+}
+
+struct CachedKey {
+    key: DecodingKey,
+    alg: Algorithm,
+    expires_at_unix: u64,
+}
+
+/// Verification keys per `(issuer, kid)`, fetched on demand.
+pub struct JwksCache {
+    http: reqwest::Client,
+    keys: RwLock<HashMap<(String, String), CachedKey>>,
+    /// When each issuer's key set was last read successfully. Bounded by the
+    /// configured `trustedIssuers`, because that is where the issuer string
+    /// comes from — never off an assertion's own claims.
+    last_refresh: RwLock<HashMap<String, u64>>,
+}
+
+impl JwksCache {
+    pub fn new(http: reqwest::Client) -> Self {
+        Self {
+            http,
+            keys: RwLock::new(HashMap::new()),
+            last_refresh: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// The key `issuer` published under `kid`, with the algorithm its own
+    /// JWKS entry declares.
+    ///
+    /// A `kid` that is not cached earns a refetch — key sets do gain keys.
+    /// What bounds the refetches is the window `refresh` arms on success:
+    /// for [`MIN_KEY_TTL_SECONDS`] after a key set was read, a `kid` that
+    /// is not in it is refused from the cache without touching the network.
+    /// That is what keeps a stream of invented `kid`s from costing the
+    /// issuer two GETs each on a path that needs no credential.
+    ///
+    /// It is a window, not a mutex, and not a promise of one fetch per
+    /// window. Two things widen it:
+    ///
+    /// - No single-flight. The check below is a read, and the refresh is
+    ///   awaited after it, so N concurrent misses for one issuer all see an
+    ///   unarmed window and all refresh.
+    /// - A *failed* refresh deliberately arms nothing, so while an issuer
+    ///   serves something this AS cannot use — an empty set, a set with no
+    ///   usable key in it, an oversized body, more than
+    ///   [`MAX_KEYS_PER_SET`] keys — every miss pays for the attempt again.
+    ///   Keeping a broken issuer retryable is worth more than the fetches,
+    ///   and [`FETCH_TIMEOUT`] bounds what each one costs.
+    pub async fn decoding_key(&self, issuer: &str, kid: &str) -> Result<(DecodingKey, Algorithm)> {
+        if let Some(hit) = self.cached(issuer, kid) {
+            return Ok(hit);
+        }
+        if self.refreshed_recently(issuer) {
+            bail!("issuer published no usable key for this kid");
+        }
+        self.refresh(issuer).await?;
+        self.cached(issuer, kid)
+            .ok_or_else(|| anyhow!("issuer published no usable key for this kid"))
+    }
+
+    fn cached(&self, issuer: &str, kid: &str) -> Option<(DecodingKey, Algorithm)> {
+        let guard = self.keys.read().unwrap();
+        let entry = guard.get(&(issuer.to_string(), kid.to_string()))?;
+        (entry.expires_at_unix > get_current_timestamp()).then(|| (entry.key.clone(), entry.alg))
+    }
+
+    /// Whether `issuer`'s key set was read inside the window. The guard is
+    /// taken and dropped here rather than around the caller's `.await`: a
+    /// `std::sync` guard held across one makes the future non-`Send`.
+    fn refreshed_recently(&self, issuer: &str) -> bool {
+        let guard = self.last_refresh.read().unwrap();
+        guard
+            .get(issuer)
+            .is_some_and(|at| at + MIN_KEY_TTL_SECONDS > get_current_timestamp())
+    }
+
+    /// Re-read `issuer`'s key set and replace everything cached for it, so
+    /// a retired key stops being usable as soon as it leaves the document.
+    async fn refresh(&self, issuer: &str) -> Result<()> {
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        let (body, _) = self.fetch(&discovery_url).await?;
+        let discovery: OpenIdDiscovery = serde_json::from_str(&body)
+            .context("issuer discovery document is not a usable OpenID configuration")?;
+
+        // The document must name the very issuer we asked about. Without
+        // this, a host serving someone else's discovery document would
+        // decide which keys sign that issuer's users in.
+        if discovery.issuer != issuer {
+            bail!("issuer discovery document names a different issuer");
+        }
+
+        let (body, max_age) = self.fetch(&discovery.jwks_uri).await?;
+        let set: RawJwkSet = serde_json::from_str(&body).context("issuer key set is not a JWKS")?;
+        // `keys` carries `#[serde(default)]`, so a CDN error page or a
+        // maintenance response is a `200` that parses as a valid, empty set.
+        // Taken at face value it empties the cache for this issuer, turning
+        // a transient answer into a dead grant.
+        //
+        // The guard on *usable* keys further down would refuse this one too.
+        // It is called out here because the distinction is what the operator
+        // needs: an empty document is an issuer or CDN problem, a full one
+        // with nothing usable is an algorithm mismatch.
+        if set.keys.is_empty() {
+            bail!("issuer key set published no keys");
+        }
+        // Checked before anything is parsed per entry. `take` would have
+        // bounded the cache while leaving the parse unbounded, and it drops
+        // whichever key the exchange actually needed — reported as an
+        // unknown `kid`, which is the wrong thing to go debugging.
+        if set.keys.len() > MAX_KEYS_PER_SET {
+            bail!("issuer key set holds more than {} keys", MAX_KEYS_PER_SET);
+        }
+        // Parsed before the cache is touched, not while it is being
+        // rewritten, so a set that yields nothing usable cannot empty it.
+        // Each entry still stands on its own: one key the `jwk` types
+        // cannot model — an unlisted curve, a `key_ops` published as a
+        // string — must not take down the key the grant actually needs.
+        let usable: Vec<(String, DecodingKey, Algorithm)> = set
+            .keys
+            .into_iter()
+            .filter_map(|raw| serde_json::from_value::<Jwk>(raw).ok())
+            .filter_map(|jwk| usable_key(&jwk))
+            .collect();
+        // The same refusal as an empty set, for the same reason and with a
+        // likelier trigger: a CDN error body parses as one entry that is
+        // not a JWK, and a rotation onto a curve this AS does not accept
+        // parses as several. Neither is an instruction to forget the keys
+        // that still work. `Err` also leaves the window below unarmed, so
+        // the next exchange retries rather than waiting it out.
+        if usable.is_empty() {
+            bail!("issuer key set published no usable key");
+        }
+
+        let expires_at_unix = get_current_timestamp()
+            + max_age
+                .unwrap_or(DEFAULT_KEY_TTL_SECONDS)
+                .clamp(MIN_KEY_TTL_SECONDS, MAX_KEY_TTL_SECONDS);
+
+        let mut guard = self.keys.write().unwrap();
+        guard.retain(|(cached_issuer, _), _| cached_issuer != issuer);
+        for (kid, key, alg) in usable {
+            guard.insert(
+                (issuer.to_string(), kid),
+                CachedKey {
+                    key,
+                    alg,
+                    expires_at_unix,
+                },
+            );
+        }
+        // Released before the next lock is taken, so the two are never held
+        // together and there is no order for a future caller to get wrong.
+        drop(guard);
+        // Recorded only on the way out, so a refusal above — an unreachable
+        // issuer, a document naming someone else, an empty set — never opens
+        // the window. A failed refresh has to stay retryable.
+        self.last_refresh
+            .write()
+            .unwrap()
+            .insert(issuer.to_string(), get_current_timestamp());
+        Ok(())
+    }
+
+    /// Returns the body and the `max-age` the response asked for.
+    ///
+    /// Read in chunks against [`MAX_BODY_BYTES`] rather than with `text()`:
+    /// the body arrives from a host this process does not control, and
+    /// buffering all of it before measuring it is the whole problem.
+    async fn fetch(&self, url: &str) -> Result<(String, Option<u64>)> {
+        let mut response = self
+            .http
+            .get(url)
+            .timeout(FETCH_TIMEOUT)
+            .send()
+            .await
+            .context("could not reach the issuer")?;
+        if !response.status().is_success() {
+            bail!("issuer answered {}", response.status());
+        }
+        let max_age = max_age_seconds(response.headers());
+        // The declared length first, because a body that announces its size
+        // costs nothing to refuse before any of it is read. The loop then
+        // covers the bodies that declare no length at all — chunked, or
+        // HTTP/2 without one — where the size is knowable only by reading.
+        //
+        // A host that *understates* its length needs no cover here: the
+        // decoder stops at the figure it was given, so it cannot deliver
+        // more than it declared.
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_BODY_BYTES as u64)
+        {
+            bail!("issuer response is larger than {} bytes", MAX_BODY_BYTES);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("could not read the issuer's response")?
+        {
+            if body.len() + chunk.len() > MAX_BODY_BYTES {
+                bail!("issuer response is larger than {} bytes", MAX_BODY_BYTES);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(body).context("issuer response is not UTF-8")?;
+        Ok((body, max_age))
+    }
+}
+
+/// A JWKS entry this AS is willing to verify an assertion with.
+///
+/// The accepted set is exactly `{ES256, RS256}`. `alg` is optional in
+/// RFC 7517 and real key sets do leave it out, so a key of an accepted
+/// type names its own algorithm when it is absent — refusing those would
+/// be an outage, not caution.
+///
+/// `None` for everything else: a key with no `kid` (nothing could select
+/// it), an `alg` outside the two accepted, a curve other than P-256, and
+/// any key whose material does not match its `alg` — most importantly a
+/// symmetric one, which could forge assertions rather than merely check
+/// them.
+fn usable_key(jwk: &Jwk) -> Option<(String, DecodingKey, Algorithm)> {
+    let kid = jwk.common.key_id.clone()?;
+    let alg = match (jwk.common.key_algorithm, &jwk.algorithm) {
+        (Some(KeyAlgorithm::ES256) | None, AlgorithmParameters::EllipticCurve(ec))
+            if ec.curve == EllipticCurve::P256 =>
+        {
+            Algorithm::ES256
+        }
+        (Some(KeyAlgorithm::RS256) | None, AlgorithmParameters::RSA(_)) => Algorithm::RS256,
+        _ => return None,
+    };
+    Some((kid, DecodingKey::from_jwk(jwk).ok()?, alg))
+}
+
+fn max_age_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::CACHE_CONTROL)?
+        .to_str()
+        .ok()?
+        .to_ascii_lowercase()
+        .split(',')
+        .find_map(|directive| directive.trim().strip_prefix("max-age=")?.parse().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::{
+        ec_public_jwk, ec_public_jwk_without_alg, start_fake_issuer,
+        start_fake_issuer_with_chunked_jwks, start_fake_issuer_with_discovery,
+        TEST_EC_P384_PKCS8_B64, TEST_EC_PKCS8_B64,
+    };
+    use super::*;
+
+    fn cache() -> JwksCache {
+        JwksCache::new(reqwest::Client::new())
+    }
+
+    #[tokio::test]
+    async fn test_discovery_issuer_mismatch_is_rejected() {
+        // The document is served by 127.0.0.1 but claims to belong to
+        // `https://honest.example`. Trusting it would let whoever controls
+        // that host publish the keys we verify assertions with, so the
+        // `jwks_uri` it offers must never even be fetched.
+        let fake = start_fake_issuer(
+            Some("https://honest.example"),
+            vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")],
+        )
+        .await;
+
+        assert!(cache().decoding_key(&fake.base, "k1").await.is_err());
+        assert_eq!(fake.jwks_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_discovery_without_an_issuer_is_rejected() {
+        // Nothing to compare `iss` against means the check cannot be made,
+        // and a check that cannot be made is a refusal.
+        let fake = start_fake_issuer_with_discovery(
+            |base| serde_json::json!({ "jwks_uri": format!("{base}/jwks") }).to_string(),
+            serde_json::json!({ "keys": [] }).to_string(),
+        )
+        .await;
+
+        assert!(cache().decoding_key(&fake.base, "k1").await.is_err());
+        assert_eq!(fake.jwks_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_key_is_cached_between_calls() {
+        let fake = start_fake_issuer(None, vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")]).await;
+        let cache = cache();
+
+        cache.decoding_key(&fake.base, "k1").await.unwrap();
+        cache.decoding_key(&fake.base, "k1").await.unwrap();
+
+        assert_eq!(fake.discovery_hits(), 1);
+        assert_eq!(fake.jwks_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_repeated_unknown_kid_does_not_refetch_within_the_window() {
+        // A key set is allowed to gain keys, so a cold cache does fetch for
+        // a `kid` it has never seen. What it must not do is fetch again for
+        // the next one: without a window, every request carrying an invented
+        // `kid` costs the issuer two sequential GETs, for as long as the
+        // requests keep coming — and `/token` takes no credential to reach.
+        let fake = start_fake_issuer(None, vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")]).await;
+        let cache = cache();
+
+        assert!(cache.decoding_key(&fake.base, "nope").await.is_err());
+        assert!(cache.decoding_key(&fake.base, "nope").await.is_err());
+
+        assert_eq!(fake.jwks_hits(), 1);
+        assert_eq!(fake.discovery_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_empty_key_set_does_not_evict_cached_keys() {
+        // `keys` defaults to empty, so a CDN error page or a maintenance
+        // response is a `200` that parses as a valid, empty key set. Letting
+        // it through replaces every good key for the issuer with nothing,
+        // which turns a transient blip into a dead grant.
+        let fake = start_fake_issuer(None, vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")]).await;
+        let cache = cache();
+        cache.decoding_key(&fake.base, "k1").await.unwrap();
+
+        fake.set_jwks(serde_json::json!({}).to_string());
+        assert!(cache.refresh(&fake.base).await.is_err());
+        assert!(cache.decoding_key(&fake.base, "k1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_unusable_key_set_does_not_evict_cached_keys() {
+        // The likelier shape of the outage above: the set is not empty, so
+        // the empty-set guard misses it, but nothing in it survives
+        // `usable_key`. A CDN error body is one such entry; a rotation onto
+        // a curve this AS does not accept is several. Taken at face value
+        // both empty the cache.
+        let fake = start_fake_issuer(None, vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")]).await;
+        let cache = cache();
+        cache.decoding_key(&fake.base, "k1").await.unwrap();
+
+        fake.set_jwks(serde_json::json!({ "keys": [{"detail": "upstream error"}] }).to_string());
+        assert!(cache.refresh(&fake.base).await.is_err());
+        assert!(cache.decoding_key(&fake.base, "k1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_refresh_leaves_the_window_unarmed() {
+        // The second half of the same defect: an unusable set that returned
+        // `Ok` armed the window, so recovery waited out
+        // `MIN_KEY_TTL_SECONDS` even after the issuer had fixed its
+        // document. The next miss has to retry instead.
+        let fake =
+            start_fake_issuer(None, vec![serde_json::json!({"detail": "upstream error"})]).await;
+        let cache = cache();
+        assert!(cache.decoding_key(&fake.base, "k1").await.is_err());
+        assert_eq!(fake.jwks_hits(), 1);
+
+        fake.set_jwks(
+            serde_json::json!({ "keys": [ec_public_jwk(TEST_EC_PKCS8_B64, "k1")] }).to_string(),
+        );
+        assert!(cache.decoding_key(&fake.base, "k1").await.is_ok());
+        assert_eq!(fake.jwks_hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_body_is_refused() {
+        // A body served with a `Content-Length` is refused from the header
+        // alone, before any of it is read. This is that branch: axum frames
+        // a `String` with an exact length, so the short-circuit fires and
+        // the read loop never runs. The chunked case below is the other one.
+        let fake = start_fake_issuer(
+            None,
+            vec![serde_json::json!({
+                "kty": "EC", "crv": "P-256", "kid": "k1", "alg": "ES256",
+                "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+                "padding": "A".repeat(MAX_BODY_BYTES)
+            })],
+        )
+        .await;
+
+        assert!(cache().decoding_key(&fake.base, "k1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_oversized_chunked_body_is_refused() {
+        // The branch that actually matters. A chunked response declares no
+        // length, so the header short-circuit cannot fire and the read loop
+        // is the only thing between the issuer and an unbounded buffer.
+        let huge = serde_json::json!({
+            "keys": [{ "kty": "EC", "kid": "k1", "padding": "A".repeat(MAX_BODY_BYTES) }]
+        });
+        let fake = start_fake_issuer_with_chunked_jwks(huge.to_string()).await;
+
+        let err = cache()
+            .decoding_key(&fake.base, "k1")
+            .await
+            .expect_err("a body over the cap must not be read whole");
+        // The message, because "refused" is not the property under test:
+        // this body would also be refused for having no usable key, and
+        // that refusal would mean it had been buffered and parsed first.
+        assert!(
+            format!("{err:#}").contains("larger than"),
+            "refused for the wrong reason: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_key_set_above_the_entry_cap_is_refused() {
+        // Refused whole rather than truncated: truncating drops whichever
+        // key the exchange needed and reports it as an unknown `kid`.
+        let mut keys: Vec<serde_json::Value> = (0..MAX_KEYS_PER_SET)
+            .map(|i| ec_public_jwk(TEST_EC_PKCS8_B64, &format!("k{i}")))
+            .collect();
+        let fake = start_fake_issuer(None, keys.clone()).await;
+        assert!(cache().decoding_key(&fake.base, "k0").await.is_ok());
+
+        keys.push(ec_public_jwk(TEST_EC_PKCS8_B64, "one-too-many"));
+        let fake = start_fake_issuer(None, keys).await;
+        assert!(cache().decoding_key(&fake.base, "k0").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_hs_key_in_jwks_is_refused() {
+        // A symmetric key can be used to *forge* a token, not just verify
+        // one, so one must never become a `DecodingKey` here — whether the
+        // key set labels it `HS256` or dresses it up as `ES256`.
+        let fake = start_fake_issuer(
+            None,
+            vec![
+                serde_json::json!({ "kty": "oct", "alg": "HS256", "kid": "sym", "k": "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0" }),
+                serde_json::json!({ "kty": "oct", "alg": "ES256", "kid": "liar", "k": "c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0" }),
+            ],
+        )
+        .await;
+        let cache = cache();
+
+        assert!(cache.decoding_key(&fake.base, "sym").await.is_err());
+        assert!(cache.decoding_key(&fake.base, "liar").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ec_p256_key_without_alg_is_accepted_as_es256() {
+        // `alg` is optional in RFC 7517. Refusing a key set that omits it
+        // would take the grant down for an issuer doing nothing wrong, so
+        // a P-256 key names its own algorithm.
+        let fake = start_fake_issuer(
+            None,
+            vec![ec_public_jwk_without_alg(
+                TEST_EC_PKCS8_B64,
+                "k1",
+                Algorithm::ES256,
+            )],
+        )
+        .await;
+
+        let (_, alg) = cache().decoding_key(&fake.base, "k1").await.unwrap();
+        assert_eq!(alg, Algorithm::ES256);
+    }
+
+    #[tokio::test]
+    async fn test_ec_key_on_another_curve_without_alg_is_refused() {
+        // Deriving the algorithm from the key must not widen the accepted
+        // set: P-384 is still outside it, with or without `alg`.
+        let fake = start_fake_issuer(
+            None,
+            vec![ec_public_jwk_without_alg(
+                TEST_EC_P384_PKCS8_B64,
+                "k384",
+                Algorithm::ES384,
+            )],
+        )
+        .await;
+
+        assert!(cache().decoding_key(&fake.base, "k384").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_one_unusable_key_does_not_take_down_the_set() {
+        // Same failure mode as a missing `alg`, one level up: a key the
+        // `jwk` types cannot model must cost its own entry and nothing
+        // else.
+        //
+        // `sloppy` is the entry that actually exercises the parsing:
+        // `key_ops` published as a string instead of an array is a real
+        // publisher slip, and it makes a whole-set `JwkSet` deserialize
+        // fail, taking the good key with it.
+        //
+        // `exotic` does not. An unmodelled curve was the first guess at a
+        // trigger and it is the wrong one: `AlgorithmParameters` is
+        // untagged with an `Other` variant that absorbs any object, so
+        // the key parses fine and `usable_key` is what drops it, for not
+        // being P-256. It stays here to pin that second behaviour.
+        let fake = start_fake_issuer(
+            None,
+            vec![
+                serde_json::json!({
+                    "kty": "EC", "crv": "P-256", "kid": "sloppy", "key_ops": "verify",
+                    "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                    "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+                }),
+                serde_json::json!({
+                    "kty": "EC", "crv": "secp256k1", "kid": "exotic", "alg": "ES256",
+                    "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                    "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+                }),
+                ec_public_jwk(TEST_EC_PKCS8_B64, "good"),
+            ],
+        )
+        .await;
+        let cache = cache();
+
+        let (_, alg) = cache.decoding_key(&fake.base, "good").await.unwrap();
+        assert_eq!(alg, Algorithm::ES256);
+        assert!(cache.decoding_key(&fake.base, "sloppy").await.is_err());
+        assert!(cache.decoding_key(&fake.base, "exotic").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rs256_key_is_accepted() {
+        // RS256 is the second algorithm the grant accepts; without this the
+        // allowlist could narrow to ES256 unnoticed.
+        let fake = start_fake_issuer(
+            None,
+            vec![serde_json::json!({
+                "kty": "RSA",
+                "alg": "RS256",
+                "kid": "rsa-1",
+                "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+                "e": "AQAB"
+            })],
+        )
+        .await;
+
+        let (_, alg) = cache().decoding_key(&fake.base, "rsa-1").await.unwrap();
+        assert_eq!(alg, jsonwebtoken::Algorithm::RS256);
+    }
+}
