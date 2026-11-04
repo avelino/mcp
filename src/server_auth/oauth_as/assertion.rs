@@ -38,7 +38,8 @@ pub struct ValidatedAssertion {
     pub roles: Vec<String>,
 }
 
-/// `aud` arrives as a bare string or as an array holding one entry.
+/// A claim that arrives as a bare string or as an array of them. `aud`
+/// (RFC 7519 §4.1.3) and `resource` (ID-JAG §3.1) are both this shape.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Audience {
@@ -47,15 +48,20 @@ enum Audience {
 }
 
 impl Audience {
+    /// Every identifier named, in order. A bare string names one.
+    fn all(&self) -> &[String] {
+        match self {
+            Audience::One(one) => std::slice::from_ref(one),
+            Audience::Many(many) => many,
+        }
+    }
+
     /// `None` unless the assertion names exactly one audience: more than
     /// one means it was not minted for this AS alone.
     fn single(&self) -> Option<&str> {
-        match self {
-            Audience::One(one) => Some(one),
-            Audience::Many(many) => match many.as_slice() {
-                [one] => Some(one),
-                _ => None,
-            },
+        match self.all() {
+            [one] => Some(one),
+            _ => None,
         }
     }
 }
@@ -65,6 +71,10 @@ struct AssertionClaims {
     iss: String,
     #[serde(default)]
     aud: Option<Audience>,
+    /// The protected resource(s) the issuer restricted this assertion to.
+    /// OPTIONAL per ID-JAG §3.1, and binding when it is there.
+    #[serde(default)]
+    resource: Option<Audience>,
     /// Picks the workspace when several share one issuer URL.
     #[serde(default)]
     aud_tenant: Option<String>,
@@ -204,6 +214,41 @@ pub async fn validate(
     // exact string match.
     if aud.trim_end_matches('/') != cfg.issuer_url.trim_end_matches('/') {
         return Err("assertion aud is not this authorization server".to_string());
+    }
+
+    // Check 5b — the protected resource, when the issuer named one. The
+    // other half of check 5's question: `aud` says which authorization
+    // server may redeem the assertion, `resource` says which resource
+    // server the token coming out of it is for. ID-JAG §4.4.1 makes every
+    // identifier in it one this Resource Authorization Server governs,
+    // and the MCP Enterprise-Managed Authorization extension (§4.3)
+    // narrows that to this MCP server's Resource Identifier.
+    //
+    // Compared against `issuer_url` trimmed, because that is exactly what
+    // `metadata::protected_resource` publishes as the Resource Identifier
+    // and exactly what `token.rs` compares the `resource` *form
+    // parameter* against. One identifier for both is what makes a signed
+    // `resource` that disagrees with the form parameter unredeemable:
+    // whichever of the two is not this server is the one refused, so the
+    // pair cannot drift apart without a test going red.
+    //
+    // Here with the other claim checks rather than after them, so a
+    // refusal is settled before check 9 consumes the `jti`.
+    //
+    // Absent stays accepted — §3.1 marks the claim OPTIONAL and the
+    // issuers in the field omit it. An empty array does not: §3.1 admits
+    // a non-empty array only, and one that names nothing names no
+    // resource this server governs.
+    if let Some(resource) = claims.resource.as_ref() {
+        let this_resource = cfg.issuer_url.trim_end_matches('/');
+        let named = resource.all();
+        if named.is_empty()
+            || !named
+                .iter()
+                .all(|named| named.trim_end_matches('/') == this_resource)
+        {
+            return Err("assertion resource is not this protected resource".to_string());
+        }
     }
 
     // Check 6 — the assertion names the client presenting it.
@@ -746,6 +791,102 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_resource_claim_naming_another_protected_resource_is_refused() {
+        // ID-JAG §4.4.1: every identifier in `resource` has to be a
+        // protected resource this AS governs, and the MCP
+        // Enterprise-Managed Authorization extension (§4.3) narrows that
+        // to this server's own Resource Identifier. Dropped on
+        // deserialization, an assertion its issuer signed as good for
+        // someone else's MCP server is redeemed here as if it had been
+        // minted for this one — a restriction the issuer put its
+        // signature on, and that this side then ignored.
+        let (fake, cfg) = valid_setup().await;
+        let state = AsState::default();
+        let cache = jwks();
+
+        let mut payload = claims(&fake.base);
+        payload["resource"] = json!("https://other-mcp.example.com");
+        let err = validate(
+            &sign(TEST_EC_PKCS8_B64, ID_JAG_TYP, "k1", &payload),
+            CLIENT_ID,
+            &cfg,
+            &cache,
+            &state,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "assertion resource is not this protected resource");
+
+        // And it was refused before check 9 ran: the same `jti`, on an
+        // assertion that does name this server, is still redeemable. A
+        // claim check placed after the replay guard would let anyone
+        // holding a copy of an assertion burn its entry and deny the
+        // owner the exchange.
+        payload["resource"] = json!(AS_URL);
+        validate(
+            &sign(TEST_EC_PKCS8_B64, ID_JAG_TYP, "k1", &payload),
+            CLIENT_ID,
+            &cfg,
+            &cache,
+            &state,
+        )
+        .await
+        .expect("a refused claim check must not have consumed the jti");
+    }
+
+    #[tokio::test]
+    async fn test_resource_claim_shapes() {
+        // `resource` is a string or a non-empty array of unique strings
+        // (ID-JAG §3.1) — the shape `aud` already has, which is why it
+        // reads through the same type. Absent is OPTIONAL and ordinary;
+        // an empty array is neither, and names no resource at all.
+        let (fake, cfg) = valid_setup().await;
+
+        for resource in [
+            json!(AS_URL),
+            json!([AS_URL]),
+            // Trimmed on both sides, like `aud` and like the `resource`
+            // form parameter: what the metadata publishes is the trimmed
+            // form, so a slash is not a different resource.
+            json!(format!("{AS_URL}/")),
+        ] {
+            let mut payload = claims(&fake.base);
+            payload["resource"] = resource.clone();
+            let token = sign(TEST_EC_PKCS8_B64, ID_JAG_TYP, "k1", &payload);
+            validate(&token, CLIENT_ID, &cfg, &jwks(), &AsState::default())
+                .await
+                .unwrap_or_else(|e| panic!("resource {resource} should be accepted: {e}"));
+        }
+
+        for resource in [
+            json!([]),
+            // Named alongside ours, it is still an assertion minted to
+            // reach somewhere else as well.
+            json!([AS_URL, "https://other-mcp.example.com"]),
+            json!("https://other-mcp.example.com"),
+        ] {
+            let mut payload = claims(&fake.base);
+            payload["resource"] = resource.clone();
+            let token = sign(TEST_EC_PKCS8_B64, ID_JAG_TYP, "k1", &payload);
+            assert!(
+                validate(&token, CLIENT_ID, &cfg, &jwks(), &AsState::default())
+                    .await
+                    .is_err(),
+                "resource {resource} should be refused"
+            );
+        }
+
+        // Backwards compatibility, and the whole reason an absent claim is
+        // not a refusal: `claims` publishes no `resource` — the shape every
+        // assertion this grant has accepted so far has had — and the
+        // exchange still works.
+        let token = sign(TEST_EC_PKCS8_B64, ID_JAG_TYP, "k1", &claims(&fake.base));
+        validate(&token, CLIENT_ID, &cfg, &jwks(), &AsState::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

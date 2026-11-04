@@ -1071,6 +1071,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_jwt_bearer_refuses_an_assertion_bound_to_another_resource() {
+        // The signed `resource` claim and the `resource` form parameter
+        // answer the same question, so both are compared against one
+        // identifier: this server's, the value
+        // `/.well-known/oauth-protected-resource` publishes. That is what
+        // makes the two disagreeing unredeemable without a third
+        // comparison between them — whichever of the pair is not this
+        // server is the one refused.
+        let (fake, ctx) = ema_ctx().await;
+
+        // Signed for someone else, asked for on behalf of this server.
+        let mut claims = ema_claims(&fake.base);
+        claims["resource"] = json!("https://other-mcp.example.com");
+        let mut req = ema_request(sign_assertion(&claims), EMA_CLIENT);
+        req.resource = Some("https://mcp.example.com".to_string());
+        let e = token(State(ctx.clone()), Form(req)).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert_eq!(e.1.error, "invalid_grant");
+        assert_eq!(
+            e.1.error_description,
+            "assertion resource is not this protected resource"
+        );
+
+        // Signed for this server, asked for on behalf of someone else.
+        // Refused by the form-parameter check, which is ahead of the
+        // assertion and so never reaches the issuer.
+        let mut claims = ema_claims(&fake.base);
+        claims["resource"] = json!("https://mcp.example.com");
+        let mut req = ema_request(sign_assertion(&claims), EMA_CLIENT);
+        req.resource = Some("https://other-mcp.example.com".to_string());
+        let e = token(State(ctx.clone()), Form(req)).await.unwrap_err();
+        assert_eq!(e.1.error, "invalid_grant");
+
+        // Both naming this server is the ordinary case and still works.
+        let mut claims = ema_claims(&fake.base);
+        claims["resource"] = json!("https://mcp.example.com");
+        let mut req = ema_request(sign_assertion(&claims), EMA_CLIENT);
+        req.resource = Some("https://mcp.example.com".to_string());
+        assert!(token(State(ctx), Form(req)).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_token_form_accepts_resource_and_ignores_unknown_fields() {
         // Claude's POST carries `resource`, and a parser strict about an
         // unrecognised parameter would turn any future extra field into a

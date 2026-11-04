@@ -7,11 +7,14 @@
 //! that brings its own key is a token that verifies itself.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, KeyAlgorithm};
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, CommonParameters, EllipticCurve, Jwk, KeyAlgorithm, KeyOperations,
+    PublicKeyUse,
+};
 use jsonwebtoken::{get_current_timestamp, Algorithm, DecodingKey};
 use serde::Deserialize;
 
@@ -44,6 +47,24 @@ const MAX_REDIRECTS: usize = 3;
 /// Floor on the cached lifetime, so an issuer advertising `max-age=0`
 /// cannot turn every token exchange into two round-trips.
 const MIN_KEY_TTL_SECONDS: u64 = 60;
+
+/// How long the next refresh of an issuer waits when that issuer's last
+/// one failed.
+///
+/// A failed refresh arms no cache window — see `refresh` — so a broken
+/// issuer is the one case the window does not pace at all: every miss
+/// pays for the attempt again, as fast as the misses arrive. This paces
+/// them without taking the issuer out of service, which is the trade the
+/// doc comment on [`JwksCache::decoding_key`] argues for: an issuer that
+/// fixes its document is serving again one short delay later, not one
+/// [`MIN_KEY_TTL_SECONDS`] later.
+const FAILED_REFRESH_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Compile-time guard on the number above: pacing a broken issuer has to
+/// stay an order of magnitude cheaper than waiting out the cache window,
+/// or "keep it retryable" is a policy in name only.
+const _: () =
+    assert!(FAILED_REFRESH_BACKOFF.as_millis() * 10 < MIN_KEY_TTL_SECONDS as u128 * 1_000);
 
 /// Ceiling on the cached lifetime: it bounds how long a key stays usable
 /// here after the issuer retires it.
@@ -98,6 +119,14 @@ pub struct JwksCache {
     /// configured `trustedIssuers`, because that is where the issuer string
     /// comes from — never off an assertion's own claims.
     last_refresh: RwLock<HashMap<String, u64>>,
+    /// One gate per issuer: whoever holds it is the only task refreshing
+    /// that issuer, so concurrent misses make one pair of fetches between
+    /// them rather than one each. It carries the [`Instant`] of that
+    /// issuer's last failed refresh, which is what paces the retries a
+    /// failure deliberately leaves available.
+    ///
+    /// Bounded the same way `last_refresh` is, and keyed the same way.
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Instant>>>>>,
 }
 
 impl JwksCache {
@@ -106,6 +135,7 @@ impl JwksCache {
             http,
             keys: RwLock::new(HashMap::new()),
             last_refresh: RwLock::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -119,28 +149,63 @@ impl JwksCache {
     /// That is what keeps a stream of invented `kid`s from costing the
     /// issuer two GETs each on a path that needs no credential.
     ///
-    /// It is a window, not a mutex, and not a promise of one fetch per
-    /// window. Two things widen it:
+    /// The window only closes once a refresh has *succeeded*, so two
+    /// things it cannot pace are coordinated here instead:
     ///
-    /// - No single-flight. The check below is a read, and the refresh is
-    ///   awaited after it, so N concurrent misses for one issuer all see an
-    ///   unarmed window and all refresh.
-    /// - A *failed* refresh deliberately arms nothing, so while an issuer
-    ///   serves something this AS cannot use — an empty set, a set with no
-    ///   usable key in it, an oversized body, more than
-    ///   [`MAX_KEYS_PER_SET`] keys — every miss pays for the attempt again.
-    ///   Keeping a broken issuer retryable is worth more than the fetches,
-    ///   and [`FETCH_TIMEOUT`] bounds what each one costs.
+    /// - Concurrent misses. One gate per issuer, taken past the cache
+    ///   check, so N requests naming one unseen `kid` make one pair of
+    ///   fetches between them instead of N. The exposure is why: this runs
+    ///   at assertion check 2, ahead of the signature check at 3, so a
+    ///   caller reaches it with no credential at all, and an issuer URL is
+    ///   public. [`FETCH_TIMEOUT`] bounds what one fetch costs and nothing
+    ///   else bounded how many ran at once.
+    /// - A *failed* refresh, which deliberately arms nothing: while an
+    ///   issuer serves something this AS cannot use — an empty set, a set
+    ///   with no usable key in it, an oversized body, more than
+    ///   [`MAX_KEYS_PER_SET`] keys — the window never opens and every miss
+    ///   pays for the attempt again. Keeping a broken issuer retryable is
+    ///   still worth more than the fetches, so the next attempt is paced by
+    ///   [`FAILED_REFRESH_BACKOFF`] rather than refused: an issuer that
+    ///   fixes its document is serving again one short delay later, not one
+    ///   [`MIN_KEY_TTL_SECONDS`] later.
     pub async fn decoding_key(&self, issuer: &str, kid: &str) -> Result<(DecodingKey, Algorithm)> {
+        if let Some(hit) = self.cached(issuer, kid) {
+            return Ok(hit);
+        }
+        // Taken after the hit check, not before, so a cached key is never
+        // made to queue behind someone else's refresh.
+        let gate = self.gate(issuer);
+        let mut last_failure = gate.lock().await;
+        // Both checks again: whoever held the gate may have just answered
+        // this very question, and waiting on them is the point.
         if let Some(hit) = self.cached(issuer, kid) {
             return Ok(hit);
         }
         if self.refreshed_recently(issuer) {
             bail!("issuer published no usable key for this kid");
         }
-        self.refresh(issuer).await?;
+        if let Some(remaining) =
+            last_failure.and_then(|at| FAILED_REFRESH_BACKOFF.checked_sub(at.elapsed()))
+        {
+            tokio::time::sleep(remaining).await;
+        }
+        let refreshed = self.refresh(issuer).await;
+        // A refresh that succeeded arms the window above, so only a failure
+        // needs pacing of its own.
+        *last_failure = refreshed.is_err().then(Instant::now);
+        refreshed?;
         self.cached(issuer, kid)
             .ok_or_else(|| anyhow!("issuer published no usable key for this kid"))
+    }
+
+    /// The gate for `issuer`, created on first use.
+    fn gate(&self, issuer: &str) -> Arc<tokio::sync::Mutex<Option<Instant>>> {
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(issuer.to_string())
+            .or_default()
+            .clone()
     }
 
     fn cached(&self, issuer: &str, kid: &str) -> Option<(DecodingKey, Algorithm)> {
@@ -383,12 +448,15 @@ fn check_scheme(url: &str, allow_loopback_http: bool) -> Result<()> {
 /// be an outage, not caution.
 ///
 /// `None` for everything else: a key with no `kid` (nothing could select
-/// it), an `alg` outside the two accepted, a curve other than P-256, and
-/// any key whose material does not match its `alg` — most importantly a
-/// symmetric one, which could forge assertions rather than merely check
-/// them.
+/// it), one the key set does not publish for verifying signatures, an
+/// `alg` outside the two accepted, a curve other than P-256, and any key
+/// whose material does not match its `alg` — most importantly a symmetric
+/// one, which could forge assertions rather than merely check them.
 fn usable_key(jwk: &Jwk) -> Option<(String, DecodingKey, Algorithm)> {
     let kid = jwk.common.key_id.clone()?;
+    if !verifies_signatures(&jwk.common) {
+        return None;
+    }
     let alg = match (jwk.common.key_algorithm, &jwk.algorithm) {
         (Some(KeyAlgorithm::ES256) | None, AlgorithmParameters::EllipticCurve(ec))
             if ec.curve == EllipticCurve::P256 =>
@@ -399,6 +467,32 @@ fn usable_key(jwk: &Jwk) -> Option<(String, DecodingKey, Algorithm)> {
         _ => return None,
     };
     Some((kid, DecodingKey::from_jwk(jwk).ok()?, alg))
+}
+
+/// Whether the key set says this key may be used to verify a signature.
+///
+/// RFC 7517 §4.2 and §4.3. `use` holds a single value, so anything other
+/// than `sig` is a key published for a different job — `enc` above all,
+/// whose private half an issuer may rotate on another schedule and hold
+/// to other rules than its signing material. `key_ops` enumerates the
+/// operations instead, so it has to list `verify`.
+///
+/// Neither is required and real key sets omit both, so a key that
+/// declares nothing stays usable: making the parameters mandatory would
+/// be an outage for issuers doing nothing wrong. The rule only bites
+/// where the issuer did say, and said something else.
+fn verifies_signatures(common: &CommonParameters) -> bool {
+    if common
+        .public_key_use
+        .as_ref()
+        .is_some_and(|declared| *declared != PublicKeyUse::Signature)
+    {
+        return false;
+    }
+    common
+        .key_operations
+        .as_ref()
+        .is_none_or(|ops| ops.contains(&KeyOperations::Verify))
 }
 
 fn max_age_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -782,17 +876,195 @@ mod tests {
         // allowlist could narrow to ES256 unnoticed.
         let fake = start_fake_issuer(
             None,
-            vec![serde_json::json!({
-                "kty": "RSA",
-                "alg": "RS256",
-                "kid": "rsa-1",
-                "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
-                "e": "AQAB"
-            })],
+            vec![rsa_jwk("rsa-1", serde_json::json!({ "alg": "RS256" }))],
         )
         .await;
 
         let (_, alg) = cache().decoding_key(&fake.base, "rsa-1").await.unwrap();
         assert_eq!(alg, jsonwebtoken::Algorithm::RS256);
+    }
+
+    /// The public half of a throwaway RSA key as a JWKS entry, with
+    /// `extra`'s members merged in — so a test can publish `use`,
+    /// `key_ops` or `alg` on it without restating the modulus.
+    fn rsa_jwk(kid: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut jwk = serde_json::json!({
+            "kty": "RSA",
+            "kid": kid,
+            "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
+            "e": "AQAB"
+        });
+        let entry = jwk.as_object_mut().unwrap();
+        for (name, value) in extra.as_object().unwrap() {
+            entry.insert(name.clone(), value.clone());
+        }
+        jwk
+    }
+
+    #[tokio::test]
+    async fn test_a_key_published_for_encryption_never_verifies_an_assertion() {
+        // RFC 7517 §4.2 and §4.3. One key set carrying both an encryption
+        // key and a signing key is an ordinary shape — an issuer that
+        // publishes everything at one `jwks_uri`. Read without `use` and
+        // `key_ops`, the two are indistinguishable whenever `alg` is
+        // omitted, which RFC 7517 allows: the encryption key becomes a
+        // `DecodingKey` that verifies identity assertions, and its private
+        // half is held under whatever rules the issuer applies to
+        // decryption material rather than to signing material.
+        let fake = start_fake_issuer(
+            None,
+            vec![
+                rsa_jwk("enc-only", serde_json::json!({ "use": "enc" })),
+                // The same key naming an algorithm. `alg` is not what
+                // decides this: it answers *how* to verify, never
+                // *whether* the issuer published the key for verifying,
+                // so an encryption key that also carries `alg` was
+                // accepted by exactly the same path.
+                rsa_jwk(
+                    "enc-with-alg",
+                    serde_json::json!({ "alg": "RS256", "use": "enc" }),
+                ),
+                rsa_jwk(
+                    "cannot-verify",
+                    serde_json::json!({ "key_ops": ["encrypt", "wrapKey"] }),
+                ),
+                rsa_jwk(
+                    "signing",
+                    serde_json::json!({ "use": "sig", "key_ops": ["verify"] }),
+                ),
+            ],
+        )
+        .await;
+        let cache = cache();
+
+        for kid in ["enc-only", "enc-with-alg"] {
+            assert!(
+                cache.decoding_key(&fake.base, kid).await.is_err(),
+                "{kid}: a key published for encryption was accepted as a verification key"
+            );
+        }
+        assert!(
+            cache
+                .decoding_key(&fake.base, "cannot-verify")
+                .await
+                .is_err(),
+            "a key whose key_ops exclude verification was accepted as a verification key"
+        );
+        // And the right one out of the same set is still chosen.
+        let (_, alg) = cache.decoding_key(&fake.base, "signing").await.unwrap();
+        assert_eq!(alg, Algorithm::RS256);
+    }
+
+    #[tokio::test]
+    async fn test_a_key_declaring_neither_use_nor_key_ops_is_still_accepted() {
+        // Both parameters are optional and plenty of real key sets carry
+        // neither, so reading them must not become a requirement to
+        // publish them — that would be an outage for every issuer doing
+        // nothing wrong. `use: "sig"` alone and `key_ops: ["verify"]`
+        // alone are the other two shapes in the field.
+        let fake = start_fake_issuer(
+            None,
+            vec![
+                rsa_jwk("bare", serde_json::json!({})),
+                rsa_jwk("use-only", serde_json::json!({ "use": "sig" })),
+                rsa_jwk(
+                    "ops-only",
+                    serde_json::json!({ "key_ops": ["verify", "sign"] }),
+                ),
+                ec_public_jwk(TEST_EC_PKCS8_B64, "ec-bare"),
+            ],
+        )
+        .await;
+        let cache = cache();
+
+        for kid in ["bare", "use-only", "ops-only"] {
+            let (_, alg) = cache
+                .decoding_key(&fake.base, kid)
+                .await
+                .unwrap_or_else(|e| panic!("{kid} should still be usable: {e:#}"));
+            assert_eq!(alg, Algorithm::RS256);
+        }
+        let (_, alg) = cache.decoding_key(&fake.base, "ec-bare").await.unwrap();
+        assert_eq!(alg, Algorithm::ES256);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_misses_for_one_issuer_make_one_pair_of_fetches() {
+        // Reachable before anything has been authenticated: `decoding_key`
+        // runs at assertion check 2, ahead of the signature check at 3, and
+        // the issuer URL it is called with is not a secret. Without
+        // coalescing, N requests naming one unseen `kid` are N discovery
+        // GETs and N key-set GETs aimed at the identity provider —
+        // `FETCH_TIMEOUT` bounds what each one costs, never how many of
+        // them run at once.
+        const CALLERS: usize = 8;
+        let fake = start_fake_issuer(None, vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")]).await;
+        let cache = Arc::new(cache());
+        // Every caller is inside `decoding_key` before any of them has an
+        // answer, which is the arrival pattern the defect needs.
+        let gun = Arc::new(tokio::sync::Barrier::new(CALLERS));
+
+        let mut callers = Vec::new();
+        for _ in 0..CALLERS {
+            let (cache, gun, issuer) = (cache.clone(), gun.clone(), fake.base.clone());
+            callers.push(tokio::spawn(async move {
+                gun.wait().await;
+                cache.decoding_key(&issuer, "k1").await.map(|_| ())
+            }));
+        }
+        for caller in callers {
+            caller.await.unwrap().unwrap();
+        }
+
+        assert_eq!(
+            fake.discovery_hits(),
+            1,
+            "concurrent misses for one issuer each ran their own discovery fetch"
+        );
+        assert_eq!(
+            fake.jwks_hits(),
+            1,
+            "concurrent misses for one issuer each ran their own key-set fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_failing_issuer_is_paced_but_stays_retryable() {
+        // The case the gate alone does not close. A failed refresh arms no
+        // window on purpose, so callers that queue behind each other would
+        // otherwise go straight back to the issuer the moment the one
+        // before them gave up — serialized, but at no lower a rate.
+        const CALLERS: u32 = 3;
+        let fake =
+            start_fake_issuer(None, vec![serde_json::json!({"detail": "upstream error"})]).await;
+        let cache = Arc::new(cache());
+        let started = Instant::now();
+
+        let mut callers = Vec::new();
+        for _ in 0..CALLERS {
+            let (cache, issuer) = (cache.clone(), fake.base.clone());
+            callers.push(tokio::spawn(async move {
+                cache.decoding_key(&issuer, "k1").await.map(|_| ())
+            }));
+        }
+        for caller in callers {
+            assert!(caller.await.unwrap().is_err());
+        }
+
+        // Retryable, which is the policy the doc comment on `decoding_key`
+        // argues for: an issuer that fixes its document is served again on
+        // the next miss. The pacing must not quietly become a lockout.
+        assert_eq!(
+            fake.jwks_hits(),
+            CALLERS as usize,
+            "a broken issuer stopped being retried"
+        );
+        // Paced: the first attempt waits for nothing, every one after it
+        // waits out the backoff armed by the failure before it.
+        assert!(
+            started.elapsed() >= FAILED_REFRESH_BACKOFF * (CALLERS - 1),
+            "retries after a failed refresh were not paced: {:?}",
+            started.elapsed()
+        );
     }
 }
