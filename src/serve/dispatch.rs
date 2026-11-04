@@ -63,6 +63,30 @@ pub(crate) fn body_declares_stateless(req: &JsonRpcRequest) -> bool {
         })
 }
 
+/// Methods the spec paginates with an opaque cursor.
+const PAGINATED_METHODS: [&str; 4] = [
+    "tools/list",
+    "resources/list",
+    "resources/templates/list",
+    "prompts/list",
+];
+
+/// Whether a request carries a pagination cursor this server never issued.
+///
+/// Every cursor qualifies. We answer each list in one page and never emit
+/// `nextCursor`, so no cursor we could recognise has ever left this process.
+/// `null` counts as absent: a client that spells the first page out that way
+/// is not paginating, and rejecting it would break peers that always send the
+/// key.
+fn carries_unissued_cursor(req: &JsonRpcRequest) -> bool {
+    PAGINATED_METHODS.contains(&req.method.as_str())
+        && req
+            .params
+            .as_ref()
+            .and_then(|p| p.get("cursor"))
+            .is_some_and(|c| !c.is_null())
+}
+
 /// Top-level non-blocking request dispatcher.
 ///
 /// This function is the **only** path that should be called from per-request
@@ -137,6 +161,36 @@ pub(crate) async fn dispatch_request(
                 JsonRpcResponse::unsupported_protocol_version(id, version),
             );
         }
+    }
+
+    // The spec paginates the `*/list` methods with an opaque cursor the
+    // server hands out in `nextCursor`. We never hand one out, so a cursor
+    // on the wire is one we cannot resolve, which is the `-32602` case the
+    // spec names. Answering with the whole list instead reads to the client
+    // as a valid page boundary, and that is how a paginating client ends up
+    // walking page one forever.
+    if carries_unissued_cursor(&req) {
+        let audit = Arc::clone(&proxy.lock().await.audit);
+        return finish_audit(
+            AuditCtx {
+                audit,
+                source,
+                method,
+                tool_name: None,
+                server_name: None,
+                identity,
+                start,
+                decision: None,
+                mrtr_continuation: mrtr_continuation_for_audit,
+                stateless_peer,
+            },
+            JsonRpcResponse::error(
+                id,
+                error_codes::INVALID_PARAMS,
+                "invalid cursor: this server answers every list in a single page \
+                 and issues no nextCursor",
+            ),
+        );
     }
 
     let response = match req.method.as_str() {
@@ -381,6 +435,60 @@ pub(crate) async fn dispatch_request(
             }
             sort_by_field(&mut resources_allowed, "uri");
             let mut result = json!({ "resources": resources_allowed });
+            set_private_cache_hints(&mut result, LIST_TTL_MS, stateless_peer);
+            JsonRpcResponse::success(id, result)
+        }
+        // Optional within the resources capability, which this proxy
+        // advertises unconditionally, so leaving it unrouted made every
+        // parameterized backend resource invisible behind a 404.
+        //
+        // A template names the same resources `resources/list` names, so it
+        // goes through the resource ACL. A leaked template tells the caller
+        // which resources exist on a backend it cannot read.
+        "resources/templates/list" => {
+            audit_logger = discover_for_list(proxy).await;
+            let (templates_snap, template_map_snap, list_audit) = {
+                let p = proxy.lock().await;
+                (
+                    p.resource_templates.clone(),
+                    p.resource_template_map.clone(),
+                    Arc::clone(&p.audit),
+                )
+            };
+            let mut templates_allowed: Vec<Value> = Vec::new();
+            for t in &templates_snap {
+                let ctx = template_map_snap
+                    .get(&t.uri_template)
+                    .map(|(server, orig)| server_auth::ResourceContext {
+                        server_alias: server.as_str(),
+                        resource_uri: orig.as_str(),
+                    });
+                let decision = server_auth::is_resource_allowed(
+                    identity,
+                    &t.uri_template,
+                    acl,
+                    ctx.as_ref(),
+                    true,
+                );
+                if decision.allowed {
+                    templates_allowed.push(serde_json::to_value(t).unwrap());
+                } else {
+                    let srv = template_map_snap
+                        .get(&t.uri_template)
+                        .map(|(s, _)| s.clone());
+                    log_filtered(
+                        &list_audit,
+                        source,
+                        identity,
+                        "resources/templates/list:filtered",
+                        &t.uri_template,
+                        srv,
+                        &decision,
+                    );
+                }
+            }
+            sort_by_field(&mut templates_allowed, "uriTemplate");
+            let mut result = json!({ "resourceTemplates": templates_allowed });
             set_private_cache_hints(&mut result, LIST_TTL_MS, stateless_peer);
             JsonRpcResponse::success(id, result)
         }
@@ -1107,7 +1215,7 @@ pub(crate) fn finish_audit(ctx: AuditCtx<'_>, mut response: JsonRpcResponse) -> 
 mod tests {
     use super::*;
     use crate::cache::ToolCacheStore;
-    use crate::protocol::{Prompt, Resource, Tool};
+    use crate::protocol::{Prompt, Resource, ResourceTemplate, Tool};
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
@@ -1171,6 +1279,7 @@ mod tests {
             description: Some("[sentry] Search for issues".to_string()),
             input_schema: None,
             annotations: None,
+            ..Default::default()
         });
         server.tool_map.insert(
             "sentry__search_issues".to_string(),
@@ -1185,6 +1294,209 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "sentry__search_issues");
         assert_eq!(tools[0]["description"], "[sentry] Search for issues");
+    }
+
+    /// `resources/templates/list` is part of the resources capability, which
+    /// the proxy advertises unconditionally. Without a route the method fell
+    /// through to METHOD_NOT_FOUND, which a stateless peer sees as a 404, so
+    /// a backend exposing parameterized resources was invisible behind the
+    /// proxy.
+    #[tokio::test]
+    async fn resource_templates_list_is_routed() {
+        let server = test_server();
+        let req = JsonRpcRequest::new(10, "resources/templates/list", None);
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert!(
+            result["resourceTemplates"].is_array(),
+            "missing resourceTemplates: {result}"
+        );
+        assert_eq!(result["ttlMs"], LIST_TTL_MS);
+        assert_eq!(result["cacheScope"], "private");
+    }
+
+    /// Every capability the proxy advertises has to be backed by the routes
+    /// that make it true. Advertising one without them is how a client ends
+    /// up being told resources are supported and then getting a 404 from
+    /// `resources/templates/list`.
+    #[tokio::test]
+    async fn every_advertised_capability_is_routed() {
+        use super::super::proxy::{proxy_capabilities, CAPABILITY_ROUTES};
+
+        let advertised = proxy_capabilities();
+        let advertised = advertised.as_object().unwrap();
+        assert_eq!(
+            advertised.len(),
+            CAPABILITY_ROUTES.len(),
+            "capability set and route table disagree"
+        );
+
+        for (capability, methods) in CAPABILITY_ROUTES {
+            assert!(
+                advertised.contains_key(capability),
+                "{capability} has routes but is not advertised"
+            );
+            for method in methods {
+                let server = test_server();
+                let identity = AuthIdentity::anonymous();
+                let req = JsonRpcRequest::new(1, method, None);
+                let resp = dispatch(server, req, &identity, &None).await;
+                if let Some(err) = resp.error {
+                    assert_ne!(
+                        err.code,
+                        error_codes::METHOD_NOT_FOUND,
+                        "{capability} is advertised but {method} is not routed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn template(uri_template: &str, name: &str) -> ResourceTemplate {
+        ResourceTemplate {
+            uri_template: uri_template.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_templates_list_namespaces_the_template() {
+        let mut server = test_server();
+        server.register_resource_templates(
+            "sentry",
+            &[serde_json::from_value(json!({
+                "uriTemplate": "issue://{id}",
+                "name": "Issue",
+                "title": "An issue",
+                "description": "One issue by id"
+            }))
+            .unwrap()],
+        );
+
+        let req = JsonRpcRequest::new(10, "resources/templates/list", None);
+        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
+        let result = resp.result.unwrap();
+        let templates = result["resourceTemplates"].as_array().unwrap();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0]["uriTemplate"], "sentry__issue://{id}");
+        assert_eq!(templates[0]["name"], "sentry__Issue");
+        assert_eq!(templates[0]["description"], "[sentry] One issue by id");
+        assert_eq!(templates[0]["title"], "An issue");
+    }
+
+    /// A template names the resources of one backend, so a caller with no
+    /// grant on that backend must not see it listed. Leaking it tells them
+    /// what exists where they cannot read.
+    #[tokio::test]
+    async fn resource_templates_list_hides_a_backend_the_caller_cannot_read() {
+        let acl: AclConfig = serde_json::from_value(json!({
+            "default": "deny",
+            "roles": {"reader": [{"server": "sentry", "access": "read"}]},
+            "subjects": {"bob": {"roles": ["reader"]}}
+        }))
+        .unwrap();
+
+        let mut server = test_server();
+        server.register_resource_templates("sentry", &[template("issue://{id}", "Issue")]);
+        server.register_resource_templates("slack", &[template("chan://{name}", "Channel")]);
+
+        let bob = AuthIdentity::new("bob", vec![]);
+        let req = JsonRpcRequest::new(10, "resources/templates/list", None);
+        let resp = dispatch(server, req, &bob, &Some(acl)).await;
+        let result = resp.result.unwrap();
+        let templates = result["resourceTemplates"].as_array().unwrap();
+        assert_eq!(
+            templates.len(),
+            1,
+            "slack leaked to a caller with no slack grant: {result}"
+        );
+        assert_eq!(templates[0]["uriTemplate"], "sentry__issue://{id}");
+    }
+
+    /// An identity with no role at all under `default: deny` sees nothing.
+    /// The filter must come from a grant, never from the absence of one.
+    #[tokio::test]
+    async fn resource_templates_list_is_empty_for_an_ungranted_identity() {
+        let acl: AclConfig = serde_json::from_value(json!({
+            "default": "deny",
+            "roles": {"reader": [{"server": "sentry", "access": "read"}]},
+            "subjects": {"bob": {"roles": ["reader"]}}
+        }))
+        .unwrap();
+
+        let mut server = test_server();
+        server.register_resource_templates("sentry", &[template("issue://{id}", "Issue")]);
+
+        let stranger = AuthIdentity::new("mallory", vec![]);
+        let req = JsonRpcRequest::new(10, "resources/templates/list", None);
+        let resp = dispatch(server, req, &stranger, &Some(acl)).await;
+        let result = resp.result.unwrap();
+        assert!(
+            result["resourceTemplates"].as_array().unwrap().is_empty(),
+            "an identity with no grant saw templates: {result}"
+        );
+    }
+
+    /// No ACL and a legacy ACL both keep listing everything, which is what
+    /// every deployment that predates this method already relies on for the
+    /// other three lists.
+    #[tokio::test]
+    async fn resource_templates_list_is_unrestricted_without_a_role_based_acl() {
+        use crate::server_auth::AclPolicy;
+
+        for acl in [None, Some(AclConfig::legacy(AclPolicy::Deny, vec![]))] {
+            let mut server = test_server();
+            server.register_resource_templates("sentry", &[template("issue://{id}", "Issue")]);
+            let req = JsonRpcRequest::new(10, "resources/templates/list", None);
+            let resp = dispatch(server, req, &AuthIdentity::anonymous(), &acl).await;
+            let result = resp.result.unwrap();
+            assert_eq!(
+                result["resourceTemplates"].as_array().unwrap().len(),
+                1,
+                "acl {acl:?} hid a template that was always listed"
+            );
+        }
+    }
+
+    /// We never emit `nextCursor`, so every cursor a client sends is one we
+    /// did not issue. The spec says an unknown cursor SHOULD be rejected
+    /// with -32602. Answering with the whole list instead looks to the
+    /// client like a valid page, which is how a paginating client ends up
+    /// walking page one forever.
+    #[tokio::test]
+    async fn a_cursor_we_never_issued_is_rejected() {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "prompts/list",
+            "resources/templates/list",
+        ] {
+            let server = test_server();
+            let identity = AuthIdentity::anonymous();
+            let req = JsonRpcRequest::new(1, method, Some(json!({"cursor": "page-2"})));
+            let resp = dispatch(server, req, &identity, &None).await;
+            let err = resp
+                .error
+                .unwrap_or_else(|| panic!("{method} accepted a cursor it never issued"));
+            assert_eq!(err.code, error_codes::INVALID_PARAMS, "{method}");
+            assert!(err.message.contains("cursor"), "{method}: {}", err.message);
+        }
+    }
+
+    /// Spelling the absent cursor out is not an error, and neither is a
+    /// params object without one. Rejecting those would break every client
+    /// that sends `cursor: null` on the first page.
+    #[tokio::test]
+    async fn an_absent_cursor_is_not_an_error() {
+        for params in [None, Some(json!({})), Some(json!({"cursor": null}))] {
+            let server = test_server();
+            let identity = AuthIdentity::anonymous();
+            let req = JsonRpcRequest::new(1, "tools/list", params.clone());
+            let resp = dispatch(server, req, &identity, &None).await;
+            assert!(resp.error.is_none(), "rejected params {params:?}");
+        }
     }
 
     #[tokio::test]
@@ -1295,6 +1607,7 @@ mod tests {
                 description: Some("Query".to_string()),
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
         server.discovered_backends.insert("ai-memory".to_string());
@@ -1373,12 +1686,14 @@ mod tests {
             description: Some("[sentry] Search".to_string()),
             input_schema: None,
             annotations: None,
+            ..Default::default()
         });
         server.tools.push(Tool {
             name: "slack__send_message".to_string(),
             description: Some("[slack] Send".to_string()),
             input_schema: None,
             annotations: None,
+            ..Default::default()
         });
 
         let acl = Some(AclConfig::legacy(
@@ -1445,6 +1760,7 @@ mod tests {
                 description: Some("A bug".to_string()),
                 mime_type: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
 
@@ -1470,6 +1786,7 @@ mod tests {
                 description: None,
                 mime_type: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
         server.register_resources(
@@ -1480,6 +1797,7 @@ mod tests {
                 description: None,
                 mime_type: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
 
@@ -1563,6 +1881,7 @@ mod tests {
                 name: "summarize".to_string(),
                 description: Some("Summarize text".to_string()),
                 arguments: None,
+                ..Default::default()
             }],
         );
 
@@ -1585,6 +1904,7 @@ mod tests {
                 name: "summarize".to_string(),
                 description: None,
                 arguments: None,
+                ..Default::default()
             }],
         );
 
@@ -1713,6 +2033,7 @@ mod tests {
             description: None,
             input_schema: None,
             annotations: None,
+            ..Default::default()
         });
         let req = JsonRpcRequest::new(1, "tools/list", None);
         let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
@@ -1895,6 +2216,7 @@ mod tests {
             description: Some("[sentry] Search".to_string()),
             input_schema: Some(json!({"type": "object"})),
             annotations: None,
+            ..Default::default()
         });
         let req = JsonRpcRequest::new(1, "tools/list", None);
         let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
@@ -1928,6 +2250,7 @@ mod tests {
                 description: None,
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             });
         }
         let req = JsonRpcRequest::new(1, "tools/list", None);
@@ -1951,6 +2274,7 @@ mod tests {
                 name: "p".to_string(),
                 description: None,
                 arguments: None,
+                ..Default::default()
             }],
         );
         server.register_prompts(
@@ -1959,6 +2283,7 @@ mod tests {
                 name: "p".to_string(),
                 description: None,
                 arguments: None,
+                ..Default::default()
             }],
         );
         server.register_resources(
@@ -1969,6 +2294,7 @@ mod tests {
                 description: None,
                 mime_type: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
         server.register_resources(
@@ -1979,6 +2305,7 @@ mod tests {
                 description: None,
                 mime_type: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
         let proxy: SharedProxy = Arc::new(Mutex::new(server));
@@ -2133,6 +2460,7 @@ mod tests {
                 description: None,
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             }],
             &[Resource {
                 uri: "doc://1".to_string(),
@@ -2140,11 +2468,14 @@ mod tests {
                 description: None,
                 mime_type: None,
                 annotations: None,
+                ..Default::default()
             }],
+            &[] as &[ResourceTemplate],
             &[Prompt {
                 name: "brief".to_string(),
                 description: None,
                 arguments: None,
+                ..Default::default()
             }],
         );
         Arc::new(Mutex::new(server))
@@ -2622,7 +2953,9 @@ mod tests {
                 description: None,
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             }],
+            &[],
             &[],
             &[],
         );

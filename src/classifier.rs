@@ -361,6 +361,7 @@ mod tests {
             description: desc.map(String::from),
             input_schema: None,
             annotations: None,
+            ..Default::default()
         }
     }
 

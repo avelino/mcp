@@ -425,6 +425,7 @@ mod tests {
                     description: Some("test tool".to_string()),
                     input_schema: None,
                     annotations: None,
+                    ..Default::default()
                 }],
                 subcommand_map: HashMap::from([(format!("{command}_test"), "test".to_string())]),
                 discovered: true,
@@ -610,6 +611,7 @@ mod tests {
                     description: Some("Print API versions".to_string()),
                     input_schema: None,
                     annotations: None,
+                    ..Default::default()
                 }],
                 subcommand_map: HashMap::from([(
                     "kubectl_api_versions".to_string(),

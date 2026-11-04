@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use crate::audit::AuditLogger;
 use crate::cache::ToolCacheStore;
 use crate::client::McpClient;
-use crate::protocol::{self, error_codes, Resource, Tool};
+use crate::protocol::{self, error_codes, Resource, ResourceTemplate, Tool};
 use crate::server_auth::NoAuth;
 
 use super::http::test_router;
@@ -143,7 +143,9 @@ async fn proxy_with_resource(resource_uri: &str) -> SharedProxy {
             description: None,
             mime_type: None,
             annotations: None,
+            ..Default::default()
         }],
+        &[] as &[ResourceTemplate],
         &[],
     );
     proxy

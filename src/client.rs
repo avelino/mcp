@@ -86,6 +86,7 @@ fn build_transport(config: &ServerConfig) -> Result<Arc<dyn Transport>> {
                         description: t.description.clone(),
                         input_schema: t.input_schema.clone(),
                         annotations: None,
+                        extra: Default::default(),
                     }
                 })
                 .collect();
@@ -642,6 +643,16 @@ impl McpClient {
 
     pub async fn list_resources(&self) -> Result<Vec<Resource>> {
         self.list_all("resources/list", "resources").await
+    }
+
+    /// `resources/templates/list`.
+    ///
+    /// Optional within the resources capability, so a backend that answers
+    /// `-32601` here is not broken. Callers treat an error as "no templates"
+    /// the same way they treat one from `resources/list`.
+    pub async fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>> {
+        self.list_all("resources/templates/list", "resourceTemplates")
+            .await
     }
 
     /// `resources/read` returning the raw result, preserving MRTR interim
