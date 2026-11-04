@@ -13,11 +13,11 @@ use super::proxy::{BackendState, DiscoveryFailure, SharedProxy, UsageStats};
 /// `tools/list` is the only required list: a backend that answers `-32601`
 /// to any of the other three simply has none of that primitive, which is not
 /// a discovery failure.
-pub(crate) struct BackendPrimitives {
-    pub(crate) tools: Vec<Tool>,
-    pub(crate) resources: Vec<Resource>,
-    pub(crate) templates: Vec<ResourceTemplate>,
-    pub(crate) prompts: Vec<Prompt>,
+struct BackendPrimitives {
+    tools: Vec<Tool>,
+    resources: Vec<Resource>,
+    templates: Vec<ResourceTemplate>,
+    prompts: Vec<Prompt>,
 }
 
 /// An optional list, empty when the backend does not implement it.

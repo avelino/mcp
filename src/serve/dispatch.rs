@@ -1296,26 +1296,6 @@ mod tests {
         assert_eq!(tools[0]["description"], "[sentry] Search for issues");
     }
 
-    /// `resources/templates/list` is part of the resources capability, which
-    /// the proxy advertises unconditionally. Without a route the method fell
-    /// through to METHOD_NOT_FOUND, which a stateless peer sees as a 404, so
-    /// a backend exposing parameterized resources was invisible behind the
-    /// proxy.
-    #[tokio::test]
-    async fn resource_templates_list_is_routed() {
-        let server = test_server();
-        let req = JsonRpcRequest::new(10, "resources/templates/list", None);
-        let resp = dispatch(server, req, &AuthIdentity::anonymous(), &None).await;
-        assert!(resp.error.is_none(), "{:?}", resp.error);
-        let result = resp.result.unwrap();
-        assert!(
-            result["resourceTemplates"].is_array(),
-            "missing resourceTemplates: {result}"
-        );
-        assert_eq!(result["ttlMs"], LIST_TTL_MS);
-        assert_eq!(result["cacheScope"], "private");
-    }
-
     /// Every capability the proxy advertises has to be backed by the routes
     /// that make it true. Advertising one without them is how a client ends
     /// up being told resources are supported and then getting a 404 from
@@ -2167,7 +2147,12 @@ mod tests {
     /// private on every one of them.
     #[tokio::test]
     async fn test_list_results_are_private_and_carry_a_ttl() {
-        for method in ["tools/list", "resources/list", "prompts/list"] {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
             let req = JsonRpcRequest::new(1, method, None);
             let resp = dispatch(test_server(), req, &AuthIdentity::anonymous(), &None).await;
             let result = resp.result.unwrap();
