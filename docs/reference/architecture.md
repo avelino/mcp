@@ -77,11 +77,12 @@ Tokens are stored per server URL (normalized, trailing slash stripped) — they 
 - `initialize` + `notifications/initialized` → Legacy handshake, for peers that don't answer the probe
 
 **Tool operations:**
-- `tools/list` → Returns available tools (with pagination via cursor)
+- `tools/list` → Returns available tools, aggregated across upstreams
 - `tools/call` → Execute a tool with arguments, get results
 
 **Resource operations:**
 - `resources/list` → Returns available resources, aggregated across upstreams
+- `resources/templates/list` → Returns the URI templates upstreams expose for parameterized resources
 - `resources/read` → Read a specific resource by URI
 
 **Prompt operations:**
@@ -89,6 +90,8 @@ Tokens are stored per server URL (normalized, trailing slash stripped) — they 
 - `prompts/get` → Get a specific prompt by name (with optional arguments)
 
 All three categories use the same `{server}__{name}` aliasing to keep items from different upstreams distinguishable. Sampling and other MCP features are not implemented.
+
+**Pagination:** every `*/list` is answered in a single page. The proxy issues no `nextCursor`, so a `cursor` on an incoming request is one it never handed out, and it is rejected with `-32602` rather than silently answered with page one. Pagination *upstream* is followed: a backend that pages its own list is read to the last page during discovery.
 
 Responses follow the MCP content model: an array of content items, each with a type (`text`, `image`) and corresponding data. The `isError` flag indicates tool-level errors (distinct from protocol errors).
 

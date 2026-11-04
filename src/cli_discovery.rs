@@ -386,6 +386,7 @@ fn build_tool(name: &str, description: &str, flags: &[Flag]) -> Tool {
         },
         input_schema: Some(schema),
         annotations: None,
+        extra: Default::default(),
     }
 }
 

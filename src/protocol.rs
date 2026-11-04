@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Newest MCP revision we speak. Revisions are ISO dates, so string
 /// ordering is chronological ordering — that is what the `>=` checks
@@ -486,6 +486,15 @@ pub struct ToolAnnotations {
     pub open_world_hint: Option<bool>,
 }
 
+/// Fields of a wire object this struct does not name.
+///
+/// Every `*/list` answer the proxy gives is re-serialized from one of these
+/// structs, so a field with no home here is a field the client never sees.
+/// 2026-07-28 keeps adding them (`title`, `outputSchema`, `icons`, `size`,
+/// `_meta`) and an extension may add more, so the catch-all is what keeps a
+/// relay transparent instead of lossy.
+pub type ExtraFields = Map<String, Value>;
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Tool {
     pub name: String,
@@ -499,6 +508,9 @@ pub struct Tool {
     pub input_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
+    /// Spec fields this struct does not name. See [`ExtraFields`].
+    #[serde(flatten)]
+    pub extra: ExtraFields,
 }
 
 #[derive(Debug, Serialize)]
@@ -508,11 +520,14 @@ pub struct ToolCallParams {
     pub arguments: Value,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ToolCallResult {
     pub content: Vec<Content>,
     #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// Spec fields this struct does not name. See [`ExtraFields`].
+    #[serde(flatten)]
+    pub extra: ExtraFields,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -534,7 +549,7 @@ pub struct Content {
 
 // --- MCP Resources ---
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Resource {
     pub uri: String,
     pub name: String,
@@ -544,6 +559,30 @@ pub struct Resource {
     pub mime_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Value>,
+    /// Spec fields this struct does not name. See [`ExtraFields`].
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+/// A `resources/templates/list` entry: a parameterized resource the backend
+/// exposes as a URI template.
+///
+/// Same relay contract as [`Resource`]: `title`, `icons` and `_meta` ride in
+/// [`ExtraFields`] rather than being dropped.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ResourceTemplate {
+    #[serde(rename = "uriTemplate")]
+    pub uri_template: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    /// Spec fields this struct does not name. See [`ExtraFields`].
+    #[serde(flatten)]
+    pub extra: ExtraFields,
 }
 
 // `resources/read` and `prompts/get` results are relayed to the client
@@ -563,13 +602,16 @@ pub struct PromptArgument {
     pub required: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Prompt {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Vec<PromptArgument>>,
+    /// Spec fields this struct does not name. See [`ExtraFields`].
+    #[serde(flatten)]
+    pub extra: ExtraFields,
 }
 
 #[cfg(test)]
@@ -1054,5 +1096,69 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!(PROTOCOL_VERSION)));
+    }
+
+    /// A proxy that re-serializes a backend primitive must not lose the
+    /// fields it does not model. 2026-07-28 defines `title`, `outputSchema`,
+    /// `icons` and `_meta` on a tool, and a client behind the proxy cannot
+    /// validate structured output against a schema it never received.
+    #[test]
+    fn tool_round_trip_keeps_fields_the_struct_does_not_model() {
+        let wire = json!({
+            "name": "search",
+            "description": "find things",
+            "inputSchema": {"type": "object"},
+            "title": "Search",
+            "outputSchema": {"type": "object", "properties": {"hits": {"type": "number"}}},
+            "icons": [{"src": "https://example.test/i.png", "mimeType": "image/png"}],
+            "_meta": {"vendor/flag": true}
+        });
+        let tool: Tool = serde_json::from_value(wire.clone()).unwrap();
+        let back = serde_json::to_value(&tool).unwrap();
+        assert_eq!(
+            back, wire,
+            "tools/list must relay the whole tool definition"
+        );
+    }
+
+    #[test]
+    fn resource_round_trip_keeps_title_and_size() {
+        let wire = json!({
+            "uri": "file:///a.txt",
+            "name": "a.txt",
+            "title": "Notes",
+            "size": 1234,
+            "icons": [{"src": "https://example.test/i.png"}],
+            "_meta": {"vendor/flag": 1}
+        });
+        let resource: Resource = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&resource).unwrap(), wire);
+    }
+
+    #[test]
+    fn prompt_round_trip_keeps_title_and_icons() {
+        let wire = json!({
+            "name": "review",
+            "title": "Review a diff",
+            "icons": [{"src": "https://example.test/i.png"}],
+            "arguments": [{"name": "diff", "required": true}],
+            "_meta": {"vendor/flag": "x"}
+        });
+        let prompt: Prompt = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&prompt).unwrap(), wire);
+    }
+
+    /// `mcp <server> <tool>` prints this struct, so a tool whose real answer
+    /// is in `structuredContent` prints only the human-readable sentence.
+    #[test]
+    fn tool_call_result_round_trip_keeps_structured_content() {
+        let wire = json!({
+            "content": [{"type": "text", "text": "3 hits"}],
+            "structuredContent": {"hits": 3},
+            "resultType": "complete",
+            "_meta": {"vendor/took_ms": 12}
+        });
+        let result: ToolCallResult = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&result).unwrap(), wire);
     }
 }

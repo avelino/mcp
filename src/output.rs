@@ -887,6 +887,7 @@ mod tests {
             description: Some("Search things".to_string()),
             input_schema: None,
             annotations: None,
+            ..Default::default()
         }];
         print_tools_json(&tools).unwrap();
     }
@@ -904,12 +905,14 @@ mod tests {
                 description: Some("Search for issues in Sentry".to_string()),
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             },
             Tool {
                 name: "ping".to_string(),
                 description: None,
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             },
         ];
         print_tools_text(&tools).unwrap();
@@ -936,6 +939,7 @@ mod tests {
                 "required": ["query"]
             })),
             annotations: None,
+            ..Default::default()
         }];
         print_tools_info_text(&tools).unwrap();
     }
@@ -947,6 +951,7 @@ mod tests {
             description: None,
             input_schema: None,
             annotations: None,
+            ..Default::default()
         }];
         print_tools_info_text(&tools).unwrap();
     }
@@ -967,6 +972,7 @@ mod tests {
                 "required": ["q"]
             })),
             annotations: None,
+            ..Default::default()
         }];
         print_tools_info_json(&tools).unwrap();
     }
@@ -978,6 +984,7 @@ mod tests {
         let result = ToolCallResult {
             content: vec![text_content("hello world")],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -987,6 +994,7 @@ mod tests {
         let result = ToolCallResult {
             content: vec![text_content("something failed")],
             is_error: Some(true),
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1002,6 +1010,7 @@ mod tests {
                 resource: None,
             }],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1017,6 +1026,7 @@ mod tests {
                 resource: None,
             }],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1032,6 +1042,7 @@ mod tests {
                 resource: None,
             }],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1047,6 +1058,7 @@ mod tests {
                 resource: None,
             }],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1062,6 +1074,7 @@ mod tests {
                 resource: None,
             }],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1077,6 +1090,7 @@ mod tests {
                 resource: None,
             }],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1096,6 +1110,7 @@ mod tests {
                 },
             ],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1105,6 +1120,7 @@ mod tests {
         let result = ToolCallResult {
             content: vec![],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result_text(&result).unwrap();
     }
@@ -1114,6 +1130,7 @@ mod tests {
         let result = ToolCallResult {
             content: vec![text_content("data")],
             is_error: Some(false),
+            ..Default::default()
         };
         print_tool_result_json(&result).unwrap();
     }
@@ -1278,6 +1295,7 @@ mod tests {
         let result = ToolCallResult {
             content: vec![text_content("ok")],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result(&result, OutputFormat::Json).unwrap();
     }
@@ -1287,6 +1305,7 @@ mod tests {
         let result = ToolCallResult {
             content: vec![text_content("ok")],
             is_error: None,
+            ..Default::default()
         };
         print_tool_result(&result, OutputFormat::Text).unwrap();
     }

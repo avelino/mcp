@@ -82,8 +82,9 @@ What it accepts:
 What it puts in responses **for a client that declared the new revision** — either in `params._meta` or via `MCP-Protocol-Version`. A client that declared neither gets exactly the bytes it got before this revision existed; these fields don't exist in the revision it negotiated, and a client validating results against a closed schema is a real client:
 
 - `resultType` on every result, plus `serverInfo` under `_meta`.
-- `ttlMs` and `cacheScope: "private"` on `tools/list`, `prompts/list`, `resources/list`, `resources/read` and `server/discover`. The scope is always private: those results are ACL-filtered per identity, so a shared cache would hand one identity another's tool list.
-- Deterministic ordering of `tools/list`, `prompts/list` and `resources/list`, so the same set of primitives always serializes identically.
+- `ttlMs` and `cacheScope: "private"` on `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, `resources/read` and `server/discover`. The scope is always private: those results are ACL-filtered per identity, so a shared cache would hand one identity another's tool list.
+- Deterministic ordering of `tools/list`, `prompts/list`, `resources/list` and `resources/templates/list`, so the same set of primitives always serializes identically.
+- Every list answered in one page. No `nextCursor` is issued, and a `cursor` the proxy never issued is rejected with `-32602` instead of being answered with the full list.
 - HTTP status codes the 2026-07-28 transport pins: `-32020` and `-32022` answer `400`, and an unknown method answers `404` — the last one **only** for a client that declared the new revision, since every legacy client has always received `-32601` on a `200` and still does.
 
 `tools/call`, `resources/read` and `prompts/get` are relayed to the backend, so a backend that answers with an interim `input_required` result (Multi Round-Trip Request) passes through intact, along with the `inputResponses` / `requestState` the client sends on the retry. The relay is not blind: whatever `ttlMs` / `cacheScope` a backend puts on such a result is stripped, because the proxy — not the backend — is the one that knows the answer was ACL-filtered. An `input_required` is preserved for every client, including a legacy one — dropping it would report an unfinished exchange as finished.
@@ -681,7 +682,7 @@ Define reusable roles with server-aware, read/write-aware grants:
 | `server` | string or string[] | Server alias(es) to match. `"*"` matches any server. |
 | `access` | `"read"` \| `"write"` \| `"*"` | Access level (see below) |
 | `tools` | string[] | Optional tool name globs to narrow the grant. Empty = all tools. |
-| `resources` | string[] | Optional resource URI globs to narrow the grant. Empty = all resources. Enforced on `resources/list` (filtering) and `resources/read` (gating). |
+| `resources` | string[] | Optional resource URI globs to narrow the grant. Empty = all resources. Enforced on `resources/list` and `resources/templates/list` (filtering) and `resources/read` (gating). |
 | `prompts` | string[] | Optional prompt name globs to narrow the grant. Empty = all prompts. Enforced on `prompts/list` (filtering) and `prompts/get` (gating). |
 | `deny` | bool | If `true`, turns this into an explicit deny that always wins over allows |
 
@@ -756,7 +757,7 @@ The ACL is enforced at every dispatch point in the proxy:
 
 1. **`tools/list`** — The response is **filtered** to only include tools the identity is allowed to call. A tool the identity cannot reach is invisible in the listing.
 2. **`tools/call`** — The request is checked against the ACL before it reaches the backend. Denied requests return a JSON-RPC error (`-32603`) with the subject and tool name.
-3. **`resources/list`** — Filtered to only include resources matching the identity's grants.
+3. **`resources/list`** and **`resources/templates/list`** — Filtered to only include resources matching the identity's grants. A template names the resources of one backend, so a caller with no grant on that backend never sees it listed.
 4. **`resources/read`** — Checked against the ACL before forwarding to the backend.
 5. **`prompts/list`** — Filtered to only include prompts matching the identity's grants.
 6. **`prompts/get`** — Checked against the ACL before forwarding to the backend.

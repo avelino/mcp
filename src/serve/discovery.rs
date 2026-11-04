@@ -4,9 +4,53 @@ use std::time::Duration;
 
 use crate::audit::AuditEntry;
 use crate::client::McpClient;
-use crate::protocol::{Prompt, Resource, Tool};
+use crate::protocol::{Prompt, Resource, ResourceTemplate, Tool};
 
 use super::proxy::{BackendState, DiscoveryFailure, SharedProxy, UsageStats};
+
+/// Everything a backend exposes, gathered in one discovery pass.
+///
+/// `tools/list` is the only required list: a backend that answers `-32601`
+/// to any of the other three simply has none of that primitive, which is not
+/// a discovery failure.
+pub(crate) struct BackendPrimitives {
+    pub(crate) tools: Vec<Tool>,
+    pub(crate) resources: Vec<Resource>,
+    pub(crate) templates: Vec<ResourceTemplate>,
+    pub(crate) prompts: Vec<Prompt>,
+}
+
+/// An optional list, empty when the backend does not implement it.
+fn optional_list<T>(result: Result<Vec<T>>, server: &str, method: &str) -> Vec<T> {
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(server = %server, %method, error = %e, "optional list not supported or failed");
+            Vec::new()
+        }
+    }
+}
+
+/// List every primitive a backend exposes.
+///
+/// `tools/list` goes first and alone: it is the only one whose failure
+/// aborts discovery, and a backend that cannot answer it is not usable. The
+/// three optional lists then go out together, so adding one to this pass
+/// costs no extra round-trip on a cold start.
+async fn list_primitives(client: &McpClient, server: &str) -> Result<BackendPrimitives> {
+    let tools = client.list_tools().await?;
+    let (resources, templates, prompts) = tokio::join!(
+        client.list_resources(),
+        client.list_resource_templates(),
+        client.list_prompts(),
+    );
+    Ok(BackendPrimitives {
+        tools,
+        resources: optional_list(resources, server, "resources/list"),
+        templates: optional_list(templates, server, "resources/templates/list"),
+        prompts: optional_list(prompts, server, "prompts/list"),
+    })
+}
 
 /// Discover tools from every backend that hasn't been seen yet, running all
 /// discoveries in parallel and **without** holding the proxy mutex during I/O.
@@ -40,31 +84,15 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
     let discovery_timeout = Duration::from_secs(30);
 
     // Fire all discoveries in parallel WITHOUT the proxy lock held.
-    type DiscoveryOutcome = std::result::Result<
-        Result<(McpClient, Vec<Tool>, Vec<Resource>, Vec<Prompt>)>,
-        tokio::time::error::Elapsed,
-    >;
+    type DiscoveryOutcome =
+        std::result::Result<Result<(McpClient, BackendPrimitives)>, tokio::time::error::Elapsed>;
     let mut joinset: tokio::task::JoinSet<(String, DiscoveryOutcome)> = tokio::task::JoinSet::new();
     for (name, server_config) in pending {
         joinset.spawn(async move {
             let result = tokio::time::timeout(discovery_timeout, async {
                 let client = McpClient::connect(&server_config).await?;
-                let tools = client.list_tools().await?;
-                let resources = match client.list_resources().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(server = %name, error = %e, "resources/list not supported or failed");
-                        vec![]
-                    }
-                };
-                let prompts = match client.list_prompts().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::debug!(server = %name, error = %e, "prompts/list not supported or failed");
-                        vec![]
-                    }
-                };
-                Ok::<_, anyhow::Error>((client, tools, resources, prompts))
+                let primitives = list_primitives(&client, &name).await?;
+                Ok::<_, anyhow::Error>((client, primitives))
             })
             .await;
             (name, result)
@@ -83,7 +111,7 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
             }
         };
         match result {
-            Ok(Ok((client, tools, resources, prompts))) => {
+            Ok(Ok((client, primitives))) => {
                 let mut p = proxy.lock().await;
                 if p.discovered_backends.contains(&name) {
                     // Lost the race — discard our client; kill_on_drop reaps it.
@@ -92,14 +120,16 @@ pub(crate) async fn discover_pending_backends(proxy: &SharedProxy) {
                 }
                 tracing::info!(
                     server = %name,
-                    tools = tools.len(),
-                    resources = resources.len(),
-                    prompts = prompts.len(),
+                    tools = primitives.tools.len(),
+                    resources = primitives.resources.len(),
+                    templates = primitives.templates.len(),
+                    prompts = primitives.prompts.len(),
                     "discovered capabilities"
                 );
-                p.register_tools(&name, &tools);
-                p.register_resources(&name, &resources);
-                p.register_prompts(&name, &prompts);
+                p.register_tools(&name, &primitives.tools);
+                p.register_resources(&name, &primitives.resources);
+                p.register_resource_templates(&name, &primitives.templates);
+                p.register_prompts(&name, &primitives.prompts);
                 p.backends.insert(
                     name.clone(),
                     BackendState::Connected {
@@ -231,27 +261,13 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
 
     let result = tokio::time::timeout(discovery_timeout, async {
         let client = McpClient::connect(&config).await?;
-        let tools = client.list_tools().await?;
-        let resources = match client.list_resources().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(server = %name, error = %e, "resources/list not supported or failed");
-                vec![]
-            }
-        };
-        let prompts = match client.list_prompts().await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(server = %name, error = %e, "prompts/list not supported or failed");
-                vec![]
-            }
-        };
-        Ok::<_, anyhow::Error>((client, tools, resources, prompts))
+        let primitives = list_primitives(&client, &name).await?;
+        Ok::<_, anyhow::Error>((client, primitives))
     })
     .await;
 
     match result {
-        Ok(Ok((client, tools, resources, prompts))) => {
+        Ok(Ok((client, primitives))) => {
             let mut p = proxy.lock().await;
             if p.discovered_backends.contains(&name) {
                 drop(client);
@@ -259,14 +275,16 @@ pub(crate) async fn discover_single_backend(proxy: &SharedProxy, backend_name: &
             }
             tracing::info!(
                 server = %name,
-                tools = tools.len(),
-                resources = resources.len(),
-                prompts = prompts.len(),
+                tools = primitives.tools.len(),
+                resources = primitives.resources.len(),
+                templates = primitives.templates.len(),
+                prompts = primitives.prompts.len(),
                 "discovered capabilities"
             );
-            p.register_tools(&name, &tools);
-            p.register_resources(&name, &resources);
-            p.register_prompts(&name, &prompts);
+            p.register_tools(&name, &primitives.tools);
+            p.register_resources(&name, &primitives.resources);
+            p.register_resource_templates(&name, &primitives.templates);
+            p.register_prompts(&name, &primitives.prompts);
             p.backends.insert(
                 name.clone(),
                 BackendState::Connected {
@@ -393,21 +411,7 @@ pub(crate) async fn connect_backend(
 
     tracing::info!(server = %server_name, "connecting");
     let client = McpClient::connect(&config).await?;
-    let tools = client.list_tools().await?;
-    let resources = match client.list_resources().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(server = %server_name, error = %e, "resources/list not supported or failed");
-            vec![]
-        }
-    };
-    let prompts = match client.list_prompts().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!(server = %server_name, error = %e, "prompts/list not supported or failed");
-            vec![]
-        }
-    };
+    let primitives = list_primitives(&client, server_name).await?;
     let client = Arc::new(client);
 
     let prev = {
@@ -415,9 +419,10 @@ pub(crate) async fn connect_backend(
         let prev = p.install_client(
             server_name,
             Arc::clone(&client),
-            &tools,
-            &resources,
-            &prompts,
+            &primitives.tools,
+            &primitives.resources,
+            &primitives.templates,
+            &primitives.prompts,
         );
         // Persist new classifications from register_tools.
         p.classifier_cache.save();
