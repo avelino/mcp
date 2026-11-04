@@ -14,9 +14,11 @@
 //!   their own files as the implementation tasks progress; declared
 //!   here once they exist.
 
+mod assertion;
 mod authorize;
 mod cidr;
 mod config;
+mod jwks;
 mod jwt;
 mod metadata;
 mod provider;
@@ -34,8 +36,9 @@ mod test_helpers;
 
 pub use config::OAuthAsConfig;
 pub use provider::OAuthAsAuth;
-pub use state::AsState;
+pub use state::{AsState, MAX_SEEN_JTI};
 pub use store::{load as load_state, save as save_state};
+pub use types::RegisteredClient;
 
 use std::sync::Arc;
 

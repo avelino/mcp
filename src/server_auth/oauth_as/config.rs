@@ -4,6 +4,8 @@
 //! AS if misconfigured (short JWT secret, missing CIDR allowlist, plain
 //! HTTP issuer) is rejected at boot via [`OAuthAsConfig::validate`].
 
+use std::collections::HashSet;
+
 use anyhow::{bail, Result};
 use serde::Deserialize;
 
@@ -76,6 +78,42 @@ pub struct OAuthAsConfig {
     /// between OAuth-authenticated users and static-bearer ones.
     #[serde(default)]
     pub injected_roles: Vec<String>,
+
+    /// Identity providers whose signed identity assertions are exchanged
+    /// for an access token without a consent screen. Empty (the default)
+    /// leaves the grant disabled, so existing configs are unaffected.
+    #[serde(default)]
+    pub trusted_issuers: Vec<TrustedIssuer>,
+
+    /// Clients known ahead of time, so they need no dynamic registration.
+    #[serde(default)]
+    pub static_clients: Vec<StaticClient>,
+}
+
+/// An identity provider trusted to vouch for users via signed assertions.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedIssuer {
+    /// Matched byte-for-byte against the assertion's `iss`.
+    pub issuer: String,
+
+    /// Distinguishes several tenants served from one `issuer` URL.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+
+    /// An assertion's email must belong to one of these domains. Required
+    /// non-empty: without it any user the issuer vouches for gets in.
+    pub allowed_email_domains: Vec<String>,
+
+    /// Roles granted to users arriving through this issuer.
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticClient {
+    pub client_id: String,
 }
 
 fn default_trusted_user_header() -> String {
@@ -110,6 +148,7 @@ impl OAuthAsConfig {
         if !self.issuer_url.starts_with("https://") && !self.issuer_url.starts_with("http://") {
             bail!("oauthAs.issuerUrl must be an http(s) URL");
         }
+        validate_header_safe_url("oauthAs.issuerUrl", &self.issuer_url)?;
         if self.jwt_secret.len() < MIN_JWT_SECRET_BYTES {
             bail!(
                 "oauthAs.jwtSecret must be at least {} bytes (got {})",
@@ -165,8 +204,93 @@ impl OAuthAsConfig {
                 bail!("oauthAs.scopesSupported must not contain empty strings");
             }
         }
+        let mut client_ids = HashSet::new();
+        for c in &self.static_clients {
+            if c.client_id.is_empty() {
+                bail!("oauthAs.staticClients must not contain an empty clientId");
+            }
+            // `set_static_clients` keys a map on `clientId`, so a duplicate
+            // would be dropped without a word.
+            if !client_ids.insert(&c.client_id) {
+                bail!(
+                    "oauthAs.staticClients must not list the same clientId twice ({})",
+                    c.client_id
+                );
+            }
+        }
+        for (i, t) in self.trusted_issuers.iter().enumerate() {
+            let at = format!("oauthAs.trustedIssuers[{i}]");
+            if !t.issuer.starts_with("https://") {
+                bail!("{at}.issuer must be an https URL");
+            }
+            validate_header_safe_url(&format!("{at}.issuer"), &t.issuer)?;
+            // An empty string names no tenant; it is what an env-var
+            // template that expanded to nothing leaves behind. Omitting the
+            // key means "every workspace behind this issuer", which is a
+            // different decision than the operator spelled out.
+            if t.tenant_id.as_deref() == Some("") {
+                bail!("{at}.tenantId must not be empty — omit the key instead");
+            }
+            if t.allowed_email_domains.is_empty() {
+                bail!("{at}.allowedEmailDomains must list at least one domain");
+            }
+            if t.allowed_email_domains.iter().any(String::is_empty) {
+                bail!("{at}.allowedEmailDomains must not contain empty strings");
+            }
+            if t.roles.iter().any(String::is_empty) {
+                bail!("{at}.roles must not contain empty strings");
+            }
+            // An entry that cannot resolve to itself is unreachable (same
+            // issuer and tenant twice, or a tenant-less twin of a tenanted
+            // entry), so the ambiguity is caught here, not at exchange time.
+            if let Err(why) = self.resolve_issuer(&t.issuer, t.tenant_id.as_deref()) {
+                bail!("{at} is not uniquely addressable: {why}");
+            }
+        }
         Ok(())
     }
+
+    /// Picks the trusted issuer for an assertion. Exact string match on
+    /// `iss`: normalizing or prefix-matching would let a look-alike issuer
+    /// ride on a trusted entry. `aud_tenant` disambiguates entries that
+    /// share an issuer URL and must name an entry for that same issuer.
+    pub fn resolve_issuer(
+        &self,
+        iss: &str,
+        aud_tenant: Option<&str>,
+    ) -> Result<&TrustedIssuer, &'static str> {
+        let mut matches = self
+            .trusted_issuers
+            .iter()
+            .filter(|t| t.issuer == iss)
+            // A `None` on either side does not discriminate. An entry without
+            // `tenantId` vouches for every workspace behind its issuer, which
+            // is the shape of a config serving one customer. An assertion
+            // without `aud_tenant` matches every entry for the issuer, so two
+            // tenanted entries stay ambiguous instead of silently resolving to
+            // whichever was listed first.
+            .filter(|t| {
+                t.tenant_id.is_none()
+                    || aud_tenant.is_none()
+                    || t.tenant_id.as_deref() == aud_tenant
+            });
+        match (matches.next(), matches.next()) {
+            (Some(t), None) => Ok(t),
+            (None, _) => Err("issuer is not trusted"),
+            (Some(_), Some(_)) => Err("issuer is ambiguous, tenant required"),
+        }
+    }
+}
+
+/// The issuer URL is echoed into a `WWW-Authenticate` header; a quote or
+/// control character there yields a malformed or silently dropped header,
+/// so it is refused at load instead of at the point of use.
+fn validate_header_safe_url(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(|c| c == '"' || c.is_ascii_control()) {
+        bail!("{field} must not contain a double quote or control character");
+    }
+    url::Url::parse(value).map_err(|e| anyhow::anyhow!("{field} is not a valid URL: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -186,6 +310,17 @@ mod tests {
             scopes_supported: vec!["mcp".to_string()],
             redirect_uri_allowlist: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
             injected_roles: vec!["oauth-user".to_string()],
+            trusted_issuers: vec![],
+            static_clients: vec![],
+        }
+    }
+
+    fn issuer(iss: &str, tenant: Option<&str>) -> TrustedIssuer {
+        TrustedIssuer {
+            issuer: iss.to_string(),
+            tenant_id: tenant.map(str::to_string),
+            allowed_email_domains: vec!["example.com".to_string()],
+            roles: vec![],
         }
     }
 
@@ -287,5 +422,232 @@ mod tests {
         assert_eq!(cfg.trusted_user_header, "x-forwarded-user");
         assert_eq!(cfg.access_token_ttl_seconds, 3600);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn test_config_without_trusted_issuers_still_validates() {
+        // Shape of a servers.json written before enterprise-managed auth.
+        let json = r#"{
+            "issuerUrl": "https://mcp.example.com",
+            "jwtSecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "trustedUserHeader": "x-forwarded-user",
+            "trustedGroupsHeader": "x-forwarded-groups",
+            "trustedSourceCidrs": ["127.0.0.1/32"],
+            "accessTokenTtlSeconds": 3600,
+            "refreshTokenTtlSeconds": 2592000,
+            "authorizationCodeTtlSeconds": 60,
+            "scopesSupported": ["mcp"],
+            "redirectUriAllowlist": ["https://claude.ai/api/mcp/auth_callback"],
+            "injectedRoles": ["oauth-user"]
+        }"#;
+        let cfg: OAuthAsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.trusted_issuers.is_empty());
+        assert!(cfg.static_clients.is_empty());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn test_trusted_issuers_camel_case_deserialization() {
+        let json = r#"{
+            "issuerUrl": "https://mcp.example.com",
+            "jwtSecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "trustedSourceCidrs": ["127.0.0.1/32"],
+            "redirectUriAllowlist": ["https://claude.ai/api/mcp/auth_callback"],
+            "trustedIssuers": [{
+                "issuer": "https://idp.example.com",
+                "tenantId": "t1",
+                "allowedEmailDomains": ["example.com"],
+                "roles": ["enterprise"]
+            }],
+            "staticClients": [{"clientId": "claude"}]
+        }"#;
+        let cfg: OAuthAsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.trusted_issuers[0].tenant_id.as_deref(), Some("t1"));
+        assert_eq!(cfg.static_clients[0].client_id, "claude");
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn test_trusted_issuer_requires_https() {
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("http://x.com", None)];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("trustedIssuers"));
+    }
+
+    #[test]
+    fn test_trusted_issuer_requires_email_domains() {
+        let mut c = valid_config();
+        let mut i = issuer("https://a.com", None);
+        i.allowed_email_domains.clear();
+        c.trusted_issuers = vec![i];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("allowedEmailDomains"));
+    }
+
+    #[test]
+    fn test_trusted_issuer_empty_role_rejected() {
+        let mut c = valid_config();
+        let mut i = issuer("https://a.com", None);
+        i.roles = vec![String::new()];
+        c.trusted_issuers = vec![i];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("roles"));
+    }
+
+    #[test]
+    fn test_trusted_issuer_with_control_character_is_rejected() {
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("https://a.com/\n", None)];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_static_client_empty_id_rejected() {
+        let mut c = valid_config();
+        c.static_clients = vec![StaticClient {
+            client_id: String::new(),
+        }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("staticClients"));
+    }
+
+    #[test]
+    fn test_duplicate_static_client_id_is_refused() {
+        // `set_static_clients` collects into a map keyed by `clientId`, so a
+        // duplicate silently wins over the entry above it — an operator who
+        // pasted a block twice and edited one copy gets whichever landed
+        // last, with no hint that the other was dropped.
+        let mut c = valid_config();
+        c.static_clients = vec![
+            StaticClient {
+                client_id: "claude".to_string(),
+            },
+            StaticClient {
+                client_id: "claude".to_string(),
+            },
+        ];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("staticClients"), "{err}");
+    }
+
+    #[test]
+    fn test_empty_tenant_id_is_refused() {
+        // `Some("")` identifies no tenant: it can only come from an env-var
+        // template that expanded to nothing. Accepted, it reaches
+        // `resolve_issuer` as a tenant that matches no assertion.
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("https://a.com", Some(""))];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tenantId"), "{err}");
+    }
+
+    #[test]
+    fn test_issuer_url_with_quote_is_rejected() {
+        let mut c = valid_config();
+        c.issuer_url = "https://mcp.example.com/\"x".to_string();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_issuer_url_with_control_character_is_rejected() {
+        let mut c = valid_config();
+        c.issuer_url = "https://mcp.example.com/\r\nX-Injected: 1".to_string();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_duplicate_issuer_and_tenant_rejected() {
+        let mut c = valid_config();
+        c.trusted_issuers = vec![
+            issuer("https://a.com", Some("t1")),
+            issuer("https://a.com", Some("t1")),
+        ];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("uniquely addressable"));
+    }
+
+    #[test]
+    fn test_resolve_issuer_by_exact_string() {
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("https://a.com", None)];
+        assert_eq!(
+            c.resolve_issuer("https://a.com", None).unwrap().issuer,
+            "https://a.com"
+        );
+        // No normalization and no prefix match: either would let a
+        // look-alike issuer ride on a trusted entry.
+        assert!(c.resolve_issuer("https://a.com/", None).is_err());
+        assert!(c.resolve_issuer("https://a.com.evil.net", None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_issuer_ambiguous_is_rejected() {
+        let mut c = valid_config();
+        c.trusted_issuers = vec![
+            issuer("https://a.com", Some("t1")),
+            issuer("https://a.com", Some("t2")),
+        ];
+        assert!(c.resolve_issuer("https://a.com", None).is_err());
+    }
+
+    #[test]
+    fn test_resolve_issuer_by_tenant_disambiguates() {
+        let mut c = valid_config();
+        c.trusted_issuers = vec![
+            issuer("https://a.com", Some("t1")),
+            issuer("https://a.com", Some("t2")),
+        ];
+        let got = c.resolve_issuer("https://a.com", Some("t2")).unwrap();
+        assert_eq!(got.tenant_id.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn test_entry_without_tenant_id_accepts_assertion_carrying_aud_tenant() {
+        // An entry with no `tenantId` does not discriminate by tenant, so it
+        // vouches for every workspace behind its issuer. Requiring the
+        // assertion to carry no `aud_tenant` refuses the production shape —
+        // no `tenantId` configured, an IdP that always names the workspace —
+        // and refuses it as "issuer is not trusted", which sends the operator
+        // to check an issuer URL that was right all along.
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("https://a.com", None)];
+        c.validate().unwrap();
+        assert_eq!(
+            c.resolve_issuer("https://a.com", Some("any-workspace"))
+                .unwrap()
+                .issuer,
+            "https://a.com"
+        );
+        // And still resolves when nothing names a tenant.
+        assert!(c.resolve_issuer("https://a.com", None).is_ok());
+    }
+
+    #[test]
+    fn test_entry_with_tenant_id_still_rejects_a_different_tenant() {
+        // The other half of the rule, and the reason the fix is not simply
+        // "ignore the tenant": an entry that names a tenant grants its roles
+        // and its domains to that workspace alone.
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("https://a.com", Some("t1"))];
+        c.validate().unwrap();
+        assert!(c.resolve_issuer("https://a.com", Some("t2")).is_err());
+        assert_eq!(
+            c.resolve_issuer("https://a.com", Some("t1"))
+                .unwrap()
+                .tenant_id
+                .as_deref(),
+            Some("t1")
+        );
+    }
+
+    #[test]
+    fn test_resolve_issuer_tenant_must_also_match_issuer() {
+        let mut c = valid_config();
+        c.trusted_issuers = vec![
+            issuer("https://a.com", Some("t1")),
+            issuer("https://b.com", Some("t2")),
+        ];
+        assert!(c.resolve_issuer("https://a.com", Some("t2")).is_err());
     }
 }

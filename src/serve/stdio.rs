@@ -26,6 +26,9 @@ pub async fn run_stdio(mut config: Config, filter: InstanceFilter) -> Result<()>
     #[cfg(unix)]
     let boot = BootInvariants {
         oauth_as_enabled: false,
+        // Stdio mounts no routes at all, so nothing here was built from an
+        // issuer URL and nothing can go stale against one.
+        oauth_as_issuer_url: None,
         audit_output: config.audit.output.clone(),
         bind_addr: None,
     };
