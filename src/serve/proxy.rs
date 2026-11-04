@@ -192,6 +192,24 @@ pub(crate) fn backend_prompt_get_params(params: Option<&Value>, original_name: &
     Value::Object(out)
 }
 
+/// The namespaced keys one backend owns, read from the map that records the
+/// owner instead of from the key's prefix.
+///
+/// A prefix match is wrong here. Nothing stops a config from naming one
+/// backend `docs` and another `docs__archive`, and `docs__` prefixes every
+/// key the second one owns. Since each `register_*` unregisters first, even
+/// for an empty list, a prefix match lets whichever backend the parallel
+/// discovery commits second delete the other one's primitives.
+fn keys_owned_by(
+    map: &HashMap<String, (String, String)>,
+    server_name: &str,
+) -> std::collections::HashSet<String> {
+    map.iter()
+        .filter(|(_, (server, _))| server == server_name)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
 /// Tracks per-backend usage patterns for adaptive idle timeout.
 #[derive(Debug, Clone)]
 pub(crate) struct UsageStats {
@@ -583,10 +601,10 @@ impl ProxyServer {
     }
 
     pub(crate) fn unregister_tools(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}{SEPARATOR}");
-        self.tools.retain(|t| !t.name.starts_with(&prefix));
-        self.tool_map.retain(|k, _| !k.starts_with(&prefix));
-        self.classifications.retain(|k, _| !k.starts_with(&prefix));
+        let owned = keys_owned_by(&self.tool_map, server_name);
+        self.tools.retain(|t| !owned.contains(&t.name));
+        self.classifications.retain(|k, _| !owned.contains(k));
+        self.tool_map.retain(|_, (server, _)| server != server_name);
     }
 
     /// Same replace-don't-append contract as [`Self::register_tools`].
@@ -617,9 +635,10 @@ impl ProxyServer {
     }
 
     pub(crate) fn unregister_resources(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}{SEPARATOR}");
-        self.resources.retain(|r| !r.uri.starts_with(&prefix));
-        self.resource_map.retain(|k, _| !k.starts_with(&prefix));
+        let owned = keys_owned_by(&self.resource_map, server_name);
+        self.resources.retain(|r| !owned.contains(&r.uri));
+        self.resource_map
+            .retain(|_, (server, _)| server != server_name);
     }
 
     /// Same replace-don't-append contract as [`Self::register_tools`].
@@ -657,11 +676,11 @@ impl ProxyServer {
     }
 
     pub(crate) fn unregister_resource_templates(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}{SEPARATOR}");
+        let owned = keys_owned_by(&self.resource_template_map, server_name);
         self.resource_templates
-            .retain(|t| !t.uri_template.starts_with(&prefix));
+            .retain(|t| !owned.contains(&t.uri_template));
         self.resource_template_map
-            .retain(|k, _| !k.starts_with(&prefix));
+            .retain(|_, (server, _)| server != server_name);
     }
 
     /// Same replace-don't-append contract as [`Self::register_tools`].
@@ -690,17 +709,18 @@ impl ProxyServer {
     }
 
     pub(crate) fn unregister_prompts(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}{SEPARATOR}");
-        self.prompts.retain(|p| !p.name.starts_with(&prefix));
-        self.prompt_map.retain(|k, _| !k.starts_with(&prefix));
+        let owned = keys_owned_by(&self.prompt_map, server_name);
+        self.prompts.retain(|p| !owned.contains(&p.name));
+        self.prompt_map
+            .retain(|_, (server, _)| server != server_name);
     }
 
     /// Collect cached tools for a server from the current tool list (for storing in Disconnected state).
     pub(crate) fn collect_cached_tools(&self, server_name: &str) -> Vec<Tool> {
-        let prefix = format!("{server_name}{SEPARATOR}");
+        let owned = keys_owned_by(&self.tool_map, server_name);
         self.tools
             .iter()
-            .filter(|t| t.name.starts_with(&prefix))
+            .filter(|t| owned.contains(&t.name))
             .cloned()
             .collect()
     }
@@ -721,11 +741,7 @@ impl ProxyServer {
                     usage_stats: UsageStats::new(),
                 },
             );
-            let tool_count = self
-                .tools
-                .iter()
-                .filter(|t| t.name.starts_with(&format!("{name}{SEPARATOR}")))
-                .count();
+            let tool_count = keys_owned_by(&self.tool_map, &name).len();
             tracing::info!(server = %name, tool_count, "tools loaded from cache");
         }
     }
@@ -749,24 +765,29 @@ impl ProxyServer {
     pub(crate) fn snapshot_cache_entries(&self) -> Vec<(String, BackendToolCache)> {
         let mut out = Vec::new();
         for name in &self.discovered_backends {
-            let prefix = format!("{name}{SEPARATOR}");
+            // The owner and the original name both come from `tool_map`
+            // rather than from the key's prefix. Stripping `docs__` off a
+            // tool owned by `docs__archive` yields `archive__search`, which
+            // is the name a warm start would then call the backend with.
             let tools: Vec<Tool> = self
                 .tools
                 .iter()
-                .filter(|t| t.name.starts_with(&prefix))
-                .map(|t| {
-                    let original_name = t.name.strip_prefix(&prefix).unwrap_or(&t.name).to_string();
+                .filter_map(|t| {
+                    let (owner, original_name) = self.tool_map.get(&t.name)?;
+                    if owner != name {
+                        return None;
+                    }
                     let original_desc = t.description.as_ref().map(|d| {
                         let tag = format!("[{name}] ");
                         d.strip_prefix(&tag).unwrap_or(d).to_string()
                     });
-                    Tool {
-                        name: original_name,
+                    Some(Tool {
+                        name: original_name.clone(),
                         description: original_desc,
                         input_schema: t.input_schema.clone(),
                         annotations: t.annotations.clone(),
                         extra: t.extra.clone(),
-                    }
+                    })
                 })
                 .collect();
 
@@ -1780,6 +1801,87 @@ mod tests {
     /// A reload or an idle reap drops a backend's primitives. Templates have
     /// to go with them, or a removed backend keeps advertising resources it
     /// no longer serves.
+    /// The warm-start cache strips the namespace back off by prefix, so with
+    /// `docs` and `docs__archive` the first backend claimed the second's
+    /// tools and stored them under a mangled name (`archive__search`).
+    #[test]
+    fn the_cache_snapshot_assigns_each_tool_to_its_real_owner() {
+        let mut server = test_server();
+        for alias in ["docs", "docs__archive"] {
+            server
+                .config_hashes
+                .insert(alias.to_string(), format!("hash-{alias}"));
+            server.discovered_backends.insert(alias.to_string());
+        }
+        server.register_tools(
+            "docs__archive",
+            &[serde_json::from_value(json!({"name": "search"})).unwrap()],
+        );
+        server.register_tools(
+            "docs",
+            &[serde_json::from_value(json!({"name": "lookup"})).unwrap()],
+        );
+
+        let entries = server.snapshot_cache_entries();
+        let names = |alias: &str| -> Vec<String> {
+            entries
+                .iter()
+                .find(|(n, _)| n == alias)
+                .map(|(_, e)| e.tools.iter().map(|t| t.name.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(names("docs"), vec!["lookup".to_string()]);
+        assert_eq!(names("docs__archive"), vec!["search".to_string()]);
+
+        assert_eq!(
+            server
+                .collect_cached_tools("docs")
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["docs__lookup".to_string()]
+        );
+    }
+
+    /// Config allows an alias that is another alias plus the separator
+    /// (`docs` and `docs__archive`), and `docs__` prefixes every
+    /// `docs__archive__*` key. Registration unregisters first even for an
+    /// empty list, so with that pair whichever backend the parallel
+    /// discovery commits second used to wipe the other one's primitives.
+    #[test]
+    fn unregistering_a_backend_leaves_a_prefix_sharing_alias_alone() {
+        let mut server = test_server();
+        let t: Tool = serde_json::from_value(json!({"name": "search"})).unwrap();
+        let r: crate::protocol::Resource =
+            serde_json::from_value(json!({"uri": "u", "name": "n"})).unwrap();
+        let pr: crate::protocol::Prompt = serde_json::from_value(json!({"name": "p"})).unwrap();
+        let tpl: ResourceTemplate =
+            serde_json::from_value(json!({"uriTemplate": "u://{id}", "name": "n"})).unwrap();
+
+        server.register_tools("docs__archive", &[t]);
+        server.register_resources("docs__archive", &[r]);
+        server.register_prompts("docs__archive", &[pr]);
+        server.register_resource_templates("docs__archive", &[tpl]);
+
+        // `docs` is discovered second and happens to expose nothing.
+        server.register_tools("docs", &[]);
+        server.register_resources("docs", &[]);
+        server.register_prompts("docs", &[]);
+        server.register_resource_templates("docs", &[]);
+
+        println!(
+            "after registering empty `docs`: tools={} resources={} prompts={} templates={}",
+            server.tools.len(),
+            server.resources.len(),
+            server.prompts.len(),
+            server.resource_templates.len()
+        );
+        assert_eq!(server.tools.len(), 1, "tools");
+        assert_eq!(server.resources.len(), 1, "resources");
+        assert_eq!(server.prompts.len(), 1, "prompts");
+        assert_eq!(server.resource_templates.len(), 1, "templates");
+    }
+
     #[test]
     fn test_register_unregister_resource_templates() {
         let mut server = test_server();
