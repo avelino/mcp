@@ -254,6 +254,11 @@ impl OAuthAsConfig {
     /// `iss`: normalizing or prefix-matching would let a look-alike issuer
     /// ride on a trusted entry. `aud_tenant` disambiguates entries that
     /// share an issuer URL and must name an entry for that same issuer.
+    ///
+    /// The tenant rule runs one way only: an entry that declares
+    /// `tenantId` is reachable solely by an assertion naming that tenant,
+    /// while an entry that declares none keeps vouching for every
+    /// workspace behind its issuer.
     pub fn resolve_issuer(
         &self,
         iss: &str,
@@ -263,21 +268,32 @@ impl OAuthAsConfig {
             .trusted_issuers
             .iter()
             .filter(|t| t.issuer == iss)
-            // A `None` on either side does not discriminate. An entry without
-            // `tenantId` vouches for every workspace behind its issuer, which
-            // is the shape of a config serving one customer. An assertion
-            // without `aud_tenant` matches every entry for the issuer, so two
-            // tenanted entries stay ambiguous instead of silently resolving to
-            // whichever was listed first.
-            .filter(|t| {
-                t.tenant_id.is_none()
-                    || aud_tenant.is_none()
-                    || t.tenant_id.as_deref() == aud_tenant
-            });
+            // Only a `None` on the *entry* side stops discriminating: an
+            // entry without `tenantId` vouches for every workspace behind
+            // its issuer, which is the shape of a config serving one
+            // customer and the one running in production today.
+            //
+            // An entry that declares `tenantId` requires the assertion to
+            // name that same tenant. `aud_tenant: None` no longer satisfies
+            // it: an assertion that identifies no workspace must not be
+            // handed a workspace's roles and domains, and Anthropic
+            // documents that a Claude-issued assertion may omit the claim.
+            .filter(|t| t.tenant_id.is_none() || t.tenant_id.as_deref() == aud_tenant);
         match (matches.next(), matches.next()) {
             (Some(t), None) => Ok(t),
-            (None, _) => Err("issuer is not trusted"),
             (Some(_), Some(_)) => Err("issuer is ambiguous, tenant required"),
+            // Nothing matched. The issuer being configured but tenanted is
+            // worth its own answer: it is the one case where the operator's
+            // issuer URL is right and the fix is on the tenant, so
+            // collapsing it into "not trusted" sends them to check a URL
+            // that was never wrong. Which tenant an issuer serves stays
+            // unsaid — `/token` takes no credential to reach.
+            (None, _)
+                if aud_tenant.is_none() && self.trusted_issuers.iter().any(|t| t.issuer == iss) =>
+            {
+                Err("issuer requires a tenant the assertion does not name")
+            }
+            (None, _) => Err("issuer is not trusted"),
         }
     }
 }
@@ -639,6 +655,82 @@ mod tests {
                 .as_deref(),
             Some("t1")
         );
+    }
+
+    #[test]
+    fn test_tenanted_entry_refuses_an_assertion_naming_no_tenant() {
+        // The finding. One entry carrying `tenantId`, an assertion that
+        // names no tenant: the old `aud_tenant.is_none()` arm resolved it
+        // to that entry anyway, so configuring `tenantId` protected
+        // nothing against an assertion that simply omits the claim — and
+        // Anthropic documents that a Claude-issued assertion may omit it.
+        //
+        // The refusal names the tenant rather than the issuer, because
+        // the issuer URL was right and sending the operator to check it
+        // is the wrong errand.
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("https://a.com", Some("t1"))];
+        c.validate().unwrap();
+        let err = c.resolve_issuer("https://a.com", None).unwrap_err();
+        assert_eq!(err, "issuer requires a tenant the assertion does not name");
+    }
+
+    #[test]
+    fn test_two_tenanted_entries_and_no_tenant_still_name_the_tenant() {
+        // The case the naive filter change loses: before the fix this was
+        // the one refusal that told the operator a tenant was required,
+        // and narrowing the filter alone collapses it into "issuer is not
+        // trusted", which is a worse answer than the buggy code gave.
+        let mut c = valid_config();
+        c.trusted_issuers = vec![
+            issuer("https://a.com", Some("t1")),
+            issuer("https://a.com", Some("t2")),
+        ];
+        let err = c.resolve_issuer("https://a.com", None).unwrap_err();
+        assert_eq!(err, "issuer requires a tenant the assertion does not name");
+    }
+
+    #[test]
+    fn test_an_unknown_issuer_still_reports_the_issuer_not_the_tenant() {
+        // The other side of the message split: nothing is configured for
+        // this `iss` at all, so the tenant has nothing to do with it.
+        let mut c = valid_config();
+        c.trusted_issuers = vec![issuer("https://a.com", Some("t1"))];
+        assert_eq!(
+            c.resolve_issuer("https://b.com", None).unwrap_err(),
+            "issuer is not trusted"
+        );
+        assert_eq!(
+            c.resolve_issuer("https://b.com", Some("t1")).unwrap_err(),
+            "issuer is not trusted"
+        );
+        // And a tenant the issuer does not serve stays "not trusted": the
+        // pair is what is untrusted, and saying which half was wrong is a
+        // config oracle for an endpoint that takes no credential.
+        assert_eq!(
+            c.resolve_issuer("https://a.com", Some("t2")).unwrap_err(),
+            "issuer is not trusted"
+        );
+    }
+
+    #[test]
+    fn test_a_tenantless_twin_of_a_tenanted_entry_is_still_refused_at_boot() {
+        // Backwards compatibility on the boot check. A tenant-less entry
+        // vouches for every workspace behind its issuer, so it swallows
+        // the tenanted entry beside it — whichever order they are listed
+        // in. Narrowing `resolve_issuer` moves which index reports it, so
+        // this pins that the config shape is still refused.
+        let mut c = valid_config();
+        c.trusted_issuers = vec![
+            issuer("https://a.com", None),
+            issuer("https://a.com", Some("t1")),
+        ];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("uniquely addressable"), "{err}");
+
+        c.trusted_issuers.reverse();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("uniquely addressable"), "{err}");
     }
 
     #[test]

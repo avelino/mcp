@@ -32,6 +32,15 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// to leave room inside Claude's 10s for everything else `/token` does.
 const _: () = assert!(FETCH_TIMEOUT.as_secs() * 2 < 10);
 
+/// How many redirects a key fetch may be sent on. Enough for the
+/// apex-to-CDN shape real issuers use, and well short of `reqwest`'s
+/// default ten — every hop is another host answering inside the single
+/// [`FETCH_TIMEOUT`] the whole fetch gets.
+///
+/// Counted the way `reqwest::redirect::Policy::limited` counts: the first
+/// entry of `previous()` is the original URL, not a redirect.
+const MAX_REDIRECTS: usize = 3;
+
 /// Floor on the cached lifetime, so an issuer advertising `max-age=0`
 /// cannot turn every token exchange into two round-trips.
 const MIN_KEY_TTL_SECONDS: u64 = 60;
@@ -246,6 +255,11 @@ impl JwksCache {
     /// the body arrives from a host this process does not control, and
     /// buffering all of it before measuring it is the whole problem.
     async fn fetch(&self, url: &str) -> Result<(String, Option<u64>)> {
+        // Before the request, not after: a refusal that has already made
+        // the call has already handed an on-path attacker the exchange.
+        // Here rather than at the one call site that needs it, so the
+        // discovery fetch is covered by the same rule.
+        require_https(url)?;
         let mut response = self
             .http
             .get(url)
@@ -285,6 +299,80 @@ impl JwksCache {
         let body = String::from_utf8(body).context("issuer response is not UTF-8")?;
         Ok((body, max_age))
     }
+}
+
+/// The HTTP client this cache is meant to run with.
+///
+/// [`require_https`] refuses a URL that is not `https`, but it only sees
+/// the URL this process asks for. A redirect is chosen by the host on the
+/// other end, and `reqwest`'s default client follows up to ten of them
+/// without caring that a hop leaves TLS — so without a policy, answering
+/// the key-set URL with a `307` does exactly what the check refuses to do
+/// directly. Refusing the hop means the request is never issued at all.
+///
+/// Redirects between `https` URLs stay allowed, capped: an issuer moving
+/// its key set behind a CDN is ordinary, a chain without end is not.
+pub(super) fn https_only_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > MAX_REDIRECTS {
+                attempt.error("issuer redirected a key fetch too many times")
+            } else if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.error("issuer redirected a key fetch off https")
+            }
+        }))
+        .build()
+        // Only a TLS backend that will not initialize gets here, and this
+        // AS cannot verify an assertion without one. Failing at boot beats
+        // falling back to a client with no redirect policy, which would
+        // drop the protection above silently.
+        .expect("a rustls backend is required to fetch issuer signing keys")
+}
+
+/// Keys, and the document that names them, may only be fetched over TLS.
+///
+/// `config.rs` already refuses a trusted issuer that is not `https`, which
+/// covers the discovery URL built from it. `jwks_uri` is different: it
+/// comes out of that document, so nothing has vouched for it yet.
+fn require_https(url: &str) -> Result<()> {
+    check_scheme(url, LOOPBACK_HTTP_ALLOWED)
+}
+
+/// Whether a plain-HTTP loopback URL may be fetched.
+///
+/// `true` only in a test build: the suite's fake issuer is an HTTP
+/// listener on `127.0.0.1`, so without the allowance no test could reach
+/// one. A release build carries `false` and has no way to turn it on.
+#[cfg(test)]
+const LOOPBACK_HTTP_ALLOWED: bool = true;
+#[cfg(not(test))]
+const LOOPBACK_HTTP_ALLOWED: bool = false;
+
+/// The rule itself, with the allowance passed in rather than read from
+/// the `cfg` above — which is what lets a test assert the behaviour of a
+/// build where it is off, and the `cfg` otherwise makes unreachable.
+fn check_scheme(url: &str, allow_loopback_http: bool) -> Result<()> {
+    let parsed = url::Url::parse(url).context("issuer named a URL that cannot be parsed")?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    // A loopback *IP literal*, never a name: settling whether a name is
+    // loopback needs DNS, and a scheme check that waits on a resolver is
+    // a scheme check an attacker gets to answer.
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if allow_loopback_http && parsed.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    bail!(
+        "issuer key material must be fetched over https, not {}",
+        parsed.scheme()
+    );
 }
 
 /// A JWKS entry this AS is willing to verify an assertion with.
@@ -327,8 +415,8 @@ fn max_age_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 mod tests {
     use super::super::test_helpers::{
         ec_public_jwk, ec_public_jwk_without_alg, start_fake_issuer,
-        start_fake_issuer_with_chunked_jwks, start_fake_issuer_with_discovery,
-        TEST_EC_P384_PKCS8_B64, TEST_EC_PKCS8_B64,
+        start_fake_issuer_redirecting_to_jwks, start_fake_issuer_with_chunked_jwks,
+        start_fake_issuer_with_discovery, TEST_EC_P384_PKCS8_B64, TEST_EC_PKCS8_B64,
     };
     use super::*;
 
@@ -364,6 +452,95 @@ mod tests {
 
         assert!(cache().decoding_key(&fake.base, "k1").await.is_err());
         assert_eq!(fake.jwks_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_plain_http_jwks_uri_is_refused() {
+        // `jwks_uri` comes out of the discovery document, and nothing
+        // downstream re-checks its scheme. Fetched over plain HTTP, the
+        // keys that verify every assertion for this issuer are whatever
+        // an on-path attacker decides to serve — that is the signature
+        // check itself, not a layer around it.
+        //
+        // The host is TEST-NET-1 (RFC 5737), so it is both unroutable and
+        // outside the loopback allowance the suite's fake issuer uses.
+        let fake = start_fake_issuer_with_discovery(
+            |base| {
+                serde_json::json!({ "issuer": base, "jwks_uri": "http://192.0.2.1/jwks" })
+                    .to_string()
+            },
+            serde_json::json!({ "keys": [] }).to_string(),
+        )
+        .await;
+
+        let err = cache()
+            .decoding_key(&fake.base, "k1")
+            .await
+            .expect_err("a key set offered over plain http must not be fetched");
+        // The message, because `is_err` alone proves nothing here: an
+        // unroutable address also fails by timing out, which is the
+        // unfixed behaviour — the fetch went out and merely did not
+        // arrive. Refused on the scheme means it was never attempted.
+        assert!(
+            format!("{err:#}").contains("https"),
+            "refused for the wrong reason: {err:#}"
+        );
+        // And it got far enough to read the document that named it.
+        assert_eq!(fake.discovery_hits(), 1);
+    }
+
+    #[test]
+    fn test_the_loopback_allowance_does_not_reach_a_release_build() {
+        // Every other test in this file talks to the fake issuer over
+        // plain HTTP on loopback, so all of them run with the allowance
+        // on and none of them can show what `mcp serve` does. This calls
+        // the rule with the constant a release build carries.
+        assert!(check_scheme("http://127.0.0.1:8080/jwks", false).is_err());
+        assert!(check_scheme("http://[::1]:8080/jwks", false).is_err());
+
+        // And where it does apply it stays narrow: a name is not an
+        // address, so it never counts as loopback.
+        assert!(check_scheme("http://localhost:8080/jwks", true).is_err());
+        assert!(check_scheme("http://127.0.0.1:8080/jwks", true).is_ok());
+
+        // https is what passes, with the allowance either way. A scheme
+        // that is neither never does.
+        assert!(check_scheme("https://idp.example.com/jwks", false).is_ok());
+        assert!(check_scheme("file:///etc/passwd", true).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_a_redirect_off_https_is_not_followed() {
+        // The second way the scheme check above can be walked around: the
+        // `jwks_uri` is `https`, passes, and the host answers it with a
+        // redirect to plain HTTP. `reqwest`'s default client follows up
+        // to ten hops and does not care that one leaves TLS, so the keys
+        // at the end of that chain are the ones assertions get verified
+        // against.
+        let fake =
+            start_fake_issuer_redirecting_to_jwks(vec![ec_public_jwk(TEST_EC_PKCS8_B64, "k1")])
+                .await;
+
+        // The default client: the hop is followed and the key is trusted.
+        // This half is the finding, kept as the control — without it a
+        // broken fixture would make the half below pass for free.
+        assert!(JwksCache::new(reqwest::Client::new())
+            .decoding_key(&fake.base, "k1")
+            .await
+            .is_ok());
+        assert_eq!(fake.jwks_hits(), 1);
+
+        // The client `mcp serve` builds: the hop is refused, so the key
+        // set behind it is never read.
+        assert!(JwksCache::new(https_only_client())
+            .decoding_key(&fake.base, "k1")
+            .await
+            .is_err());
+        assert_eq!(
+            fake.jwks_hits(),
+            1,
+            "a hop off https must not have been followed"
+        );
     }
 
     #[tokio::test]

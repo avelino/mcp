@@ -55,9 +55,14 @@ pub fn router(config: Arc<OAuthAsConfig>, state: Arc<AsState>) -> Router {
     // The metadata handlers only need the config, so they get a
     // narrower state. The token / register / authorize handlers
     // need both, bundled in `register::AppCtx`.
+    //
+    // One `JwksCache` for the whole router: built here rather than per
+    // request so a key set fetched for one exchange serves the next, which
+    // is what keeps `/token` from costing the issuer two GETs every time.
     let app_ctx = Arc::new(register::AppCtx {
         config: config.clone(),
         state,
+        jwks: Arc::new(jwks::JwksCache::new(jwks::https_only_client())),
     });
 
     let metadata_router = Router::new()

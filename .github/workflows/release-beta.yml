@@ -20,8 +20,13 @@ jobs:
     # este beta obsoleto antes de terminar. Mata a build velha na hora. No job
     # e nao no workflow porque cancel-in-progress no workflow cancelaria a run
     # inteira, inclusive um `publish` entre o delete e o create do release.
+    #
+    # `matrix.target` no group nao e enfeite: concurrency em job com matriz e
+    # avaliado uma vez por target. Sem ele os sete targets caem no mesmo grupo
+    # e, com cancel-in-progress, cancelam uns aos outros dentro da MESMA run.
+    # A matriz nunca fecha e `publish`/`docker` ficam bloqueados pra sempre.
     concurrency:
-      group: release-beta-build-${{ github.ref }}
+      group: release-beta-build-${{ github.ref }}-${{ matrix.target }}
       cancel-in-progress: true
     # Same-repo push to main whose CI succeeded. A fork fails the repository
     # check even when its branch is named main; a pull_request fails the
