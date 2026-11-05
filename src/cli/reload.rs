@@ -269,7 +269,7 @@ fn is_stale(config_hash: Option<&String>, cached: Option<&BackendToolCache>) -> 
 }
 
 fn evict_stale_caches(cfg: &Config, pool: Arc<DbPool>) -> CacheReport {
-    let store = ToolCacheStore::new(pool);
+    let store = ToolCacheStore::new(pool).with_file_fallback();
     let mut evicted = Vec::new();
     for name in store.list_cached_backends() {
         let cached = store.load_backend(&name);
