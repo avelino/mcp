@@ -1,3 +1,4 @@
+mod cancel;
 mod discovery;
 mod dispatch;
 /// End-to-end coverage of the 2026-07-28 wire contract the seam tests do not
