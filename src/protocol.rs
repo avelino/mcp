@@ -58,6 +58,11 @@ pub mod error_codes {
     // capability a peer is required to hold. It lands here when we do.
 }
 
+/// The cancellation notification, named once for both directions: the proxy
+/// recognizes it from a client and sends it to a backend, and those two sites
+/// drifting apart would be a silent protocol break.
+pub const CANCELLED_NOTIFICATION: &str = "notifications/cancelled";
+
 /// Required `resultType` discriminator on every result.
 pub const RESULT_TYPE_COMPLETE: &str = "complete";
 /// Interim result of a [Multi Round-Trip Request][mrtr].

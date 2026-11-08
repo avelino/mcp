@@ -406,6 +406,12 @@ pub(crate) struct ProxyServer {
     /// mutex released, and installs the client. Concurrent callers wait on
     /// the same per-backend lock instead of all spawning duplicate children.
     pub(crate) connect_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// In-flight requests this process can still be asked to cancel.
+    ///
+    /// It lives here, beside `discovery_lock`, so `dispatch_request` reaches
+    /// it through the proxy it already holds instead of growing a parameter
+    /// that every one of its callers and tests would have to thread through.
+    pub(crate) cancel_registry: Arc<super::cancel::CancelRegistry>,
 }
 
 impl ProxyServer {
@@ -435,6 +441,7 @@ impl ProxyServer {
             cache_store,
             discovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             connect_locks: HashMap::new(),
+            cancel_registry: Arc::new(super::cancel::CancelRegistry::default()),
         }
     }
 

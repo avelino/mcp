@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::config::ServerConfig;
 use crate::protocol::*;
+use crate::serve::cancel::CancelToken;
 use crate::transport::cli::{CliTransport, CliTransportConfig};
 use crate::transport::http::HttpTransport;
 use crate::transport::stdio::StdioTransport;
@@ -390,7 +391,18 @@ impl McpClient {
         headers: &[(String, String)],
     ) -> Result<Value> {
         let req = self.build_request(method, params);
-        let resp = self.transport.request_with_headers(&req, headers).await?;
+        self.send_built(&req, headers).await
+    }
+
+    /// The tail of [`Self::send_with_headers`], split out for the one caller
+    /// that has to know the request's id before the response comes back.
+    async fn send_built(
+        &self,
+        req: &JsonRpcRequest,
+        headers: &[(String, String)],
+    ) -> Result<Value> {
+        let method = &req.method;
+        let resp = self.transport.request_with_headers(req, headers).await?;
 
         if let Some(err) = resp.error {
             bail!("{method} failed: {} (code {})", err.message, err.code);
@@ -582,6 +594,20 @@ impl McpClient {
         params: serde_json::Value,
         extra_headers: &[(String, String)],
     ) -> Result<serde_json::Value> {
+        let headers = self.tool_call_headers(&params, extra_headers);
+        self.send_with_headers("tools/call", Some(params), &headers)
+            .await
+    }
+
+    /// The headers one `tools/call` carries: the caller's own, plus the
+    /// `Mcp-Param-*` family derived from the tool's `x-mcp-header`
+    /// annotations. A caller-supplied name wins the collision, for the reason
+    /// spelled out on [`Self::call_tool_raw_with`].
+    fn tool_call_headers(
+        &self,
+        params: &serde_json::Value,
+        extra_headers: &[(String, String)],
+    ) -> Vec<(String, String)> {
         let empty = serde_json::Value::Object(serde_json::Map::new());
         let from_params = match params.get("name").and_then(|v| v.as_str()) {
             Some(name) => self.param_headers(name, params.get("arguments").unwrap_or(&empty)),
@@ -598,9 +624,46 @@ impl McpClient {
                 .into_iter()
                 .filter(|(k, _)| !reserved.contains(&k.to_ascii_lowercase())),
         );
+        headers
+    }
 
-        self.send_with_headers("tools/call", Some(params), &headers)
-            .await
+    /// Same as [`Self::call_tool_raw_with`], but gives up when `cancel` fires
+    /// and tells the backend to stop too.
+    ///
+    /// Only `tools/call` has this path. The `*/list` methods and
+    /// `resources/read` answer fast enough that a cancellation would lose the
+    /// race anyway, and a long `tools/call` is the one that holds a slot open
+    /// while a per-call bill runs.
+    pub(crate) async fn call_tool_raw_cancellable(
+        &self,
+        params: serde_json::Value,
+        extra_headers: &[(String, String)],
+        cancel: &CancelToken,
+    ) -> Result<serde_json::Value> {
+        // Checked up front rather than only raced below: `select!` polls its
+        // branches in random order, so an already-cancelled token could still
+        // lose to the request, and the whole point is to not spend the
+        // backend call.
+        if cancel.is_cancelled() {
+            bail!("tools/call cancelled by client");
+        }
+
+        let headers = self.tool_call_headers(&params, extra_headers);
+        let req = self.build_request("tools/call", Some(params));
+
+        tokio::select! {
+            result = self.send_built(&req, &headers) => result,
+            () = cancel.cancelled() => {
+                // Best-effort. A backend that never implemented the
+                // notification ignores it, and a transport that already died
+                // cannot carry it. The caller is done waiting either way, so
+                // neither case is worth failing differently over.
+                if let Err(e) = self.transport.cancel(&req.id).await {
+                    tracing::debug!(error = %e, "could not relay cancellation to backend");
+                }
+                Err(anyhow!("tools/call cancelled by client"))
+            }
+        }
     }
 
     /// `tools/call` returning the raw result, preserving MRTR interim
@@ -1039,6 +1102,10 @@ mod tests {
         /// One result per call, in order, so a paginated method can be driven
         /// to the end. The last page repeats if asked for more.
         Pages(Vec<Value>),
+        /// Never answers. This is the long tool call a client gives up on:
+        /// the caller waits until something else, a cancellation, takes the
+        /// request away from it.
+        Hang,
     }
 
     /// Scripted transport that records every message it was asked to send,
@@ -1046,7 +1113,9 @@ mod tests {
     struct MockTransport {
         replies: HashMap<String, Reply>,
         sent: Mutex<Vec<Value>>,
-        notified: Mutex<Vec<String>>,
+        /// Whole notifications. The method-name view most assertions want is
+        /// derived in `notified()` rather than recorded a second time.
+        notifications: Mutex<Vec<Value>>,
         version: Mutex<Option<String>>,
         /// Headers the client asked the transport to mirror, per method.
         headers: Mutex<HashMap<String, Vec<(String, String)>>>,
@@ -1060,7 +1129,7 @@ mod tests {
                     .map(|(m, r)| (m.to_string(), r))
                     .collect(),
                 sent: Mutex::new(Vec::new()),
-                notified: Mutex::new(Vec::new()),
+                notifications: Mutex::new(Vec::new()),
                 version: Mutex::new(None),
                 headers: Mutex::new(HashMap::new()),
             })
@@ -1092,7 +1161,23 @@ mod tests {
         }
 
         fn notified(&self) -> Vec<String> {
-            self.notified.lock().unwrap().clone()
+            self.notifications
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|m| m["method"].as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+
+        /// The recorded notification for `method`, or `None` when it was
+        /// never sent.
+        fn notification_for(&self, method: &str) -> Option<Value> {
+            self.notifications
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|m| m["method"] == method)
+                .cloned()
         }
 
         /// The recorded request for `method`. Panics when it was never sent —
@@ -1115,6 +1200,7 @@ mod tests {
                     Ok(JsonRpcResponse::error(msg.id.clone(), *code, message))
                 }
                 Some(Reply::Dead) => bail!("transport closed"),
+                Some(Reply::Hang) => std::future::pending().await,
                 Some(Reply::Pages(pages)) => {
                     // `sent` already holds this call, so the count is 1-based.
                     let n = self
@@ -1149,7 +1235,10 @@ mod tests {
         }
 
         async fn notify(&self, msg: &JsonRpcNotification) -> Result<()> {
-            self.notified.lock().unwrap().push(msg.method.clone());
+            self.notifications
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(msg)?);
             Ok(())
         }
 
@@ -2747,6 +2836,99 @@ mod tests {
         assert_eq!(
             agreed_handshake_version(None, PROTOCOL_VERSION_LEGACY),
             PROTOCOL_VERSION_LEGACY
+        );
+    }
+
+    /// The cancellation has to reach the backend, naming the id the proxy
+    /// actually used on the wire. A backend that only ever sees the request
+    /// keeps billing for it.
+    #[tokio::test]
+    async fn a_cancelled_tool_call_tells_the_backend() {
+        let t = MockTransport::new(vec![
+            ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
+            ("tools/call", Reply::Hang),
+        ]);
+        let client = connect_mock(Arc::clone(&t)).await.unwrap();
+        let token = crate::serve::cancel::CancelToken::default();
+
+        let (result, ()) = tokio::join!(
+            client.call_tool_raw_cancellable(json!({"name": "slow"}), &[], &token),
+            async { token.cancel() },
+        );
+
+        assert!(result.is_err(), "a cancelled call must not return a result");
+        let sent_id = t.request_for("tools/call")["id"].clone();
+        let cancellation = t
+            .notification_for("notifications/cancelled")
+            .expect("backend was never told to cancel");
+        assert_eq!(cancellation["params"]["requestId"], sent_id);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_that_answers_first_sends_no_cancellation() {
+        let t = MockTransport::new(vec![
+            ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
+            ("tools/call", Reply::Result(json!({"content": []}))),
+        ]);
+        let client = connect_mock(Arc::clone(&t)).await.unwrap();
+        let token = crate::serve::cancel::CancelToken::default();
+
+        client
+            .call_tool_raw_cancellable(json!({"name": "fast"}), &[], &token)
+            .await
+            .unwrap();
+
+        assert!(t.notification_for("notifications/cancelled").is_none());
+    }
+
+    /// Cancelled before it started: there is nothing to cancel on the backend
+    /// because the request was never sent, and sending it would burn the
+    /// quota this whole feature exists to protect.
+    #[tokio::test]
+    async fn an_already_cancelled_token_never_reaches_the_backend() {
+        let t = MockTransport::new(vec![
+            ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
+            ("tools/call", Reply::Hang),
+        ]);
+        let client = connect_mock(Arc::clone(&t)).await.unwrap();
+        let token = crate::serve::cancel::CancelToken::default();
+        token.cancel();
+
+        let result = client
+            .call_tool_raw_cancellable(json!({"name": "slow"}), &[], &token)
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !t.methods_sent().contains(&"tools/call".to_string()),
+            "the request was sent despite an already cancelled token"
+        );
+        assert!(t.notification_for("notifications/cancelled").is_none());
+    }
+
+    /// `x-mcp-header` mirroring is not a feature of the non-cancellable path.
+    /// Both paths go through the same header computation, and this pins it.
+    #[tokio::test]
+    async fn a_cancellable_tool_call_still_mirrors_param_headers() {
+        let t = MockTransport::new(vec![
+            ("server/discover", discover_ok(&[PROTOCOL_VERSION])),
+            ("tools/call", Reply::Result(json!({"content": []}))),
+        ]);
+        let client = connect_mock(Arc::clone(&t)).await.unwrap();
+        let token = crate::serve::cancel::CancelToken::default();
+
+        client
+            .call_tool_raw_cancellable(
+                json!({"name": "x", "arguments": {}}),
+                &[("Mcp-Param-X-MCP-Subject".to_string(), "alice".to_string())],
+                &token,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            t.headers_for("tools/call"),
+            vec![("Mcp-Param-X-MCP-Subject".to_string(), "alice".to_string())]
         );
     }
 }

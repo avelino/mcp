@@ -277,9 +277,11 @@ pub(crate) async fn dispatch_request(
             // When the tool name is namespaced (server__tool), we can infer
             // which backend owns it and discover **only** that backend instead
             // of blocking on every pending server.
+            let cancel_registry: Arc<super::cancel::CancelRegistry>;
             let discovery_action = {
                 let p = proxy.lock().await;
                 audit_logger = Arc::clone(&p.audit);
+                cancel_registry = Arc::clone(&p.cancel_registry);
                 match req.params.as_ref().and_then(|v| v.get("name")) {
                     Some(Value::String(name)) if !p.tool_map.contains_key(name) => {
                         match infer_backend_name(name, &p.configs) {
@@ -379,13 +381,33 @@ pub(crate) async fn dispatch_request(
                             // `x-mcp-header` annotations into `Mcp-Param-*`,
                             // and it takes whole params so the MRTR
                             // continuation survives the hop.
+                            //
+                            // Tracked from here until the guard drops, so a
+                            // `notifications/cancelled` arriving mid-call can
+                            // find this request. The key carries the caller's
+                            // subject: ids are the client's to choose, so `1`
+                            // from one peer collides with `1` from every
+                            // other, and the subject is what keeps a peer
+                            // from cancelling a stranger's work.
+                            let cancel = cancel_registry
+                                .register(super::cancel::CancelKey::new(&identity.subject, &id));
                             match client
-                                .call_tool_raw_with(backend_params, &identity_headers)
+                                .call_tool_raw_cancellable(
+                                    backend_params,
+                                    &identity_headers,
+                                    cancel.token(),
+                                )
                                 .await
                             {
                                 Ok(mut result) => {
                                     sanitize_relayed_result(&mut result, stateless_peer);
                                     JsonRpcResponse::success(id, result)
+                                }
+                                // Order matters: a cancelled call fails, and
+                                // its failure must not go out as an ordinary
+                                // backend error.
+                                Err(_) if cancel.token().is_cancelled() => {
+                                    super::cancel::suppressed_response(id)
                                 }
                                 Err(e) => JsonRpcResponse::error(
                                     id,

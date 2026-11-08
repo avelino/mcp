@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::instances::{self, InstanceFilter};
 use crate::protocol::JsonRpcRequest;
 use crate::server_auth::AuthIdentity;
+use serde_json::Value;
 
 use super::discovery::discover_pending_backends;
 use super::dispatch::dispatch_request;
@@ -180,9 +181,22 @@ pub async fn run_stdio(mut config: Config, filter: InstanceFilter) -> Result<()>
             continue;
         }
 
+        // Decided on the raw value first: a notification has no `id`, and
+        // `JsonRpcRequest` makes `id` mandatory, so a notification could
+        // never parse into one. That is why every notification used to be
+        // dropped here without anything even looking at its method.
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if msg.get("id").is_none() {
+            let registry = Arc::clone(&proxy.lock().await.cancel_registry);
+            super::cancel::handle_notification(&registry, &msg, &identity.subject);
+            continue;
+        }
+
         // Spawn each request so multiple in-flight requests can run in
         // parallel even on the stdio control channel.
-        if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&line) {
+        if let Ok(req) = serde_json::from_value::<JsonRpcRequest>(msg) {
             let proxy = Arc::clone(&proxy);
             let stdout = Arc::clone(&stdout);
             let identity = identity.clone();
@@ -194,6 +208,12 @@ pub async fn run_stdio(mut config: Config, filter: InstanceFilter) -> Result<()>
                 let response =
                     dispatch_request(&proxy, req, &identity, &acl, "serve:stdio", stateless_peer)
                         .await;
+                // A cancelled request gets no answer at all. Writing one
+                // would break the spec and confuse a client that has already
+                // moved on from that id.
+                if super::cancel::is_suppressed(&response) {
+                    return;
+                }
                 let mut data = match serde_json::to_string(&response) {
                     Ok(s) => s,
                     Err(_) => return,
@@ -204,7 +224,6 @@ pub async fn run_stdio(mut config: Config, filter: InstanceFilter) -> Result<()>
                 let _ = out.flush().await;
             });
         }
-        // Notifications (no id) — silently dropped.
     }
 
     let drained = {

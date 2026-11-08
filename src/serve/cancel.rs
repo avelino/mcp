@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio::sync::watch;
 
+use crate::protocol::{JsonRpcResponse, CANCELLED_NOTIFICATION};
+
 /// A one-way flag a waiter can await.
 #[derive(Clone)]
 pub(crate) struct CancelToken {
@@ -26,9 +28,11 @@ impl Default for CancelToken {
 
 impl CancelToken {
     pub(crate) fn cancel(&self) {
-        // Ignores the send error: it only means every receiver is gone, and a
-        // cancellation nobody is waiting for has nothing left to do.
-        let _ = self.tx.send(true);
+        // `send` is the wrong call here: it refuses to write the value at all
+        // when no receiver is alive, and this token holds no receiver of its
+        // own. `send_replace` always writes, and still wakes whoever is
+        // waiting.
+        self.tx.send_replace(true);
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -142,9 +146,6 @@ impl Drop for CancelGuard {
     }
 }
 
-/// The one notification this proxy acts on.
-const CANCELLED: &str = "notifications/cancelled";
-
 /// Act on an inbound notification, reporting whether it was one we handle.
 ///
 /// Takes the raw message because that is what both transports have at the
@@ -155,7 +156,36 @@ const CANCELLED: &str = "notifications/cancelled";
 /// `subject` is the authenticated caller, and it scopes the lookup. A peer can
 /// only cancel what it started.
 pub(crate) fn handle_notification(registry: &CancelRegistry, msg: &Value, subject: &str) -> bool {
-    unimplemented!()
+    if msg.get("method").and_then(Value::as_str) != Some(CANCELLED_NOTIFICATION) {
+        return false;
+    }
+
+    // A cancellation that names nothing, or names a request this subject never
+    // started, is still a cancellation we consumed. The miss is the ordinary
+    // case: the response usually wins the race.
+    if let Some(request_id) = msg.get("params").and_then(|params| params.get("requestId")) {
+        registry.cancel(&CancelKey::new(subject, request_id));
+    }
+    true
+}
+
+/// Internal marker on the response of a cancelled request.
+///
+/// The spec forbids answering a cancelled request, so this never reaches a
+/// peer: both transports recognize it and write nothing. It exists because
+/// `dispatch_request` has to return *something* on the way out, and an
+/// `Option` in that signature would push the distinction into every one of
+/// its callers and tests.
+const SUPPRESSED: i64 = -32001;
+
+/// The response a cancelled request unwinds with.
+pub(crate) fn suppressed_response(id: Value) -> JsonRpcResponse {
+    JsonRpcResponse::error(id, SUPPRESSED, "request cancelled by client")
+}
+
+/// Whether this response must be dropped instead of written to the peer.
+pub(crate) fn is_suppressed(resp: &JsonRpcResponse) -> bool {
+    resp.error.as_ref().is_some_and(|e| e.code == SUPPRESSED)
 }
 
 #[cfg(test)]
@@ -306,5 +336,29 @@ mod tests {
         handle_notification(&registry, &cancellation_of(json!({"n": 7})), "alice");
 
         assert!(!guard.token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_response_is_recognized() {
+        assert!(is_suppressed(&suppressed_response(json!(7))));
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_response_is_not_suppressed() {
+        assert!(!is_suppressed(&JsonRpcResponse::success(
+            json!(7),
+            json!({"content": []})
+        )));
+    }
+
+    /// A real backend failure must still reach the caller. Only the one
+    /// sentinel code is dropped.
+    #[tokio::test]
+    async fn another_error_code_is_not_suppressed() {
+        assert!(!is_suppressed(&JsonRpcResponse::error(
+            json!(7),
+            crate::protocol::error_codes::INTERNAL_ERROR,
+            "backend exploded"
+        )));
     }
 }

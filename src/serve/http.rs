@@ -915,8 +915,12 @@ async fn mcp_authenticated(
         Err(e) => return parse_error(e),
     };
 
-    // Notifications have no "id" field — accept and return 202
+    // Notifications have no "id" field — accept and return 202. The one the
+    // proxy acts on is `notifications/cancelled`; every other is still
+    // accepted and dropped.
     if msg.get("id").is_none() {
+        let registry = Arc::clone(&state.proxy.lock().await.cancel_registry);
+        super::cancel::handle_notification(&registry, &msg, &identity.subject);
         return (StatusCode::ACCEPTED, Json(json!(null)));
     }
 
@@ -979,6 +983,14 @@ async fn mcp_authenticated(
             ),
         ),
     };
+    // The spec forbids answering a request the client cancelled, so the
+    // response never goes out — not here and not down the SSE stream below.
+    // 202 with no body is what this handler already returns when it has
+    // accepted a message and has nothing to say about it.
+    if super::cancel::is_suppressed(&response) {
+        return (StatusCode::ACCEPTED, Json(json!(null)));
+    }
+
     let status = status_for_response(&response, stateless_peer);
     let response_json = serde_json::to_value(&response).unwrap();
 

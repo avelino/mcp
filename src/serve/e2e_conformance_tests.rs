@@ -591,3 +591,70 @@ async fn a_legacy_peer_receives_no_2026_07_28_result_fields() {
         "mcp-proxy"
     );
 }
+
+/// The HTTP notification path has to reach the registry. It used to answer
+/// 202 and drop the message, so a cancellation never found the request it
+/// named and the backend kept working.
+#[tokio::test]
+async fn a_cancellation_over_http_reaches_the_in_flight_request() {
+    let proxy = empty_proxy();
+    let registry = Arc::clone(&proxy.lock().await.cancel_registry);
+    let guard = registry.register(super::cancel::CancelKey::new(
+        crate::server_auth::ANONYMOUS_SUBJECT,
+        &json!(7),
+    ));
+    let server = TestServer::start(Arc::clone(&proxy)).await;
+
+    let (status, _) = server
+        .post(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 7},
+            }),
+            &[],
+        )
+        .await;
+
+    assert_eq!(status, 202);
+    assert!(
+        guard.token().is_cancelled(),
+        "the cancellation never reached the registry"
+    );
+}
+
+/// Losing the race with the response is the ordinary case, not a protocol
+/// error. The peer gets the same 202 either way, and never a 4xx it would
+/// have to interpret.
+#[tokio::test]
+async fn a_cancellation_for_a_request_nobody_started_is_still_accepted() {
+    let server = TestServer::start(empty_proxy()).await;
+
+    let (status, _) = server
+        .post(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 404},
+            }),
+            &[],
+        )
+        .await;
+
+    assert_eq!(status, 202);
+}
+
+/// Every other notification keeps the behavior it had: accepted and dropped.
+#[tokio::test]
+async fn an_unrelated_notification_is_still_accepted_and_dropped() {
+    let server = TestServer::start(empty_proxy()).await;
+
+    let (status, _) = server
+        .post(
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            &[],
+        )
+        .await;
+
+    assert_eq!(status, 202);
+}
