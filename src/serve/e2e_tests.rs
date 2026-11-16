@@ -35,8 +35,8 @@ use crate::audit::AuditLogger;
 use crate::cache::ToolCacheStore;
 use crate::client::McpClient;
 use crate::protocol::{
-    error_codes, meta_keys, Prompt, Resource, Tool, HEADER_MCP_METHOD, HEADER_MCP_NAME,
-    PROTOCOL_VERSION, PROTOCOL_VERSION_LEGACY,
+    error_codes, meta_keys, Prompt, Resource, ResourceTemplate, Tool, HEADER_MCP_METHOD,
+    HEADER_MCP_NAME, PROTOCOL_VERSION, PROTOCOL_VERSION_LEGACY,
 };
 use crate::server_auth::NoAuth;
 
@@ -324,6 +324,7 @@ async fn proxy_with_backend(backend_url: &str) -> SharedProxy {
         description: None,
         input_schema: None,
         annotations: None,
+        ..Default::default()
     };
     server.install_client(
         "stub",
@@ -336,6 +337,7 @@ async fn proxy_with_backend(backend_url: &str) -> SharedProxy {
                 description: None,
                 mime_type: Some("text/plain".to_string()),
                 annotations: None,
+                ..Default::default()
             },
             Resource {
                 uri: UNICODE_URI.to_string(),
@@ -343,8 +345,10 @@ async fn proxy_with_backend(backend_url: &str) -> SharedProxy {
                 description: None,
                 mime_type: Some("text/plain".to_string()),
                 annotations: None,
+                ..Default::default()
             },
         ],
+        &[] as &[ResourceTemplate],
         &[] as &[Prompt],
     );
     Arc::new(Mutex::new(server))
@@ -454,7 +458,14 @@ async fn proxy_with_stateless_backend(backend_url: &str) -> SharedProxy {
         HashMap::new(),
         ToolCacheStore::new(Arc::new(crate::db::DbPool::disabled())),
     );
-    server.install_client("sql", client, &tools, &[] as &[Resource], &[] as &[Prompt]);
+    server.install_client(
+        "sql",
+        client,
+        &tools,
+        &[] as &[Resource],
+        &[] as &[ResourceTemplate],
+        &[] as &[Prompt],
+    );
     Arc::new(Mutex::new(server))
 }
 
@@ -1129,6 +1140,7 @@ async fn proxy_forwarding_identity(
             description: None,
             input_schema: None,
             annotations: None,
+            ..Default::default()
         }],
         &[Resource {
             uri: ENCODED_URI.to_string(),
@@ -1136,11 +1148,14 @@ async fn proxy_forwarding_identity(
             description: None,
             mime_type: Some("text/plain".to_string()),
             annotations: None,
+            ..Default::default()
         }],
+        &[] as &[ResourceTemplate],
         &[Prompt {
             name: "greet".to_string(),
             description: None,
             arguments: None,
+            ..Default::default()
         }],
     );
     Arc::new(Mutex::new(server))

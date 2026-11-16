@@ -289,7 +289,8 @@ impl CliTransport {
         // Run the command with timeout. kill_on_drop ensures the child is
         // reaped if the request is cancelled (e.g. caller dropped, server
         // shutting down) instead of leaking as an orphan.
-        let mut cmd = Command::new(&self.command);
+        let program = super::which::program_for_spawn(&self.command, &self.env);
+        let mut cmd = Command::new(&program);
         cmd.args(&cmd_args).envs(&self.env).kill_on_drop(true);
 
         let duration = Duration::from_secs(self.timeout_secs);
@@ -425,6 +426,7 @@ mod tests {
                     description: Some("test tool".to_string()),
                     input_schema: None,
                     annotations: None,
+                    ..Default::default()
                 }],
                 subcommand_map: HashMap::from([(format!("{command}_test"), "test".to_string())]),
                 discovered: true,
@@ -471,6 +473,7 @@ mod tests {
 
     /// The gate must respect a backend that pins its own PATH, the same way
     /// the spawn would.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_backend_pinned_path_is_honored() {
         use std::os::unix::fs::PermissionsExt;
@@ -610,6 +613,7 @@ mod tests {
                     description: Some("Print API versions".to_string()),
                     input_schema: None,
                     annotations: None,
+                    ..Default::default()
                 }],
                 subcommand_map: HashMap::from([(
                     "kubectl_api_versions".to_string(),

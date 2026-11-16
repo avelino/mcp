@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::oauth_primitives::generate_random_string;
 
+use super::jwks::JwksCache;
 use super::redirect_uri;
 use super::types::RegisteredClient;
 use super::{AsState, OAuthAsConfig};
@@ -58,6 +59,10 @@ pub struct RegistrationError {
 pub struct AppCtx {
     pub config: Arc<OAuthAsConfig>,
     pub state: Arc<AsState>,
+    /// Signing keys of the trusted identity providers, shared across
+    /// requests so a warm key set is not re-fetched per exchange. Only the
+    /// `jwt-bearer` grant at `/token` reads it.
+    pub jwks: Arc<JwksCache>,
 }
 
 pub async fn register(
@@ -204,8 +209,11 @@ mod tests {
                 scopes_supported: vec![],
                 redirect_uri_allowlist: allowlist,
                 injected_roles: vec![],
+                trusted_issuers: vec![],
+                static_clients: vec![],
             }),
             state: Arc::new(AsState::default()),
+            jwks: Arc::new(JwksCache::new(reqwest::Client::new())),
         })
     }
 

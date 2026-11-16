@@ -18,11 +18,14 @@ use crate::audit::{AuditLogger, AuditOutput};
 use crate::cache::ToolCacheStore;
 use crate::config::{self, Config};
 use crate::instances::InstanceFilter;
-use crate::server_auth::build_auth_provider;
+use crate::server_auth::oauth_as::AsState;
+use crate::server_auth::{build_auth_provider, configured_static_clients};
 
 use super::http::test_router;
 use super::proxy::{ProxyServer, SharedProxy};
-use super::reload::{reload_in_place, AuthSnapshot, BootInvariants, ReloadContext, SharedAuth};
+use super::reload::{
+    reload_in_place, www_authenticate_for, AuthSnapshot, BootInvariants, ReloadContext, SharedAuth,
+};
 
 const ADMIN: &str = "Bearer tok-admin";
 const DEV: &str = "Bearer tok-dev";
@@ -142,21 +145,40 @@ struct Endpoint {
 
 impl Endpoint {
     async fn start(config: &Config, filter: InstanceFilter) -> Self {
-        let provider = build_auth_provider(&config.server_auth, None).unwrap();
+        // The AS state `run_http` would have loaded; without it the provider
+        // chain cannot be built and the challenge would rightly stay plain.
+        let as_state = config
+            .server_auth
+            .providers
+            .iter()
+            .any(|p| p == "oauth_as")
+            .then(|| Arc::new(AsState::default()));
+        let provider = build_auth_provider(&config.server_auth, as_state.as_ref()).unwrap();
+        // Boot applies the configured clients after the build; mirrored here or
+        // the harness would start with a map `run_http` would have filled.
+        if let Some(state) = as_state.as_ref() {
+            state.set_static_clients(configured_static_clients(&config.server_auth, 0));
+        }
         let auth = AuthSnapshot::new(
             provider,
             config.server_auth.acl.clone(),
             config.server_auth.admin_roles.clone(),
         )
+        .with_www_authenticate(www_authenticate_for(&config.server_auth))
         .shared();
         let reload = ReloadContext {
             filter: Arc::new(filter),
             boot: Arc::new(BootInvariants {
                 oauth_as_enabled: config.server_auth.providers.iter().any(|p| p == "oauth_as"),
+                oauth_as_issuer_url: config
+                    .server_auth
+                    .oauth_as
+                    .as_ref()
+                    .map(|oauth| oauth.issuer_url.clone()),
                 audit_output: config.audit.output.clone(),
                 bind_addr: Some("127.0.0.1:0".to_string()),
             }),
-            as_state: None,
+            as_state,
         };
         let proxy = empty_proxy();
 
@@ -214,11 +236,45 @@ impl Endpoint {
         .await
     }
 
+    /// The `WWW-Authenticate` header of an unauthenticated `/mcp` call.
+    async fn challenge(&self) -> String {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/mcp", self.base))
+            .header("content-type", "application/json")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .send()
+            .await
+            .unwrap();
+        challenge_of(&resp)
+    }
+
+    /// The same header on the deprecated HTTP+SSE transport, which shares
+    /// the gate but returns its refusal by value instead of handing back the
+    /// response the gate built.
+    async fn sse_challenge(&self) -> String {
+        let resp = reqwest::Client::new()
+            .get(format!("{}/mcp/sse", self.base))
+            .send()
+            .await
+            .unwrap();
+        challenge_of(&resp)
+    }
+
     async fn published(&self) -> Vec<String> {
         let mut names: Vec<String> = self.proxy.lock().await.configs.keys().cloned().collect();
         names.sort();
         names
     }
+}
+
+fn challenge_of(resp: &reqwest::Response) -> String {
+    assert_eq!(resp.status().as_u16(), 401);
+    resp.headers()
+        .get("www-authenticate")
+        .expect("a 401 must carry a challenge")
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 fn names(body: &Value, field: &str) -> Vec<String> {
@@ -371,6 +427,54 @@ async fn a_broken_server_auth_leaves_the_previous_one_in_force() {
     );
 }
 
+/// The configured client map is part of "exactly in place". Building the
+/// provider walks `providers` in order, so an `oauth_as` arm that replaced the
+/// map would have replaced it before a later arm failed the reload — leaving
+/// the proxy serving the previous auth block with the *new* config's clients,
+/// and the client an operator never removed gone until the next restart.
+#[tokio::test]
+async fn test_rejected_reload_leaves_static_clients_untouched() {
+    let mut server_auth = bearer_auth(&["admin"]);
+    server_auth["providers"] = json!(["oauth_as", "bearer"]);
+    let mut oauth = oauth_as_block("https://mcp.example.com");
+    oauth["staticClients"] = json!([{"clientId": "ema-client"}]);
+    server_auth["oauthAs"] = oauth;
+    let env = ConfigEnv::new(config_with(&[], server_auth));
+    let endpoint = Endpoint::start(&env.load(), InstanceFilter::default()).await;
+    let as_state = endpoint
+        .reload
+        .as_state
+        .clone()
+        .expect("oauth_as is in providers, so boot loaded an AS state");
+    assert!(
+        as_state.get_client("ema-client").is_some(),
+        "boot has to have applied the configured client for the rest to mean anything"
+    );
+
+    // `oauth_as` is accepted and would replace the map; `bearer` then fails
+    // for want of its sub-config and the whole reload is refused.
+    let mut oauth = oauth_as_block("https://mcp.example.com");
+    oauth["staticClients"] = json!([{"clientId": "replacement"}]);
+    env.write(config_with(
+        &[],
+        json!({
+            "providers": ["oauth_as", "bearer"],
+            "oauthAs": oauth,
+            "adminRoles": ["admin"],
+        }),
+    ));
+
+    assert!(endpoint.reload_in_place().await.is_err());
+    assert!(
+        as_state.get_client("ema-client").is_some(),
+        "a rejected reload must not have dropped the client still in the live config"
+    );
+    assert!(
+        as_state.get_client("replacement").is_none(),
+        "nor admitted a client from the config that was refused"
+    );
+}
+
 // --- boot invariants ---------------------------------------------------
 
 /// `audit.output` opens a db pool and a logger at boot, so a reload cannot
@@ -423,6 +527,42 @@ async fn turning_oauth_as_on_is_reported_and_bearer_keeps_working() {
         "the bearer half of the chain must survive the reload"
     );
     assert_eq!(endpoint.tools_list(Some("Bearer tok-nope")).await, 401);
+}
+
+/// `/token`, `/authorize` and the metadata routes are built once, around the
+/// listener, from a clone of the boot config. A reload rebuilds the provider
+/// that *checks* `iss` and leaves those untouched, so before this was
+/// reported an edited `issuerUrl` answered `200` with nothing to report —
+/// while `/token` kept minting the old issuer, the metadata kept advertising
+/// it, and the rebuilt validator rejected every token either of them
+/// produced.
+#[tokio::test]
+async fn test_changing_issuer_url_requires_restart() {
+    let auth_with = |issuer: &str| {
+        let mut auth = bearer_auth(&["admin"]);
+        auth["providers"] = json!(["bearer", "oauth_as"]);
+        auth["oauthAs"] = oauth_as_block(issuer);
+        auth
+    };
+    let env = ConfigEnv::new(config_with(&[], auth_with("https://old.example.com")));
+    let endpoint = Endpoint::start(&env.load(), InstanceFilter::default()).await;
+
+    env.write(config_with(&[], auth_with("https://new.example.com")));
+    let (status, body) = endpoint.reload(Some(ADMIN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        names(&body, "requires_restart"),
+        vec!["serverAuth.oauthAs.issuerUrl".to_string()]
+    );
+
+    // The other half, against an over-broad comparison: the boot value is
+    // what it is measured against, so putting it back reports nothing.
+    // Compared against the previous reload instead, a config nobody edited
+    // would claim a restart on every pass.
+    env.write(config_with(&[], auth_with("https://old.example.com")));
+    let (status, body) = endpoint.reload(Some(ADMIN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(names(&body, "requires_restart").is_empty(), "{body}");
 }
 
 /// An `audit.output` the operator spelled out but did not change is not a
@@ -525,4 +665,107 @@ async fn reloading_the_same_config_twice_is_an_empty_diff() {
     assert!(second.added.is_empty());
     assert!(second.changed.is_empty());
     assert!(second.removed.is_empty());
+}
+
+// --- 401 challenge -----------------------------------------------------
+
+fn oauth_as_block(issuer_url: &str) -> Value {
+    json!({
+        "issuerUrl": issuer_url,
+        "jwtSecret": "0123456789abcdef0123456789abcdef",
+        "trustedSourceCidrs": ["127.0.0.1/32"],
+        "redirectUriAllowlist": ["https://client.example.com/cb"],
+    })
+}
+
+/// RFC 9728 §5.1: the 401 is how a client that has never heard of this proxy
+/// learns where the authorization server is. A trailing slash on the issuer
+/// must not leak into the URL, or it names a path nothing serves.
+#[tokio::test]
+async fn test_401_carries_resource_metadata_challenge() {
+    let mut server_auth = bearer_auth(&["admin"]);
+    server_auth["providers"] = json!(["bearer", "oauth_as"]);
+    server_auth["oauthAs"] = oauth_as_block("https://mcp.example.com/");
+    let env = ConfigEnv::new(config_with(&[], server_auth));
+    let endpoint = Endpoint::start(&env.load(), InstanceFilter::default()).await;
+
+    assert_eq!(
+        endpoint.challenge().await,
+        "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource\""
+    );
+}
+
+/// The deprecated HTTP+SSE transport authenticates through the same gate but
+/// returns the refusal by value, one copy away from the POST path. A
+/// challenge dropped on that copy would leave a client on that transport with
+/// a 401 and nowhere to go, and no `/mcp` test would see it.
+#[tokio::test]
+async fn test_sse_401_carries_the_same_challenge() {
+    let mut server_auth = bearer_auth(&["admin"]);
+    server_auth["providers"] = json!(["bearer", "oauth_as"]);
+    server_auth["oauthAs"] = oauth_as_block("https://mcp.example.com");
+    let env = ConfigEnv::new(config_with(&[], server_auth));
+    let endpoint = Endpoint::start(&env.load(), InstanceFilter::default()).await;
+
+    assert_eq!(
+        endpoint.sse_challenge().await,
+        "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource\""
+    );
+}
+
+/// Pointing a client at an AS that is not configured would send it chasing a
+/// 404.
+#[tokio::test]
+async fn test_401_without_oauth_as_has_plain_bearer_challenge() {
+    let env = ConfigEnv::new(config_with(&[], bearer_auth(&["admin"])));
+    let endpoint = Endpoint::start(&env.load(), InstanceFilter::default()).await;
+
+    assert_eq!(endpoint.challenge().await, "Bearer");
+}
+
+/// The challenge rides in the snapshot so that it changes in the same write as
+/// the provider that produced the 401.
+///
+/// A reload moves this and the validator — `provider.rs` reads
+/// `config.issuer_url` to pin the expected `iss`, and the provider is rebuilt.
+/// What it cannot move is the side that *mints* and advertises: `/token` and
+/// the metadata routes were built around the listener at boot. So an
+/// `issuerUrl` edit leaves those two halves disagreeing, which is why the
+/// same reload reports the field in `requires_restart`. See
+/// [`test_changing_issuer_url_requires_restart`].
+#[tokio::test]
+async fn test_reload_updates_the_challenge() {
+    let mut first = bearer_auth(&["admin"]);
+    first["providers"] = json!(["bearer", "oauth_as"]);
+    first["oauthAs"] = oauth_as_block("https://old.example.com");
+    let env = ConfigEnv::new(config_with(&[], first));
+    let endpoint = Endpoint::start(&env.load(), InstanceFilter::default()).await;
+    assert!(endpoint
+        .challenge()
+        .await
+        .contains("https://old.example.com/"));
+
+    let mut second = bearer_auth(&["admin"]);
+    second["providers"] = json!(["bearer", "oauth_as"]);
+    second["oauthAs"] = oauth_as_block("https://new.example.com");
+    env.write(config_with(&[], second));
+    let (status, body) = endpoint.reload(Some(ADMIN)).await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_eq!(
+        endpoint.challenge().await,
+        "Bearer resource_metadata=\"https://new.example.com/.well-known/oauth-protected-resource\""
+    );
+}
+
+/// `oauthAs` present but not in `providers` means the AS router is not
+/// mounted, so the metadata URL would 404.
+#[tokio::test]
+async fn test_challenge_is_plain_bearer_when_oauth_as_not_in_providers() {
+    let mut server_auth = bearer_auth(&["admin"]);
+    server_auth["oauthAs"] = oauth_as_block("https://mcp.example.com");
+    let env = ConfigEnv::new(config_with(&[], server_auth));
+    let endpoint = Endpoint::start(&env.load(), InstanceFilter::default()).await;
+
+    assert_eq!(endpoint.challenge().await, "Bearer");
 }

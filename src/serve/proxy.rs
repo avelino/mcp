@@ -11,8 +11,8 @@ use crate::classifier_cache::{cache_key, ClassifierCache};
 use crate::client::McpClient;
 use crate::config::{parse_duration_str, IdleTimeoutPolicy, ServerConfig};
 use crate::protocol::{
-    error_codes, JsonRpcResponse, Prompt, Resource, ServerDiscoverResult, ServerInfo, Tool,
-    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    error_codes, JsonRpcResponse, Prompt, Resource, ResourceTemplate, ServerDiscoverResult,
+    ServerInfo, Tool, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::server_auth::{self, AclConfig, AuthIdentity};
 
@@ -34,14 +34,46 @@ pub(crate) fn infer_backend_name<'a>(
     }
 }
 
+/// The methods this proxy routes, grouped under the capability that owns
+/// them.
+///
+/// [`proxy_capabilities`] is built from this list and
+/// `every_advertised_capability_is_routed` walks it through the dispatcher,
+/// so a capability cannot be advertised without the routes that make the
+/// claim true. That is the failure this table exists to prevent: the proxy
+/// advertised `resources` for a long time while `resources/templates/list`
+/// answered METHOD_NOT_FOUND.
+///
+/// A method the proxy does not route stays out, which is why `completions`
+/// and `logging` are absent rather than declared empty.
+pub(crate) const CAPABILITY_ROUTES: [(&str, &[&str]); 3] = [
+    ("tools", &["tools/list", "tools/call"]),
+    (
+        "resources",
+        &[
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+        ],
+    ),
+    ("prompts", &["prompts/list", "prompts/get"]),
+];
+
 /// Capabilities this proxy advertises. Shared by `initialize` and
 /// `server/discover` so the two answers can never drift apart.
+///
+/// Deliberately a statement about the **proxy**, not about the backends
+/// behind it. A proxy with no backend still answers `tools/list`, and
+/// deriving the set from what has been discovered so far would make the
+/// payload depend on whether the lazy discovery pass has run yet. Under a
+/// one-hour `server/discover` TTL a client would cache whichever answer it
+/// happened to race.
 pub(crate) fn proxy_capabilities() -> Value {
-    json!({
-        "tools": {},
-        "resources": {},
-        "prompts": {}
-    })
+    let mut caps = serde_json::Map::new();
+    for (name, _) in CAPABILITY_ROUTES {
+        caps.insert(name.to_string(), json!({}));
+    }
+    Value::Object(caps)
 }
 
 pub(crate) fn proxy_server_info() -> ServerInfo {
@@ -158,6 +190,24 @@ pub(crate) fn backend_prompt_get_params(params: Option<&Value>, original_name: &
     }
     copy_mrtr_continuation(params, &mut out);
     Value::Object(out)
+}
+
+/// The namespaced keys one backend owns, read from the map that records the
+/// owner instead of from the key's prefix.
+///
+/// A prefix match is wrong here. Nothing stops a config from naming one
+/// backend `docs` and another `docs__archive`, and `docs__` prefixes every
+/// key the second one owns. Since each `register_*` unregisters first, even
+/// for an empty list, a prefix match lets whichever backend the parallel
+/// discovery commits second delete the other one's primitives.
+fn keys_owned_by(
+    map: &HashMap<String, (String, String)>,
+    server_name: &str,
+) -> std::collections::HashSet<String> {
+    map.iter()
+        .filter(|(_, (server, _))| server == server_name)
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 /// Tracks per-backend usage patterns for adaptive idle timeout.
@@ -323,6 +373,9 @@ pub(crate) struct ProxyServer {
     pub(crate) tools: Vec<Tool>,
     pub(crate) resource_map: HashMap<String, (String, String)>, // namespaced_uri -> (server, original_uri)
     pub(crate) resources: Vec<Resource>,
+    // namespaced_template -> (server, original_template)
+    pub(crate) resource_template_map: HashMap<String, (String, String)>,
+    pub(crate) resource_templates: Vec<ResourceTemplate>,
     pub(crate) prompt_map: HashMap<String, (String, String)>, // namespaced_name -> (server, original_name)
     pub(crate) prompts: Vec<Prompt>,
     /// Per-tool read/write classification, keyed by namespaced tool name.
@@ -353,6 +406,12 @@ pub(crate) struct ProxyServer {
     /// mutex released, and installs the client. Concurrent callers wait on
     /// the same per-backend lock instead of all spawning duplicate children.
     pub(crate) connect_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// In-flight requests this process can still be asked to cancel.
+    ///
+    /// It lives here, beside `discovery_lock`, so `dispatch_request` reaches
+    /// it through the proxy it already holds instead of growing a parameter
+    /// that every one of its callers and tests would have to thread through.
+    pub(crate) cancel_registry: Arc<super::cancel::CancelRegistry>,
 }
 
 impl ProxyServer {
@@ -369,6 +428,8 @@ impl ProxyServer {
             tools: Vec::new(),
             resource_map: HashMap::new(),
             resources: Vec::new(),
+            resource_template_map: HashMap::new(),
+            resource_templates: Vec::new(),
             prompt_map: HashMap::new(),
             prompts: Vec::new(),
             classifications: HashMap::new(),
@@ -380,6 +441,7 @@ impl ProxyServer {
             cache_store,
             discovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             connect_locks: HashMap::new(),
+            cancel_registry: Arc::new(super::cancel::CancelRegistry::default()),
         }
     }
 
@@ -435,6 +497,7 @@ impl ProxyServer {
         for name in diff.changed.iter().chain(diff.removed.iter()) {
             self.unregister_tools(name);
             self.unregister_resources(name);
+            self.unregister_resource_templates(name);
             self.unregister_prompts(name);
             self.discovered_backends.remove(name);
             self.discovery_failures.remove(name);
@@ -539,15 +602,16 @@ impl ProxyServer {
                 description,
                 input_schema: tool.input_schema.clone(),
                 annotations: tool.annotations.clone(),
+                extra: tool.extra.clone(),
             });
         }
     }
 
     pub(crate) fn unregister_tools(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}{SEPARATOR}");
-        self.tools.retain(|t| !t.name.starts_with(&prefix));
-        self.tool_map.retain(|k, _| !k.starts_with(&prefix));
-        self.classifications.retain(|k, _| !k.starts_with(&prefix));
+        let owned = keys_owned_by(&self.tool_map, server_name);
+        self.tools.retain(|t| !owned.contains(&t.name));
+        self.classifications.retain(|k, _| !owned.contains(k));
+        self.tool_map.retain(|_, (server, _)| server != server_name);
     }
 
     /// Same replace-don't-append contract as [`Self::register_tools`].
@@ -572,14 +636,58 @@ impl ProxyServer {
                 description,
                 mime_type: r.mime_type.clone(),
                 annotations: r.annotations.clone(),
+                extra: r.extra.clone(),
             });
         }
     }
 
     pub(crate) fn unregister_resources(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}{SEPARATOR}");
-        self.resources.retain(|r| !r.uri.starts_with(&prefix));
-        self.resource_map.retain(|k, _| !k.starts_with(&prefix));
+        let owned = keys_owned_by(&self.resource_map, server_name);
+        self.resources.retain(|r| !owned.contains(&r.uri));
+        self.resource_map
+            .retain(|_, (server, _)| server != server_name);
+    }
+
+    /// Same replace-don't-append contract as [`Self::register_tools`].
+    ///
+    /// The template is namespaced like a resource URI, so the backend a
+    /// client's expanded URI belongs to is still readable from the prefix.
+    pub(crate) fn register_resource_templates(
+        &mut self,
+        server_name: &str,
+        templates: &[ResourceTemplate],
+    ) {
+        self.unregister_resource_templates(server_name);
+        for t in templates {
+            let namespaced = format!("{server_name}{SEPARATOR}{}", t.uri_template);
+            if self.resource_template_map.contains_key(&namespaced) {
+                continue;
+            }
+            let description = t
+                .description
+                .as_ref()
+                .map(|d| format!("[{server_name}] {d}"));
+            self.resource_template_map.insert(
+                namespaced.clone(),
+                (server_name.to_string(), t.uri_template.clone()),
+            );
+            self.resource_templates.push(ResourceTemplate {
+                uri_template: namespaced,
+                name: format!("{server_name}{SEPARATOR}{}", t.name),
+                description,
+                mime_type: t.mime_type.clone(),
+                annotations: t.annotations.clone(),
+                extra: t.extra.clone(),
+            });
+        }
+    }
+
+    pub(crate) fn unregister_resource_templates(&mut self, server_name: &str) {
+        let owned = keys_owned_by(&self.resource_template_map, server_name);
+        self.resource_templates
+            .retain(|t| !owned.contains(&t.uri_template));
+        self.resource_template_map
+            .retain(|_, (server, _)| server != server_name);
     }
 
     /// Same replace-don't-append contract as [`Self::register_tools`].
@@ -602,22 +710,24 @@ impl ProxyServer {
                 name: namespaced_name,
                 description,
                 arguments: p.arguments.clone(),
+                extra: p.extra.clone(),
             });
         }
     }
 
     pub(crate) fn unregister_prompts(&mut self, server_name: &str) {
-        let prefix = format!("{server_name}{SEPARATOR}");
-        self.prompts.retain(|p| !p.name.starts_with(&prefix));
-        self.prompt_map.retain(|k, _| !k.starts_with(&prefix));
+        let owned = keys_owned_by(&self.prompt_map, server_name);
+        self.prompts.retain(|p| !owned.contains(&p.name));
+        self.prompt_map
+            .retain(|_, (server, _)| server != server_name);
     }
 
     /// Collect cached tools for a server from the current tool list (for storing in Disconnected state).
     pub(crate) fn collect_cached_tools(&self, server_name: &str) -> Vec<Tool> {
-        let prefix = format!("{server_name}{SEPARATOR}");
+        let owned = keys_owned_by(&self.tool_map, server_name);
         self.tools
             .iter()
-            .filter(|t| t.name.starts_with(&prefix))
+            .filter(|t| owned.contains(&t.name))
             .cloned()
             .collect()
     }
@@ -638,11 +748,7 @@ impl ProxyServer {
                     usage_stats: UsageStats::new(),
                 },
             );
-            let tool_count = self
-                .tools
-                .iter()
-                .filter(|t| t.name.starts_with(&format!("{name}{SEPARATOR}")))
-                .count();
+            let tool_count = keys_owned_by(&self.tool_map, &name).len();
             tracing::info!(server = %name, tool_count, "tools loaded from cache");
         }
     }
@@ -666,23 +772,29 @@ impl ProxyServer {
     pub(crate) fn snapshot_cache_entries(&self) -> Vec<(String, BackendToolCache)> {
         let mut out = Vec::new();
         for name in &self.discovered_backends {
-            let prefix = format!("{name}{SEPARATOR}");
+            // The owner and the original name both come from `tool_map`
+            // rather than from the key's prefix. Stripping `docs__` off a
+            // tool owned by `docs__archive` yields `archive__search`, which
+            // is the name a warm start would then call the backend with.
             let tools: Vec<Tool> = self
                 .tools
                 .iter()
-                .filter(|t| t.name.starts_with(&prefix))
-                .map(|t| {
-                    let original_name = t.name.strip_prefix(&prefix).unwrap_or(&t.name).to_string();
+                .filter_map(|t| {
+                    let (owner, original_name) = self.tool_map.get(&t.name)?;
+                    if owner != name {
+                        return None;
+                    }
                     let original_desc = t.description.as_ref().map(|d| {
                         let tag = format!("[{name}] ");
                         d.strip_prefix(&tag).unwrap_or(d).to_string()
                     });
-                    Tool {
-                        name: original_name,
+                    Some(Tool {
+                        name: original_name.clone(),
                         description: original_desc,
                         input_schema: t.input_schema.clone(),
                         annotations: t.annotations.clone(),
-                    }
+                        extra: t.extra.clone(),
+                    })
                 })
                 .collect();
 
@@ -715,6 +827,29 @@ impl ProxyServer {
             match self.discovery_failures.get(name) {
                 Some(failure) => failure.should_retry(),
                 None => true, // never attempted
+            }
+        })
+    }
+
+    /// Like `has_undiscovered_backends`, but ignores backends whose tools are
+    /// already registered from the persistent cache. `tools/list` uses this
+    /// to decide whether it must block: the background refresh marks every
+    /// cache-loaded backend as undiscovered again, and blocking on that
+    /// refresh would throw away the instant answer the cache exists for.
+    pub(crate) fn has_backends_without_tools(&self) -> bool {
+        self.configs.keys().any(|name| {
+            if self.discovered_backends.contains(name) {
+                return false;
+            }
+            if matches!(
+                self.backends.get(name),
+                Some(BackendState::Disconnected { cached_tools, .. }) if !cached_tools.is_empty()
+            ) {
+                return false;
+            }
+            match self.discovery_failures.get(name) {
+                Some(failure) => failure.should_retry(),
+                None => true,
             }
         })
     }
@@ -782,6 +917,7 @@ impl ProxyServer {
         client: Arc<McpClient>,
         tools: &[Tool],
         resources: &[Resource],
+        templates: &[ResourceTemplate],
         prompts: &[Prompt],
     ) -> Option<Arc<McpClient>> {
         let (mut stats, prev) = match self.backends.remove(server_name) {
@@ -796,6 +932,7 @@ impl ProxyServer {
 
         self.register_tools(server_name, tools);
         self.register_resources(server_name, resources);
+        self.register_resource_templates(server_name, templates);
         self.register_prompts(server_name, prompts);
         tracing::info!(
             server = %server_name,
@@ -1248,6 +1385,7 @@ mod tests {
             description: Some("Search for issues".to_string()),
             input_schema: None,
             annotations: None,
+            ..Default::default()
         };
 
         let server_name = "sentry";
@@ -1256,6 +1394,97 @@ mod tests {
 
         assert_eq!(namespaced, "sentry__search_issues");
         assert_eq!(description, "[sentry] Search for issues");
+    }
+
+    /// Namespacing rebuilds each primitive field by field, so a field the
+    /// rebuild forgets never reaches the client even when the struct models
+    /// it. `outputSchema` is the one that hurts: `tools/call` relays
+    /// `structuredContent` verbatim, so the client gets the payload and not
+    /// the schema the spec says it SHOULD validate against.
+    #[test]
+    fn registering_a_tool_keeps_the_fields_the_struct_does_not_name() {
+        let mut server = test_server();
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "search",
+            "title": "Search",
+            "outputSchema": {"type": "object", "properties": {"hits": {"type": "number"}}},
+            "icons": [{"src": "https://example.test/i.png"}],
+            "_meta": {"vendor/flag": true}
+        }))
+        .unwrap();
+
+        server.register_tools("sentry", &[tool]);
+
+        let listed = serde_json::to_value(&server.tools[0]).unwrap();
+        assert_eq!(listed["name"], "sentry__search");
+        assert_eq!(listed["title"], "Search");
+        assert_eq!(
+            listed["outputSchema"]["properties"]["hits"]["type"],
+            "number"
+        );
+        assert_eq!(listed["icons"][0]["src"], "https://example.test/i.png");
+        assert_eq!(listed["_meta"]["vendor/flag"], true);
+    }
+
+    #[test]
+    fn registering_a_resource_keeps_title_and_size() {
+        let mut server = test_server();
+        let resource: crate::protocol::Resource = serde_json::from_value(json!({
+            "uri": "file:///a.txt",
+            "name": "a.txt",
+            "title": "Notes",
+            "size": 1234
+        }))
+        .unwrap();
+
+        server.register_resources("docs", &[resource]);
+
+        let listed = serde_json::to_value(&server.resources[0]).unwrap();
+        assert_eq!(listed["uri"], "docs__file:///a.txt");
+        assert_eq!(listed["title"], "Notes");
+        assert_eq!(listed["size"], 1234);
+    }
+
+    #[test]
+    fn registering_a_prompt_keeps_title_and_icons() {
+        let mut server = test_server();
+        let prompt: crate::protocol::Prompt = serde_json::from_value(json!({
+            "name": "review",
+            "title": "Review a diff",
+            "icons": [{"src": "https://example.test/i.png"}]
+        }))
+        .unwrap();
+
+        server.register_prompts("gh", &[prompt]);
+
+        let listed = serde_json::to_value(&server.prompts[0]).unwrap();
+        assert_eq!(listed["name"], "gh__review");
+        assert_eq!(listed["title"], "Review a diff");
+        assert_eq!(listed["icons"][0]["src"], "https://example.test/i.png");
+    }
+
+    /// The warm-start cache strips the namespace back off, which is a second
+    /// field-by-field rebuild. A tool restored from cache must carry the same
+    /// definition the backend gave us.
+    #[test]
+    fn the_cache_snapshot_keeps_the_fields_the_struct_does_not_name() {
+        let mut server = test_server();
+        server
+            .config_hashes
+            .insert("sentry".to_string(), "hash".to_string());
+        server.discovered_backends.insert("sentry".to_string());
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "search",
+            "outputSchema": {"type": "object"}
+        }))
+        .unwrap();
+        server.register_tools("sentry", &[tool]);
+
+        let entries = server.snapshot_cache_entries();
+        let (_, entry) = entries.iter().find(|(n, _)| n == "sentry").unwrap();
+        let cached = serde_json::to_value(&entry.tools[0]).unwrap();
+        assert_eq!(cached["name"], "search");
+        assert_eq!(cached["outputSchema"], json!({"type": "object"}));
     }
 
     #[test]
@@ -1382,6 +1611,7 @@ mod tests {
             description: Some(format!("does {name}")),
             input_schema: None,
             annotations: None,
+            ..Default::default()
         }
     }
 
@@ -1486,12 +1716,14 @@ mod tests {
                 description: Some("Search stuff".to_string()),
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             },
             Tool {
                 name: "create".to_string(),
                 description: None,
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             },
         ];
 
@@ -1509,6 +1741,7 @@ mod tests {
                 description: Some("Send msg".to_string()),
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
         assert_eq!(server.tools.len(), 3);
@@ -1530,6 +1763,7 @@ mod tests {
                 description: Some("Search".to_string()),
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
         server.register_tools(
@@ -1539,6 +1773,7 @@ mod tests {
                 description: Some("Send".to_string()),
                 input_schema: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
 
@@ -1567,6 +1802,7 @@ mod tests {
                     description: Some("First".to_string()),
                     mime_type: None,
                     annotations: None,
+                    ..Default::default()
                 },
                 Resource {
                     uri: "issue://2".to_string(),
@@ -1574,6 +1810,7 @@ mod tests {
                     description: None,
                     mime_type: None,
                     annotations: None,
+                    ..Default::default()
                 },
             ],
         );
@@ -1591,6 +1828,113 @@ mod tests {
         assert!(server.resource_map.is_empty());
     }
 
+    /// A reload or an idle reap drops a backend's primitives. Templates have
+    /// to go with them, or a removed backend keeps advertising resources it
+    /// no longer serves.
+    /// The warm-start cache strips the namespace back off by prefix, so with
+    /// `docs` and `docs__archive` the first backend claimed the second's
+    /// tools and stored them under a mangled name (`archive__search`).
+    #[test]
+    fn the_cache_snapshot_assigns_each_tool_to_its_real_owner() {
+        let mut server = test_server();
+        for alias in ["docs", "docs__archive"] {
+            server
+                .config_hashes
+                .insert(alias.to_string(), format!("hash-{alias}"));
+            server.discovered_backends.insert(alias.to_string());
+        }
+        server.register_tools(
+            "docs__archive",
+            &[serde_json::from_value(json!({"name": "search"})).unwrap()],
+        );
+        server.register_tools(
+            "docs",
+            &[serde_json::from_value(json!({"name": "lookup"})).unwrap()],
+        );
+
+        let entries = server.snapshot_cache_entries();
+        let names = |alias: &str| -> Vec<String> {
+            entries
+                .iter()
+                .find(|(n, _)| n == alias)
+                .map(|(_, e)| e.tools.iter().map(|t| t.name.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(names("docs"), vec!["lookup".to_string()]);
+        assert_eq!(names("docs__archive"), vec!["search".to_string()]);
+
+        assert_eq!(
+            server
+                .collect_cached_tools("docs")
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["docs__lookup".to_string()]
+        );
+    }
+
+    /// Config allows an alias that is another alias plus the separator
+    /// (`docs` and `docs__archive`), and `docs__` prefixes every
+    /// `docs__archive__*` key. Registration unregisters first even for an
+    /// empty list, so with that pair whichever backend the parallel
+    /// discovery commits second used to wipe the other one's primitives.
+    #[test]
+    fn unregistering_a_backend_leaves_a_prefix_sharing_alias_alone() {
+        let mut server = test_server();
+        let t: Tool = serde_json::from_value(json!({"name": "search"})).unwrap();
+        let r: crate::protocol::Resource =
+            serde_json::from_value(json!({"uri": "u", "name": "n"})).unwrap();
+        let pr: crate::protocol::Prompt = serde_json::from_value(json!({"name": "p"})).unwrap();
+        let tpl: ResourceTemplate =
+            serde_json::from_value(json!({"uriTemplate": "u://{id}", "name": "n"})).unwrap();
+
+        server.register_tools("docs__archive", &[t]);
+        server.register_resources("docs__archive", &[r]);
+        server.register_prompts("docs__archive", &[pr]);
+        server.register_resource_templates("docs__archive", &[tpl]);
+
+        // `docs` is discovered second and happens to expose nothing.
+        server.register_tools("docs", &[]);
+        server.register_resources("docs", &[]);
+        server.register_prompts("docs", &[]);
+        server.register_resource_templates("docs", &[]);
+
+        println!(
+            "after registering empty `docs`: tools={} resources={} prompts={} templates={}",
+            server.tools.len(),
+            server.resources.len(),
+            server.prompts.len(),
+            server.resource_templates.len()
+        );
+        assert_eq!(server.tools.len(), 1, "tools");
+        assert_eq!(server.resources.len(), 1, "resources");
+        assert_eq!(server.prompts.len(), 1, "prompts");
+        assert_eq!(server.resource_templates.len(), 1, "templates");
+    }
+
+    #[test]
+    fn test_register_unregister_resource_templates() {
+        let mut server = test_server();
+        let template: ResourceTemplate = serde_json::from_value(json!({
+            "uriTemplate": "issue://{id}",
+            "name": "Issue",
+            "title": "An issue"
+        }))
+        .unwrap();
+
+        server.register_resource_templates("sentry", &[template]);
+        assert_eq!(server.resource_templates.len(), 1);
+        assert!(server
+            .resource_template_map
+            .contains_key("sentry__issue://{id}"));
+        let listed = serde_json::to_value(&server.resource_templates[0]).unwrap();
+        assert_eq!(listed["title"], "An issue");
+
+        server.unregister_resource_templates("sentry");
+        assert!(server.resource_templates.is_empty());
+        assert!(server.resource_template_map.is_empty());
+    }
+
     #[test]
     fn test_register_unregister_prompts() {
         let mut server = test_server();
@@ -1600,6 +1944,7 @@ mod tests {
                 name: "summarize".to_string(),
                 description: Some("Summarize text".to_string()),
                 arguments: None,
+                ..Default::default()
             }],
         );
         assert_eq!(server.prompts.len(), 1);
@@ -2379,6 +2724,7 @@ mod tests {
                 description: None,
                 mime_type: None,
                 annotations: None,
+                ..Default::default()
             }],
         );
         server.register_prompts(
@@ -2387,6 +2733,7 @@ mod tests {
                 name: "review".to_string(),
                 description: None,
                 arguments: None,
+                ..Default::default()
             }],
         );
         server.register_tools("keep", &[tool("search")]);

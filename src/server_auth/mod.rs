@@ -165,6 +165,12 @@ fn default_groups_header() -> String {
 /// audience checks against revocation. Callers (typically `run_http`)
 /// load the state from disk and pass an `Arc` here.
 ///
+/// Builds, and mutates nothing. A reload calls this while it is still deciding
+/// whether to accept the new config, and a provider earlier in the list must
+/// not have written anything by the time a later one fails. Applying the
+/// configured clients is therefore the caller's job, in its apply phase —
+/// see [`configured_static_clients`].
+///
 /// Schema is intentionally not backwards-compatible with the legacy
 /// `provider: String` field: configs that still carry it deserialize
 /// into an empty `providers` vec, which boots as `NoAuth`. Operators
@@ -219,6 +225,49 @@ pub fn build_auth_provider(
     }
 
     Ok(Arc::new(ProviderChain::new(providers)))
+}
+
+/// The clients `oauthAs.staticClients` declares, as the records
+/// [`oauth_as::AsState::set_static_clients`] stores.
+///
+/// Pure, and separate from [`build_auth_provider`], so that a reload can decide
+/// the whole config is good before any of it is written: `set_static_clients`
+/// replaces the map wholesale, and doing that from inside the provider build
+/// leaves a refused config's clients installed.
+///
+/// `now_unix` is a parameter rather than a clock read so the conversion is
+/// testable.
+///
+/// Empty when there is no `oauthAs` block or it declares no clients. Callers
+/// apply it unconditionally: a config that dropped its last static client has
+/// to clear the ones still in the map, which is what makes a removal take
+/// effect without a restart.
+pub fn configured_static_clients(
+    config: &ServerAuthConfig,
+    now_unix: u64,
+) -> Vec<oauth_as::RegisteredClient> {
+    config
+        .oauth_as
+        .iter()
+        .flat_map(|oauth| &oauth.static_clients)
+        // Both empty lists are deliberate, not a half-filled DCR record:
+        // the entry exists only for the existence check in provider.rs, and
+        // enterprise-managed clients never go through /authorize.
+        //
+        // `redirect_uris` empty does fail closed — authorize.rs matches the
+        // request against this list, so no redirect_uri can match. The
+        // empty `grant_types` guarantees nothing: no request-time path in
+        // `src/` reads a registered client's grant list, so it neither
+        // permits nor refuses any grant today. Whether a per-client grant
+        // check belongs on the exchange is Task 6's call.
+        .map(|c| oauth_as::RegisteredClient {
+            client_id: c.client_id.clone(),
+            client_name: None,
+            redirect_uris: vec![],
+            grant_types: vec![],
+            created_at_unix: now_unix,
+        })
+        .collect()
 }
 
 /// Check if a resource is allowed for the given identity.
@@ -468,6 +517,60 @@ mod tests {
         let mut b = Credentials::new();
         b.insert("x-forwarded-user".to_string(), "alice".to_string());
         assert_eq!(provider.authenticate(&b).await.unwrap().subject, "alice");
+    }
+
+    #[test]
+    fn test_configured_static_clients_convert_and_apply_without_being_persisted() {
+        // OAuthAsAuth refuses tokens whose `aud` is not a known client, so a
+        // configured client has to pass that check — and has to do it without
+        // reaching the persisted snapshot, or a client removed from config
+        // leaves an orphan on the PVC that nothing in config can clear.
+        //
+        // Conversion and application are two steps now: `build_auth_provider`
+        // runs in the validate phase of a reload and must be able to fail
+        // having written nothing.
+        let config: ServerAuthConfig = serde_json::from_value(serde_json::json!({
+            "providers": ["oauth_as"],
+            "oauthAs": {
+                "issuerUrl": "https://mcp.example.com",
+                "jwtSecret": "x".repeat(32),
+                "trustedSourceCidrs": ["127.0.0.1/32"],
+                "redirectUriAllowlist": ["https://claude.ai/api/mcp/auth_callback"],
+                "staticClients": [{"clientId": "ema-client"}]
+            }
+        }))
+        .unwrap();
+        let state = Arc::new(oauth_as::AsState::default());
+        build_auth_provider(&config, Some(&state)).unwrap();
+        assert!(
+            state.get_client("ema-client").is_none(),
+            "building the provider must not have touched the client map"
+        );
+
+        let clients = configured_static_clients(&config, 1_700_000_000);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].client_id, "ema-client");
+        assert_eq!(clients[0].created_at_unix, 1_700_000_000);
+        // Empty on purpose: the record exists for the existence check alone,
+        // and the empties make /authorize fail closed for it.
+        assert!(clients[0].redirect_uris.is_empty());
+        assert!(clients[0].grant_types.is_empty());
+
+        state.set_static_clients(clients);
+        let client = state.get_client("ema-client").unwrap();
+        assert_eq!(client.client_id, "ema-client");
+        assert!(!state
+            .snapshot_persisted()
+            .clients
+            .contains_key("ema-client"));
+    }
+
+    #[test]
+    fn test_configured_static_clients_is_empty_without_oauth_as() {
+        // Boot and reload apply the result unconditionally, so a config with
+        // no `oauthAs` has to clear the map rather than leave the previous
+        // config's clients answering.
+        assert!(configured_static_clients(&ServerAuthConfig::default(), 0).is_empty());
     }
 
     #[test]

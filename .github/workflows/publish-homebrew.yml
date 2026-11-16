@@ -9,6 +9,13 @@ on:
         description: "Release tag to publish (e.g. v0.5.0)"
         required: true
 
+concurrency:
+  group: publish-homebrew
+  # Nunca cancela: commita a formula no tap. Interromper entre o bump da
+  # versao e o do sha256 deixa a formula sem instalar. O group e global
+  # porque o tap e um repo so.
+  cancel-in-progress: false
+
 permissions:
   contents: write
 

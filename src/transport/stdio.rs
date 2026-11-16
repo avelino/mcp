@@ -52,7 +52,8 @@ impl StdioTransport {
             return Err(e.into());
         }
 
-        let mut cmd = Command::new(command);
+        let program = super::which::program_for_spawn(command, env);
+        let mut cmd = Command::new(&program);
         cmd.args(args)
             .envs(env)
             .stdin(std::process::Stdio::piped())
@@ -235,6 +236,14 @@ impl Transport for StdioTransport {
                 )
             }
         }
+    }
+
+    /// Also drops the pending entry. Nothing is going to answer the cancelled
+    /// id now, and the reader task would otherwise hold its `oneshot::Sender`
+    /// for the rest of the process's life.
+    async fn cancel(&self, request_id: &serde_json::Value) -> Result<()> {
+        self.pending.lock().await.remove(&request_id.to_string());
+        self.notify(&super::cancellation(request_id)).await
     }
 
     async fn notify(&self, msg: &JsonRpcNotification) -> Result<()> {

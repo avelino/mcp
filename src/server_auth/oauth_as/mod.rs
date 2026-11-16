@@ -14,9 +14,11 @@
 //!   their own files as the implementation tasks progress; declared
 //!   here once they exist.
 
+mod assertion;
 mod authorize;
 mod cidr;
 mod config;
+mod jwks;
 mod jwt;
 mod metadata;
 mod provider;
@@ -34,8 +36,9 @@ mod test_helpers;
 
 pub use config::OAuthAsConfig;
 pub use provider::OAuthAsAuth;
-pub use state::AsState;
+pub use state::{AsState, MAX_SEEN_JTI};
 pub use store::{load as load_state, save as save_state, state_path};
+pub use types::RegisteredClient;
 
 use std::sync::Arc;
 
@@ -52,9 +55,14 @@ pub fn router(config: Arc<OAuthAsConfig>, state: Arc<AsState>) -> Router {
     // The metadata handlers only need the config, so they get a
     // narrower state. The token / register / authorize handlers
     // need both, bundled in `register::AppCtx`.
+    //
+    // One `JwksCache` for the whole router: built here rather than per
+    // request so a key set fetched for one exchange serves the next, which
+    // is what keeps `/token` from costing the issuer two GETs every time.
     let app_ctx = Arc::new(register::AppCtx {
         config: config.clone(),
         state,
+        jwks: Arc::new(jwks::JwksCache::new(jwks::https_only_client())),
     });
 
     let metadata_router = Router::new()

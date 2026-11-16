@@ -17,3 +17,16 @@ updates:
       cargo:
         patterns:
           - "*"
+    # chrondb e pinado numa pre-release (`0.2.3-dev.<sha>`). O Dependabot
+    # resolve um update montando um range (`>=atual, <=alvo`), e o Cargo nao
+    # casa pre-release por range, so por versao exata -- ele diz isso na
+    # mensagem: "if you are looking for the prerelease package it needs to be
+    # specified explicitly".
+    #
+    # Como o grupo `cargo` e `*`, a dep que nao resolve derruba o grupo
+    # inteiro: o run de 2026-11-04 perdeu serde_json, sha2, open, uuid e libc
+    # por causa so do chrondb. Ignorar devolve o resto do grupo.
+    #
+    # Sai daqui quando o chrondb publicar versao estavel.
+    ignore:
+      - dependency-name: chrondb

@@ -6,8 +6,11 @@ pub mod which;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde_json::{json, Value};
 
-use crate::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
+use crate::protocol::{
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, CANCELLED_NOTIFICATION,
+};
 
 /// Transport trait — all methods take `&self` so a single transport instance
 /// can be shared across many concurrent requests via `Arc`. Implementations
@@ -40,6 +43,19 @@ pub trait Transport: Send + Sync {
         self.request(msg).await
     }
 
+    /// Tell the backend to stop working on `request_id`.
+    ///
+    /// Default: send `notifications/cancelled` and nothing else, which is all
+    /// the protocol asks for. A transport holding per-request state of its own
+    /// overrides this to drop that state too.
+    ///
+    /// A backend that does not implement the notification ignores it and keeps
+    /// going. The proxy frees its own slot and connection either way, but the
+    /// backend's quota is only spared by a backend that honors it.
+    async fn cancel(&self, request_id: &Value) -> Result<()> {
+        self.notify(&cancellation(request_id)).await
+    }
+
     /// Tell the transport which protocol revision the client negotiated.
     ///
     /// Default no-op: only Streamable HTTP changes wire behavior across
@@ -48,4 +64,12 @@ pub trait Transport: Send + Sync {
     /// pre-2026-07-28 behavior, which is what every current backend
     /// expects.
     fn set_protocol_version(&self, _version: &str) {}
+}
+
+/// The `notifications/cancelled` message for `request_id`.
+pub(crate) fn cancellation(request_id: &Value) -> JsonRpcNotification {
+    JsonRpcNotification::new(
+        CANCELLED_NOTIFICATION,
+        Some(json!({ "requestId": request_id })),
+    )
 }

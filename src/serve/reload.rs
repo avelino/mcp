@@ -33,6 +33,31 @@ pub(crate) struct AuthSnapshot {
     /// captured at boot, or editing `adminRoles` would need the restart this
     /// whole feature exists to avoid.
     pub(crate) admin_roles: Arc<Vec<String>>,
+    /// `WWW-Authenticate` value for a 401. In the snapshot, not in `AppState`,
+    /// because it is derived from `oauthAs.issuerUrl` and a reload that changes
+    /// the issuer has to change the challenge in the same write as the provider
+    /// that rejects the request.
+    pub(crate) www_authenticate: String,
+}
+
+/// The challenge a 401 carries (RFC 9728 §5.1). With an authorization server
+/// configured it points at the protected-resource metadata, which is how a
+/// client that knows only this URL finds where to sign in. Without one there
+/// is nothing to point at, so it stays a bare scheme.
+///
+/// Both the provider and its sub-config are required: the metadata route is
+/// mounted only when `oauth_as` is in `providers`, and a pointer to a route
+/// that 404s sends the client chasing nothing.
+pub(crate) fn www_authenticate_for(config: &ServerAuthConfig) -> String {
+    let enabled = config.providers.iter().any(|p| p == "oauth_as");
+    match config.oauth_as.as_ref().filter(|_| enabled) {
+        // Same trim as the metadata handler, so the URL names the route it serves.
+        Some(oauth) => format!(
+            "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            oauth.issuer_url.trim_end_matches('/')
+        ),
+        None => "Bearer".to_string(),
+    }
 }
 
 pub(crate) type SharedAuth = Arc<std::sync::RwLock<AuthSnapshot>>;
@@ -47,7 +72,15 @@ impl AuthSnapshot {
             provider,
             acl: Arc::new(acl),
             admin_roles: Arc::new(admin_roles),
+            www_authenticate: "Bearer".to_string(),
         }
+    }
+
+    /// Chained rather than a `new` parameter: only the HTTP transport has a
+    /// challenge to supply, and `new` has callers (stdio, tests) with none.
+    pub(crate) fn with_www_authenticate(mut self, challenge: String) -> Self {
+        self.www_authenticate = challenge;
+        self
     }
 
     pub(crate) fn shared(self) -> SharedAuth {
@@ -79,6 +112,14 @@ pub(crate) struct BootInvariants {
     /// Whether the OAuth AS sub-router was mounted. The router is built once,
     /// around the listener.
     pub(crate) oauth_as_enabled: bool,
+    /// `oauthAs.issuerUrl` as that sub-router was built with it, `None` when
+    /// the config carried no `oauthAs` block.
+    ///
+    /// Captured because the routes that *mint* and advertise `iss` were built
+    /// from a clone of this config, while a reload only rebuilds the provider
+    /// that *checks* it. Published one without the other, every token issued
+    /// after the reload is rejected by the validator that read the new value.
+    pub(crate) oauth_as_issuer_url: Option<String>,
     /// `audit.output` exactly as it was read from disk, *before*
     /// `resolve_for_serve` filled in the serve-mode default. The raw value is
     /// what the new config can be compared against; the resolved one would
@@ -129,6 +170,11 @@ pub(crate) struct ReloadOutcome {
 /// Unless it was the only provider: `build_auth_provider` reads an empty
 /// `providers` list as `NoAuth`, so stripping it there would turn a reload
 /// into the thing that opened the proxy. That is refused outright.
+///
+/// `providers` is the only field narrowed here. Every sibling — `acl`,
+/// `adminRoles`, `oauthAs` — comes back byte-identical, which is why
+/// `restart_required_by` can read the unnarrowed config and still agree
+/// with this one about everything but the toggle it exists to report.
 fn applicable_server_auth(
     mut config: ServerAuthConfig,
     as_state: Option<&Arc<AsState>>,
@@ -155,6 +201,17 @@ fn restart_required_by(boot: &BootInvariants, config: &Config) -> Vec<String> {
     }
     if config.audit.output != boot.audit_output {
         out.push("audit.output".to_string());
+    }
+    // Only when this process actually mounted the AS: without the sub-router
+    // there is nothing holding the old value, and the toggle above is already
+    // reporting the change that matters.
+    let issuer_now = config
+        .server_auth
+        .oauth_as
+        .as_ref()
+        .map(|oauth| oauth.issuer_url.as_str());
+    if boot.oauth_as_enabled && issuer_now != boot.oauth_as_issuer_url.as_deref() {
+        out.push("serverAuth.oauthAs.issuerUrl".to_string());
     }
     out
 }
@@ -229,6 +286,21 @@ pub(crate) async fn reload_in_place(
         p.classifier_cache.save();
     }
 
+    // Here and not beside `build_auth_provider` above: that call is still the
+    // validate phase, and `set_static_clients` replaces the map wholesale, so
+    // doing it there would leave a refused config's clients installed. Runs on
+    // every accepted reload, which is how a client removed from config
+    // disappears without a restart.
+    if let Some(state) = as_state {
+        state.set_static_clients(server_auth::configured_static_clients(
+            &auth_config,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ));
+    }
+
     // One write, so no request can observe the new provider against the old
     // ACL. See [`AuthSnapshot`].
     *auth
@@ -237,7 +309,8 @@ pub(crate) async fn reload_in_place(
         provider,
         config.server_auth.acl.clone(),
         config.server_auth.admin_roles.clone(),
-    );
+    )
+    .with_www_authenticate(www_authenticate_for(&auth_config));
 
     discover_pending_backends(proxy).await;
 

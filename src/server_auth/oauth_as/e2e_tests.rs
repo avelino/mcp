@@ -163,6 +163,8 @@ fn cfg_for_e2e() -> Arc<OAuthAsConfig> {
         scopes_supported: vec!["mcp".to_string()],
         redirect_uri_allowlist: vec!["https://claude.ai/api/mcp/auth_callback".to_string()],
         injected_roles: vec!["oauth-user".to_string()],
+        trusted_issuers: vec![],
+        static_clients: vec![],
     })
 }
 

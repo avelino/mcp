@@ -139,19 +139,6 @@ pub(crate) fn spend_bootstrap(state: &UiState, candidate: &str) -> bool {
     true
 }
 
-#[cfg(test)]
-fn bootstrap_valid(state: &UiState, candidate: &str) -> bool {
-    state
-        .bootstrap
-        .lock()
-        .ok()
-        .and_then(|b| {
-            b.as_ref()
-                .map(|b| b.expires > Instant::now() && ct_eq(&b.token, candidate))
-        })
-        .unwrap_or(false)
-}
-
 fn host_is_local(headers: &HeaderMap, bound: &str) -> bool {
     let Ok(bound) = bound.parse::<std::net::SocketAddr>() else {
         return false;

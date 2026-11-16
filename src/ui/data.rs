@@ -1093,6 +1093,7 @@ mod tests {
             description: None,
             input_schema: None,
             annotations: None,
+            extra: Default::default(),
         }
     }
 
