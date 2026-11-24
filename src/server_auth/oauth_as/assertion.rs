@@ -974,7 +974,7 @@ mod tests {
         let token = encode(
             &header,
             &claims(&fake.base),
-            &EncodingKey::from_secret(AS_SECRET.as_bytes()),
+            &EncodingKey::from_secret(AS_SECRET.as_bytes()).expect("test secret is non-empty"),
         )
         .unwrap();
 
