@@ -10,4 +10,6 @@ unmaintained = "all"
 unsound = "all"
 # Fail on vulnerabilities, unsound and unmaintained crates in the whole graph.
 # Add an entry here only with a reason and a link.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained but has no known vulnerability; migration to jiff or time is tracked separately. https://rustsec.org/advisories/RUSTSEC-2026-0543" },
+]
