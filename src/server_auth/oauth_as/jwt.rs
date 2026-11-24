@@ -13,7 +13,8 @@ use super::types::JwtClaims;
 /// `{ "alg": "HS256", "typ": "JWT" }` — there is no negotiation.
 pub fn sign(claims: &JwtClaims, secret: &[u8]) -> Result<String> {
     let header = Header::new(Algorithm::HS256);
-    encode(&header, claims, &EncodingKey::from_secret(secret)).context("failed to sign JWT")
+    let key = EncodingKey::from_secret(secret).context("invalid JWT signing secret")?;
+    encode(&header, claims, &key).context("failed to sign JWT")
 }
 
 /// Verify a bearer-style JWT and return its claims if valid.
@@ -38,8 +39,8 @@ pub fn verify(
     validation.set_audience(&[expected_audience]);
     validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud", "sub"]);
 
-    let data = decode::<JwtClaims>(token, &DecodingKey::from_secret(secret), &validation)
-        .context("JWT verification failed")?;
+    let key = DecodingKey::from_secret(secret).context("invalid JWT verification secret")?;
+    let data = decode::<JwtClaims>(token, &key, &validation).context("JWT verification failed")?;
 
     // Defense in depth: the `jsonwebtoken` crate already rejects
     // header.alg mismatches via `Validation::new(HS256)`, but assert
