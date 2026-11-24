@@ -43,7 +43,7 @@ shell-words = "1"
 socket2 = { version = "0.6", features = ["all"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-jsonwebtoken = { version = "11", default-features = false, features = [
+jsonwebtoken = { version = "12", default-features = false, features = [
   "aws_lc_rs",
 ] }
 
