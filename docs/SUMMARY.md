@@ -19,6 +19,7 @@
 * [CLI as MCP](guides/cli-as-mcp.md)
 * [Proxy mode](guides/proxy-mode.md)
 * [Audit logging](guides/audit-logging.md)
+* [Web UI](guides/web-ui.md)
 * [Observability](guides/observability.md)
 * [Enterprise token management](guides/enterprise-token-management.md)
 

@@ -630,3 +630,32 @@ mcp acl check --role dev --server grafana --tool query_prometheus || echo "BLOCK
 # Audit what a role can reach on a server
 mcp acl check --role dev --server github --all-tools --format json | jq '.[] | select(.decision=="DENY")'
 ```
+
+## `mcp ui`
+
+Start the local web UI. It renders from the same config file, tool cache, audit log and ACL the CLI uses, and edits go through a diff + atomic write.
+
+```bash
+mcp ui                            # http://127.0.0.1:7332, opens a browser
+mcp ui --addr 127.0.0.1:9000      # different port
+mcp ui --no-open                  # print the URL only
+mcp ui --read-only                # disable every mutating route
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--addr <host:port>` | `127.0.0.1:7332` | Bind address; non-loopback binds are allowed but the token is the only protection |
+| `--no-open` | off | Do not launch a browser |
+| `--read-only` | off | Disable editing (also forced when the config is inline in `MCP_SERVERS_CONFIG`) |
+| `--insecure` | off | Acknowledge a non-loopback bind on plain HTTP |
+| `--cookie-secure` | off | (`serve`) mark the UI session cookie `Secure` when the TLS terminator does not send `X-Forwarded-Proto` |
+
+The first request must carry the token printed at startup; it is single-use, expires after ten minutes, and is exchanged for a session cookie. Every write is audited with `source: "ui"`. See the [Web UI guide](../guides/web-ui.md).
+
+The UI can also be served by the proxy, for a team:
+
+```bash
+mcp serve --http 127.0.0.1:7332 --management
+```
+
+The pages mount at `/`, authenticate through `serverAuth` (bearer, OAuth-issued JWT or forwarded identity), filter the catalog by the caller's ACL, and allow writes only for roles in `serverAuth.adminRoles`. `--management` requires `--http`.

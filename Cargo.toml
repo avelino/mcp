@@ -46,6 +46,8 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 jsonwebtoken = { version = "12", default-features = false, features = [
   "aws_lc_rs",
 ] }
+jsonc-parser = { version = "0.34", features = ["cst", "serde_json"] }
+minijinja = { version = "3", default-features = false, features = ["builtins", "multi_template", "macros", "std_collections", "json", "serde"] }
 
 # OpenTelemetry — default-off, ativado via OTEL_EXPORTER_OTLP_ENDPOINT.
 # Suporta gRPC (tonic) e HTTP/protobuf (reqwest) — operador escolhe via

@@ -186,10 +186,10 @@ pub fn save_auth_store(store: &AuthStore) -> Result<()> {
 
     let path = auth_store_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::secure_file::create_private_dir(parent)?;
     }
     let content = serde_json::to_string_pretty(store)?;
-    std::fs::write(&path, content)?;
+    crate::secure_file::write_private(&path, content.as_bytes())?;
     Ok(())
 }
 

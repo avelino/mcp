@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Overview</h1>
+    <p class="sub">What this machine is configured to serve, and what the proxy did recently.</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/activity">Open activity</a>
+    <a class="btn primary" href="/playground">Run a tool</a>
+  </div>
+</div>
+
+{% if read_only %}
+<div class="banner">
+  <div>
+    <div class="t">Read-only</div>
+    <div class="d">{{ read_only_reason }}</div>
+  </div>
+</div>
+{% endif %}
+
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr));margin-bottom:14px">
+  <div class="card stat">
+    <div class="k">Backends</div>
+    <div class="v">{{ stats.servers }} <small>configured</small></div>
+    <div class="d">{{ stats.http }} http · {{ stats.stdio }} stdio · {{ stats.cli }} cli</div>
+  </div>
+  <div class="card stat">
+    <div class="k">Tools cached</div>
+    <div class="v">{{ stats.tools }}</div>
+    <div class="d">{{ stats.read }} read · {{ stats.write }} write</div>
+  </div>
+  <div class="card stat">
+    <div class="k">Calls · 24h</div>
+    <div class="v">{{ stats.calls }}</div>
+    <div class="d">{{ stats.errors }} failed · {{ stats.denied }} denied</div>
+  </div>
+  {% if not viewer_team %}
+  <div class="card stat">
+    <div class="k">Instances</div>
+    <div class="v">{{ instances | length }}</div>
+    <div class="d">running <code class="mono">mcp serve</code> processes</div>
+  </div>
+  {% endif %}
+</div>
+
+<div class="split">
+  <div class="stack">
+    <div class="card">
+      <div class="card-h">
+        <h2>Backends</h2>
+        <span class="spacer"></span>
+        <a class="btn sm ghost" href="/servers">Manage →</a>
+      </div>
+      <div class="card-b flush scroll-x">
+        {% if servers | length == 0 %}
+        <div class="empty">
+          No servers configured yet.<br>
+          <a class="btn sm" style="margin-top:10px" href="/servers">Add one from the registry or a URL →</a>
+        </div>
+        {% else %}
+        <table>
+          <thead><tr><th>Server</th><th>Type</th><th>Tools</th><th>Cache</th><th class="num">Calls 24h</th></tr></thead>
+          <tbody>
+            {% for s in servers %}
+            <tr class="click" data-href="/servers/{{ s.name | urlencode }}">
+              <td><div class="row"><span class="dot {{ s.dot }}"></span><span class="mono" style="font-weight:600">{{ s.name }}</span>
+                {% if not s.available %}<span class="chip err" title="{{ s.unavailable_reason }}">missing</span>{% endif %}</div></td>
+              <td><span class="chip">{{ s.kind }}</span></td>
+              <td>{{ s.tools }}{% if s.read or s.write %} <span class="tiny muted">({{ s.read }}r/{{ s.write }}w)</span>{% endif %}</td>
+              <td class="tiny muted mono">{{ s.cached_at }}</td>
+              <td class="num">{{ s.calls }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if not viewer_team %}
+    <div class="card">
+      <div class="card-h"><h2>Running instances</h2><span class="spacer"></span><span class="chip">{{ instances | length }}</span></div>
+      <div class="card-b flush">
+        {% if instances | length == 0 %}
+        <div class="empty">No <code class="mono">mcp serve</code> process is running on this machine.</div>
+        {% else %}
+        <table>
+          <thead><tr><th>Transport</th><th>Address</th><th>Started</th><th>Filter</th><th></th></tr></thead>
+          <tbody>
+            {% for i in instances %}
+            <tr>
+              <td><span class="chip">{{ i.transport }}</span></td>
+              <td class="mono tiny">{{ i.addr }}</td>
+              <td class="tiny muted mono">{{ i.started_at }}</td>
+              <td class="tiny muted mono">{{ i.filter }}</td>
+              <td style="text-align:right">
+                <form class="inline" method="post" action="/reload">
+                  <input type="hidden" name="csrf" value="{{ token }}">
+                  <input type="hidden" name="pid" value="{{ i.pid }}">
+                  <button class="btn sm" {% if read_only %}disabled{% endif %}>Reload</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <div class="card-h"><h2>Recent denials</h2><span class="spacer"></span><span class="chip err">{{ denials | length }}</span></div>
+      <div class="card-b flush">
+        {% if denials | length == 0 %}
+        <div class="empty" style="padding:24px">Nothing was denied in the last 24 hours.</div>
+        {% else %}
+        {% for d in denials %}
+        <div style="padding:10px 14px;border-bottom:1px solid var(--line-soft)">
+          <div class="row"><span class="mono tiny" style="font-weight:600">{{ d.tool }}</span><span class="spacer"></span><span class="tiny muted mono">{{ d.at }}</span></div>
+          <div class="tiny muted" style="margin-top:3px">{{ d.identity }} · {{ d.rule }}</div>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+
+    {% if viewer_admin %}
+    <div class="card">
+      <div class="card-h"><h2>Config</h2></div>
+      <div class="card-b">
+        <dl class="kv">
+          <dt>File</dt><dd class="mono tiny">{{ config_path }}</dd>
+          <dt>Hash</dt><dd class="mono tiny">{{ config_hash }}</dd>
+          <dt>Auth</dt><dd>{{ auth_summary }}</dd>
+          <dt>Audit</dt><dd>{{ audit_summary }}</dd>
+        </dl>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

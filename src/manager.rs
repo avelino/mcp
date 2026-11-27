@@ -340,7 +340,7 @@ fn is_valid_env_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
+pub(crate) fn build_config_entry(server: &registry::RegistryServer) -> Result<Value> {
     // Prefer packages (stdio) over remotes (http)
     if let Some(pkg) = server.packages.first() {
         let declared_env: Vec<&registry::EnvVar> = pkg

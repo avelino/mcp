@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Activity</h1>
+    <p class="sub">Every call, every ACL decision, every refusal — straight from the local audit log.</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/activity.json?{{ query_string }}">Export JSON</a>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:14px">
+  <div class="card-b" style="padding:10px 12px">
+    <form method="get" action="/activity" class="row" style="flex-wrap:wrap;gap:8px">
+      <div class="seg">
+        <a class="{% if not errors %}on{% endif %}" href="/activity?server={{ filters.server | urlencode }}&identity={{ filters.identity | urlencode }}&since={{ filters.since | urlencode }}">All</a>
+        <a class="{% if errors %}on{% endif %}" href="/activity?errors=1&server={{ filters.server | urlencode }}&identity={{ filters.identity | urlencode }}&since={{ filters.since | urlencode }}">Errors</a>
+      </div>
+      <select name="server" style="width:auto;font-family:var(--sans)">
+        <option value="">Server: all</option>
+        {% for s in server_names %}<option value="{{ s }}" {% if s == filters.server %}selected{% endif %}>{{ s }}</option>{% endfor %}
+      </select>
+      <select name="identity" style="width:auto;font-family:var(--sans)">
+        <option value="">Identity: all</option>
+        {% for i in identities %}<option value="{{ i }}" {% if i == filters.identity %}selected{% endif %}>{{ i }}</option>{% endfor %}
+      </select>
+      <select name="since" style="width:auto;font-family:var(--sans)">
+        {% for w in since_options %}<option value="{{ w }}" {% if w == filters.since %}selected{% endif %}>Since: {{ w }}</option>{% endfor %}
+      </select>
+      <button class="btn sm">Apply</button>
+      <span class="spacer"></span>
+      <span class="tiny muted">live refresh every 5s</span>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-b flush scroll-x" id="rows"
+       hx-get="/activity/rows?{{ query_string }}"
+       hx-trigger="every 5s"
+       hx-swap="innerHTML">
+    {% include "partials/activity_rows.html" %}
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,25 @@
+{% if allowed %}
+<div class="verdict allow">
+  <div class="label allow">ALLOW</div>
+  <p class="tiny" style="margin:8px 0 0;color:var(--txt-2)">
+    <b>{{ subject }}</b> may call <code class="mono">{{ key }}</code>. Matched rule: <code class="mono">{{ rule }}</code>.
+  </p>
+{% else %}
+<div class="verdict deny">
+  <div class="label deny">DENY</div>
+  <p class="tiny" style="margin:8px 0 0;color:var(--txt-2)">
+    <b>{{ subject }}</b> may not call <code class="mono">{{ key }}</code>. Matched rule: <code class="mono">{{ rule }}</code>.
+  </p>
+{% endif %}
+  <div class="tiny muted" style="margin-top:10px;border-top:1px solid var(--line-soft);padding-top:8px">
+    <div>roles: {% if roles %}{% for r in roles %}<span class="chip">{{ r }}</span> {% endfor %}{% else %}<span class="muted">none</span>{% endif %}</div>
+    {% if classification %}
+    <div style="margin-top:4px">classification: <span class="mono">{{ classification.kind }} ({{ classification.source }}, {{ classification.confidence }})</span></div>
+    {% else %}
+    <div style="margin-top:4px">classification: <span class="muted">unknown — tool not in cache; a read grant cannot cover an unclassified tool</span></div>
+    {% endif %}
+    {% if not has_acl %}
+    <div style="margin-top:4px">no <code class="mono">serverAuth.acl</code> configured — everything is allowed</div>
+    {% endif %}
+  </div>
+</div>

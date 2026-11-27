@@ -1,0 +1,36 @@
+<div class="stack">
+  <div class="card">
+    <div class="card-h">
+      <h2>Diff</h2>
+      <span class="spacer"></span>
+      {% if ok %}<span class="chip ok">valid</span>{% else %}<span class="chip err">invalid</span>{% endif %}
+    </div>
+    <div class="card-b flush">
+      {% if diff %}
+      <pre class="diff">{{ diff | safe }}</pre>
+      {% else %}
+      <div class="empty" style="padding:26px">No changes.</div>
+      {% endif %}
+    </div>
+    {% if error %}
+    <div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+      <span class="tiny deny">{{ error }}</span>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>Impact</h2></div>
+    <div class="card-b">
+      <dl class="kv" style="grid-template-columns:110px 1fr;font-size:11.5px">
+        <dt>Instances</dt><dd>{{ impact.instances }}</dd>
+        <dt>Cache</dt><dd>{{ impact.cache }}</dd>
+        <dt>Restart?</dt><dd class="{% if impact.restart %}deny{% else %}allow{% endif %}">{{ impact.restart_text }}</dd>
+        <dt>Backup</dt><dd class="mono tiny">servers.json.bak.&lt;timestamp&gt;</dd>
+      </dl>
+      <div class="note" style="margin-top:10px">
+        If the file changes before you apply, the write is refused with <code class="mono">409</code> and the diff is recomputed.
+      </div>
+    </div>
+  </div>
+</div>

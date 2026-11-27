@@ -465,6 +465,28 @@ impl AuditLogger {
         }
     }
 
+    /// Number of stored entries.
+    ///
+    /// ChronDB has no count API, so this still reads the key list — but it does
+    /// not deserialize a single entry, which is what `query_filtered` with
+    /// `usize::MAX` did every time the settings page was opened.
+    pub fn count(&self) -> Result<usize> {
+        match self {
+            AuditLogger::Disabled | AuditLogger::Stream { .. } => Ok(0),
+            AuditLogger::Active { pool, .. } => {
+                let db = pool.acquire()?;
+                let raw = db
+                    .list_by_prefix("audit:", None)
+                    .map_err(|e| anyhow::anyhow!("failed to count audit logs: {e:?}"))?;
+                Ok(match raw {
+                    Value::Array(items) => items.len(),
+                    Value::Object(map) => map.len(),
+                    _ => 0,
+                })
+            }
+        }
+    }
+
     pub fn query_filtered(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
         match self {
             AuditLogger::Disabled | AuditLogger::Stream { .. } => Ok(vec![]),
@@ -473,17 +495,53 @@ impl AuditLogger {
                 let raw = db
                     .list_by_prefix("audit:", None)
                     .map_err(|e| anyhow::anyhow!("failed to query audit logs: {e:?}"))?;
-                let all_entries = parse_entries_from_list(&raw, usize::MAX)?;
-
-                let filtered: Vec<AuditEntry> = all_entries
-                    .into_iter()
-                    .rev() // most recent first
-                    .filter(|e| filter.matches(e))
-                    .take(filter.limit)
-                    .collect();
-
-                Ok(filtered)
+                Ok(filter_reversed(&raw, filter))
             }
+        }
+    }
+}
+
+/// Newest first, stopping once `limit` entries match.
+///
+/// The old version deserialized the whole table before applying the filter.
+/// The list itself is still in memory (ChronoDB has no query API), but a page
+/// that asks for 200 recent entries no longer pays for a full decode.
+fn filter_reversed(raw: &Value, filter: &AuditFilter) -> Vec<AuditEntry> {
+    let mut out = Vec::with_capacity(filter.limit.min(512));
+
+    match raw {
+        Value::Array(items) => {
+            for item in items.iter().rev() {
+                push_if_match(&mut out, item, filter);
+                if out.len() >= filter.limit {
+                    break;
+                }
+            }
+        }
+        Value::Object(map) => {
+            // Keys are `audit:{millis}-{uuid}`; sorting them puts the newest
+            // last, which the reverse iteration then reads first.
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for key in keys.into_iter().rev() {
+                push_if_match(&mut out, &map[key], filter);
+                if out.len() >= filter.limit {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn push_if_match(out: &mut Vec<AuditEntry>, item: &Value, filter: &AuditFilter) {
+    if out.len() >= filter.limit {
+        return;
+    }
+    if let Ok(entry) = serde_json::from_value::<AuditEntry>(item.clone()) {
+        if filter.matches(&entry) {
+            out.push(entry);
         }
     }
 }
@@ -1299,5 +1357,64 @@ mod tests {
         assert!(entry.classification_kind.is_none());
         assert!(entry.classification_source.is_none());
         assert!(entry.classification_confidence.is_none());
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(tool: &str, ts: &str) -> Value {
+        json!({
+            "timestamp": ts,
+            "source": "cli",
+            "method": "tools/call",
+            "tool_name": tool,
+            "server_name": "sentry",
+            "identity": "alice",
+            "duration_ms": 1,
+            "success": true
+        })
+    }
+
+    #[test]
+    fn the_newest_entries_come_first_and_the_limit_is_respected() {
+        let raw = Value::Object(
+            [
+                (
+                    "audit:100-a".to_string(),
+                    entry("first", "2026-01-01T00:00:01Z"),
+                ),
+                (
+                    "audit:200-b".to_string(),
+                    entry("second", "2026-01-01T00:00:02Z"),
+                ),
+                (
+                    "audit:300-c".to_string(),
+                    entry("third", "2026-01-01T00:00:03Z"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let filter = AuditFilter {
+            limit: 2,
+            ..Default::default()
+        };
+        let entries = filter_reversed(&raw, &filter);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].timestamp, "2026-01-01T00:00:03Z");
+        assert_eq!(entries[1].timestamp, "2026-01-01T00:00:02Z");
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_returns_nothing() {
+        let raw = Value::Array(vec![entry("one", "2026-01-01T00:00:01Z")]);
+        let filter = AuditFilter {
+            server: Some("nope".to_string()),
+            ..Default::default()
+        };
+        assert!(filter_reversed(&raw, &filter).is_empty());
     }
 }

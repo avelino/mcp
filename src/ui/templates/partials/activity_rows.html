@@ -1,0 +1,31 @@
+{% if rows | length == 0 %}
+<div class="empty">No audit entries match. The log is written by the CLI and by <code class="mono">mcp serve</code>.</div>
+{% else %}
+<table>
+  <thead><tr><th style="width:150px">When</th><th>Identity</th><th>Item</th><th>Source</th><th>ACL</th><th>Status</th><th class="num">Duration</th></tr></thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td class="mono tiny muted">{{ r.at }}</td>
+      <td class="tiny">{{ r.identity }}</td>
+      <td class="mono tiny" style="font-weight:600">{{ r.item }}</td>
+      <td class="tiny muted mono">{{ r.source }}</td>
+      <td class="tiny {% if r.denied %}deny{% else %}muted{% endif %}">{{ r.acl }}</td>
+      <td>
+        {% if r.status == 'ok' %}<span class="chip ok">ok</span>
+        {% elif r.status == 'denied' %}<span class="chip err">denied</span>
+        {% elif r.status == 'error' %}<span class="chip err">error</span>
+        {% else %}<span class="chip">{{ r.status }}</span>{% endif %}
+      </td>
+      <td class="num">{{ r.ms }}</td>
+    </tr>
+    {% if r.error %}
+    <tr><td colspan="7" style="padding:0 14px 10px"><div class="tiny deny mono">{{ r.error }}</div></td></tr>
+    {% endif %}
+    {% endfor %}
+  </tbody>
+</table>
+<div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+  <span class="tiny muted">{{ rows | length }} entries · <code class="mono">{{ db_path }}</code></span>
+</div>
+{% endif %}

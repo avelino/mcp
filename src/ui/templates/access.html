@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Access</h1>
+    <p class="sub">Who may call what, and why. Roles are unioned; any matching deny wins.</p>
+  </div>
+</div>
+
+{% if not has_acl %}
+<div class="banner">
+  <div>
+    <div class="t">No ACL configured</div>
+    <div class="d">Without <code class="mono">serverAuth.acl</code> the proxy allows every tool to every identity. The ACL is only enforced by <code class="mono">mcp serve --http</code> — the CLI and this page's local calls ignore it.</div>
+  </div>
+</div>
+{% endif %}
+
+{% if acl.legacy %}
+<div class="banner">
+  <div>
+    <div class="t">Legacy ACL rules</div>
+    <div class="d">This config uses the <code class="mono">rules</code> schema. Subjects and tokens can still be managed below, but roles cannot be created or removed — edit the rules in the file.</div>
+  </div>
+</div>
+{% endif %}
+
+<div class="split" style="grid-template-columns:minmax(0,1fr) 400px">
+  <div class="stack">
+    <div class="card">
+      <div class="card-h">
+        <h2>Roles</h2>
+        <span class="spacer"></span>
+        <span class="chip">default: <b class="{% if acl.default == 'allow' %}allow{% else %}deny{% endif %}">{{ acl.default }}</b></span>
+        <span class="chip">strictClassification: {{ acl.strict }}</span>
+      </div>
+      <div class="card-b flush">
+        {% if acl.roles | length == 0 %}
+        <div class="empty">No roles defined.</div>
+        {% else %}
+        {% for r in acl.roles %}
+        <div style="padding:12px 14px;border-bottom:1px solid var(--line-soft)">
+          <div class="row">
+            <span class="mono" style="font-weight:600">{{ r.name }}</span>
+            {% if r.name in admin_roles %}<span class="chip ok">admin</span>{% endif %}
+            <span class="spacer"></span>
+            <span class="tiny muted">{{ r.subject_count }}</span>
+            {% if not acl.legacy %}
+            <form class="inline" method="post" action="/access/roles/{{ r.name | urlencode }}/delete"
+                  data-confirm="Remove role {{ r.name }}?">
+              <input type="hidden" name="csrf" value="{{ token }}">
+              <button class="btn sm danger"
+                {% if r.name in admin_roles or r.subjects > 0 %}disabled
+                  title="{% if r.name in admin_roles %}it is in serverAuth.adminRoles{% else %}still assigned to subjects{% endif %}"{% endif %}>Remove</button>
+            </form>
+            {% endif %}
+          </div>
+          <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px">
+            {% for g in r.grants %}
+            <span class="chip">
+              {{ g.server }} <span class="muted">·</span>
+              <b class="{% if g.access == 'read' %}allow{% elif g.access == '*' %}warn{% else %}deny{% endif %}">{{ g.access }}</b>
+              {% if g.tools %}<span class="muted">· {{ g.tools }}</span>{% endif %}
+              {% if g.deny %}<span class="deny">deny</span>{% endif %}
+            </span>
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+      {% if not acl.legacy and acl.roles | length > 0 %}
+      <div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+        <form method="post" action="/access/roles" class="row" style="gap:8px;flex-wrap:wrap;width:100%">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input class="input" name="name" placeholder="new role" style="width:150px;font-family:var(--sans)" required>
+          <span class="tiny muted">copies grants from</span>
+          <select name="from" style="width:auto;font-family:var(--sans)">
+            {% for r in acl.roles %}<option>{{ r.name }}</option>{% endfor %}
+          </select>
+          <button class="btn sm">Create role</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h2>Subjects</h2><span class="spacer"></span><span class="chip">{{ acl.subjects | length }}</span></div>
+      <div class="card-b flush scroll-x">
+        {% if acl.subjects | length == 0 %}
+        <div class="empty">No subjects mapped. Bearer tokens carry their own roles.</div>
+        {% else %}
+        <table>
+          <thead><tr><th>Subject</th><th>Roles</th><th>Last used</th><th>Change</th><th></th></tr></thead>
+          <tbody>
+            {% for s in acl.subjects %}
+            <tr>
+              <td class="mono tiny" style="font-weight:600">{{ s.name }}</td>
+              <td>{% for r in s.roles %}<span class="chip">{{ r }}</span> {% endfor %}</td>
+              <td class="tiny muted mono">{{ s.last_used }}</td>
+              <td>
+                <form class="row" method="post" action="/access/subjects" style="gap:6px">
+                  <input type="hidden" name="csrf" value="{{ token }}">
+                  <input type="hidden" name="name" value="{{ s.name }}">
+                  <input class="input" name="roles" value="{{ s.roles_csv }}" style="width:190px" title="comma separated">
+                  <button class="btn sm">Save</button>
+                </form>
+              </td>
+              <td style="text-align:right">
+                <form class="inline" method="post" action="/access/subjects/{{ s.name | urlencode }}/delete"
+                      data-confirm="Remove subject {{ s.name }}?">
+                  <input type="hidden" name="csrf" value="{{ token }}">
+                  <button class="btn sm danger">Remove</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% endif %}
+      </div>
+      {% if not acl.legacy %}
+      <div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+        <form method="post" action="/access/subjects" class="row" style="gap:8px;flex-wrap:wrap;width:100%">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input class="input" name="name" placeholder="new subject" style="width:170px;font-family:var(--sans)" required>
+          <input class="input" name="roles" placeholder="{{ role_names | join(', ') }}" style="flex:1;min-width:180px">
+          <button class="btn sm">Add subject</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h2>Bearer tokens</h2><span class="spacer"></span><span class="chip">{{ token_rows | length }}</span></div>
+      <div class="card-b flush scroll-x">
+        {% if token_rows | length == 0 %}
+        <div class="empty">No tokens. Add one below, or configure a provider that does not need them.</div>
+        {% else %}
+        <table>
+          <thead><tr><th>Fingerprint</th><th>Subject</th><th>Roles</th><th>Last used</th><th></th></tr></thead>
+          <tbody>
+            {% for t in token_rows %}
+            <tr>
+              <td class="mono tiny">{{ t.fingerprint }}</td>
+              <td class="tiny">{{ t.subject }}</td>
+              <td>
+                {% for r in t.roles %}<span class="chip">{{ r }}</span> {% endfor %}
+                {% if t.legacy %}<span class="chip warn" title="legacy form has no roles, so it can never reload">no roles</span>{% endif %}
+              </td>
+              <td class="tiny muted mono">{{ t.last_used }}</td>
+              <td style="text-align:right">
+                <form class="inline" method="post" action="/access/tokens/{{ t.fingerprint }}/delete"
+                      data-confirm="Revoke the token for {{ t.subject }}?">
+                  <input type="hidden" name="csrf" value="{{ token }}">
+                  <button class="btn sm danger">Revoke</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% endif %}
+      </div>
+      <div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+        <form method="post" action="/access/tokens" class="row" style="gap:8px;flex-wrap:wrap;width:100%">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <input class="input" name="subject" placeholder="subject, e.g. alice" style="width:170px;font-family:var(--sans)" required>
+          <input class="input" name="roles" placeholder="{{ role_names | join(', ') }}" style="flex:1;min-width:180px">
+          <button class="btn sm primary">New token</button>
+        </form>
+      </div>
+      <div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+        <span class="tiny muted">Secrets are never rendered. A new token is shown exactly once, then forgotten.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <div class="card-h"><h2>Simulator</h2><span class="spacer"></span><span class="chip">acl check</span></div>
+      <div class="card-b">
+        <form hx-post="/access/check" hx-target="#verdict" hx-swap="innerHTML">
+          <input type="hidden" name="csrf" value="{{ token }}">
+          <div class="field">
+            <label>Subject</label>
+            <input class="input" name="subject" list="subjects" value="{{ sample_subject }}" placeholder="alice">
+            <datalist id="subjects">{% for s in acl.subjects %}<option value="{{ s.name }}">{% endfor %}</datalist>
+          </div>
+          <div class="field">
+            <label>Server</label>
+            <select name="server">{% for s in server_names %}<option>{{ s }}</option>{% endfor %}</select>
+          </div>
+          <div class="field">
+            <label>Tool</label>
+            <input class="input" name="tool" value="{{ sample_tool }}" placeholder="search_issues">
+          </div>
+          <button class="btn primary" style="width:100%">Check</button>
+        </form>
+        <div id="verdict" style="margin-top:14px">
+          <div class="note">Runs the same evaluator the proxy uses, with the tool classified from the local cache.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h2>How identity gets here</h2></div>
+      <div class="card-b">
+        <div class="note">
+          A subject is a name; the token is what proves it. Tokens created here use the extended form
+          <code class="mono">{ "subject", "roles" }</code>, the only form that can hold an admin role.
+        </div>
+        <div class="note" style="margin-top:10px">
+          Removing the last subject or token that holds a role from <code class="mono">adminRoles</code> is refused:
+          it would lock everyone out of this page.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

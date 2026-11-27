@@ -2,6 +2,7 @@ mod hints;
 pub mod oauth;
 pub(crate) mod oauth_primitives;
 pub mod store;
+pub use store::auth_store_path;
 
 use anyhow::{Context, Result};
 use store::{load_auth_store, server_key};

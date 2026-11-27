@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Token created · mcp</title>
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/theme.js"></script>
+</head>
+<body>
+<main class="login-wrap">
+  <div style="width:390px;max-width:94vw;display:flex;justify-content:flex-end;margin-bottom:8px"><button class="theme-toggle" type="button" data-theme-toggle aria-label="Change theme">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>
+  <span data-theme-label>auto</span>
+</button></div>
+  <div class="card login-card" style="width:560px">
+    <div class="row" style="gap:10px;margin-bottom:18px">
+      <div class="logo">m</div>
+      <div>
+        <div class="brand-name">mcp</div>
+        <div class="brand-sub">control room</div>
+      </div>
+    </div>
+    <h1>Token created</h1>
+    <p class="sub" style="margin-bottom:16px">
+      For <b>{{ subject }}</b>{% if roles %} with roles {% for r in roles %}<span class="chip">{{ r }}</span>{% endfor %}{% endif %}.
+      Copy it now — this page is the only time it exists in readable form.
+    </p>
+
+    <textarea class="input" rows="3" readonly data-select-on-click style="font-size:12px">{{ token }}</textarea>
+
+    <div class="banner ok" style="margin-top:16px">
+      <div>
+        <div class="t">Store it somewhere safe</div>
+        <div class="d">The config stores it as the key in <code class="mono">serverAuth.bearer.tokens</code>; this page is the only place it is ever shown, and the UI lists just a fingerprint. If you lose it, revoke it and create another.</div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <a class="btn primary" href="/access">Done</a>
+      <span class="spacer"></span>
+      <span class="tiny muted mono">mcp {{ version }}</span>
+    </div>
+  </div>
+</main>
+</body>
+</html>

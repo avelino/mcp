@@ -37,7 +37,7 @@ mod test_helpers;
 pub use config::OAuthAsConfig;
 pub use provider::OAuthAsAuth;
 pub use state::{AsState, MAX_SEEN_JTI};
-pub use store::{load as load_state, save as save_state};
+pub use store::{load as load_state, save as save_state, state_path};
 pub use types::RegisteredClient;
 
 use std::sync::Arc;

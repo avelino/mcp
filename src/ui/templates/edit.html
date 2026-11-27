@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Edit {{ server.name }}</h1>
+    <p class="sub">Nothing is written until you apply. The diff is computed against the bytes on disk right now.</p>
+  </div>
+  <div class="actions"><a class="btn" href="/servers/{{ server.name | urlencode }}">Back</a></div>
+</div>
+
+<form method="post" action="/servers/{{ server.name | urlencode }}">
+  <input type="hidden" name="csrf" value="{{ token }}">
+  <input type="hidden" name="expected_hash" value="{{ hash }}">
+
+  <div class="split">
+    <div class="card">
+      <div class="card-h">
+        <h2>Fields</h2>
+        <span class="spacer"></span>
+        <span class="chip">{{ server.kind }}</span>
+      </div>
+      <div class="card-b"
+           hx-post="/servers/{{ server.name | urlencode }}/plan"
+           hx-trigger="change, keyup changed delay:600ms"
+           hx-include="closest form"
+           hx-target="#plan"
+           hx-swap="innerHTML">
+
+        <div class="field">
+          <label>Name</label>
+          <input class="input" value="{{ server.name }}" readonly>
+          <div class="hint">Renaming is a delete + add; do it in the file if you need it.</div>
+        </div>
+
+        {% if server.kind == 'http' %}
+        <div class="field">
+          <label>URL</label>
+          <input class="input" name="url" value="{{ server.url }}" placeholder="https://example.com/mcp">
+        </div>
+        <div class="field">
+          <label>Headers</label>
+          <textarea name="headers" rows="4" placeholder="Authorization: Bearer ${MY_TOKEN}">{{ server.headers_text }}</textarea>
+          <div class="hint">One <code class="mono">Key: Value</code> per line. <code class="mono">${VAR}</code> stays literal in the file.</div>
+        </div>
+        {% else %}
+        <div class="field">
+          <label>Command</label>
+          <input class="input" name="command" value="{{ server.command }}" placeholder="npx">
+        </div>
+        <div class="field">
+          <label>Args</label>
+          <input class="input" name="args" value="{{ server.args }}" placeholder="-y some-mcp-server@latest">
+        </div>
+        <div class="field">
+          <label>Environment</label>
+          <textarea name="env" rows="4" placeholder="SLACK_MCP_XOXP_TOKEN=${SLACK_TOKEN}">{{ server.env_text }}</textarea>
+          <div class="hint">One <code class="mono">KEY=value</code> per line.</div>
+        </div>
+        {% endif %}
+
+        <div class="field">
+          <label>Idle timeout</label>
+          <select name="idle_timeout">
+            {% for opt in idle_options %}
+            <option value="{{ opt }}" {% if opt == server.idle %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+          </select>
+          <div class="hint">How long the proxy keeps this backend warm. <code class="mono">adaptive</code> uses 1–5 minutes based on traffic.</div>
+        </div>
+
+        <div class="field">
+          <label>tool_acl — read globs</label>
+          <input class="input" name="tool_acl_read" value="{{ server.tool_acl_read }}" placeholder="search_*, get_*">
+        </div>
+        <div class="field">
+          <label>tool_acl — write globs</label>
+          <input class="input" name="tool_acl_write" value="{{ server.tool_acl_write }}" placeholder="create_*, update_*">
+          <div class="hint">Classifies tools for ACL. A pattern in both lists is rejected.</div>
+        </div>
+      </div>
+      <div class="card-h" style="border-top:1px solid var(--line-soft);border-bottom:0">
+        <button class="btn primary">Apply and reload</button>
+        <a class="btn ghost" href="/servers/{{ server.name | urlencode }}">Discard</a>
+        <span class="spacer"></span>
+        <span class="tiny muted mono">{{ hash }}</span>
+      </div>
+    </div>
+
+    <div id="plan">
+      <div class="card">
+        <div class="card-h"><h2>Diff</h2></div>
+        <div class="card-b">
+          <div class="empty" style="padding:26px">Change a field to see the diff.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</form>
+{% endblock %}

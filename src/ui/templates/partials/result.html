@@ -1,0 +1,23 @@
+<div class="card-h">
+  <h2>Result</h2>
+  <span class="spacer"></span>
+  <span class="chip {% if ok %}ok{% else %}err{% endif %}">{{ status }} · {{ ms }}ms · {{ size }}</span>
+</div>
+<div class="card-b">
+  {% if error %}
+  <div class="banner err" style="margin:0">
+    <div><div class="t">The call did not complete</div><div class="d mono tiny">{{ error }}</div></div>
+  </div>
+  {% elif single_text %}
+  <pre class="code" style="white-space:pre-wrap">{{ text }}</pre>
+  {% else %}
+  <pre class="code" style="max-height:420px">{{ json }}</pre>
+  {% endif %}
+  <div class="row" style="margin-top:10px">
+    <span class="tiny muted mono">{{ key }}</span>
+    <span class="spacer"></span>
+    <a class="btn sm ghost" href="/activity">Open in activity →</a>
+  </div>
+  <div class="note" style="margin-top:8px">Arguments sent:</div>
+  <pre class="code" style="margin-top:6px;font-size:10.5px">{{ arguments }}</pre>
+</div>
